@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runBacktest, compareStrategies, parseDataset } from '../src/backtest.js';
+import { MAX_COMPARISON_RUNTIME_MS,MAX_RESEARCH_RUNTIME_MS,runBacktest, compareStrategies, parseDataset } from '../src/backtest.js';
 import { ResearchService } from '../src/research.js';
 import { Candle, intraday_signal, swing_signal, daily_holding_exit } from '../src/strategy.js';
 
@@ -173,7 +173,7 @@ for (const [name, mutate] of [
 
 test('resource, cost and split configuration are bounded', () => {
   assert.throws(() => runBacktest(dataset(), { max_bars: 10 }), /bar limit/);
-  assert.throws(() => runBacktest(dataset(), { max_bars: 250001 }));
+  assert.throws(() => runBacktest(dataset(), { max_bars: 1000001 }));
   assert.throws(() => runBacktest(dataset(), { fee_rate: -1 }));
   assert.throws(() => runBacktest(dataset(), { initial_capital: NaN }));
   assert.throws(() => runBacktest(dataset(), { split_fractions: [.6, .3, .2] }));
@@ -199,6 +199,54 @@ test('worker cancellation stops research without creating a report or any live a
   assert.equal(cancelled.status, 'cancelled'); assert.equal(cancelled.result, null);
   assert.equal((await waiting).status, 'cancelled'); assert.equal(service.worker, null);
   await service.close();
+});
+
+test('research timing is unaffected by a forward operating-system clock correction',()=>{
+  const original=Date.now;let jumps=0;
+  try {
+    Date.now=()=>original()+600000*++jumps;
+    const report=runBacktest(dataset(),zeroCosts);
+    assert.equal(report.dataset.bar_count,75);assert.equal(report.data_quality.completed_result,true);
+  } finally {Date.now=original;}
+});
+
+test('worker budget scales for a large sample, remains bounded and still supports cancellation',async t=>{
+  const service=new ResearchService();t.after(()=>service.close());
+  assert.throws(()=>service.start(dataset(),{max_runtime_ms:1800001}),/Maximum runtime/);
+  assert.throws(()=>service.start(dataset(),{max_runtime_ms:0}),/Maximum runtime/);
+  const input=dataset(session(),Array.from({length:610},(_,i)=>'STOCK'+i));
+  const started=service.start(input);
+  assert.ok(started.runtime_budget_ms>60000);assert.ok(started.runtime_budget_ms<=MAX_COMPARISON_RUNTIME_MS);
+  const stopped=await service.cancel();assert.equal(stopped.status,'cancelled');assert.equal(stopped.result,null);
+});
+
+test('comparison announces each real phase before its first candles without pretending normalization has completed',()=>{
+  const progress=[];compareStrategies(dataset(),zeroCosts,{onProgress:value=>progress.push(value)});
+  assert.deepEqual(progress[0],{phase:'baseline',progress:0,processed_bars:0});
+  const enhancedStart=progress.findIndex(value=>value.phase==='enhanced');
+  assert.ok(enhancedStart>0);assert.equal(progress[enhancedStart-1].processed_bars,75);
+  assert.deepEqual(progress[enhancedStart],{phase:'enhanced',progress:.5,processed_bars:0});
+  assert.equal(progress.at(-1).progress,1);assert.equal(progress.at(-1).processed_bars,75);
+});
+
+test('runtime exhaustion carries exact variant, elapsed time and processed candles without returning a partial comparison',t=>{
+  let clock=0,phase='';const progress=[];
+  t.mock.method(performance,'now',()=>clock);
+  assert.throws(()=>compareStrategies(dataset(),{...zeroCosts,max_runtime_ms:100},{
+    onProgress:value=>{phase=value.phase;progress.push(value);},
+    cancelled:()=>{if(phase==='enhanced')clock=101;return false;},
+  }),error=>{
+    assert.equal(error.code,'worker_timeout');assert.equal(error.phase,'enhanced');assert.equal(error.runtime_budget_ms,100);
+    assert.equal(error.elapsed_ms,101);assert.equal(error.processed_bars,1);assert.equal(error.total_bars,75);
+    assert.equal(error.message,'Backtest runtime limit exceeded; use a smaller dataset');return true;
+  });
+  assert.equal(progress.at(-1).phase,'enhanced');assert.equal(progress.at(-1).processed_bars,0);
+});
+
+test('explicit comparison limits allow up to thirty minutes while the optimizer candidate constant remains ten minutes',()=>{
+  assert.equal(MAX_COMPARISON_RUNTIME_MS,1800000);assert.equal(MAX_RESEARCH_RUNTIME_MS,600000);
+  assert.equal(runBacktest(dataset(),{max_runtime_ms:1800000}).options.max_runtime_ms,1800000);
+  assert.throws(()=>runBacktest(dataset(),{max_runtime_ms:1800001}),/Maximum runtime/);
 });
 
 test('worker reports validation failure without crashing its caller', async t => {

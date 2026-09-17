@@ -6,6 +6,10 @@ const SECRET_FIELDS = new Set(['access_token', 'api_key', 'api_secret', 'request
 const REJECTION_STATUSES = new Set([400, 401, 403, 404, 405, 410, 422, 428, 429]);
 const REJECTION_KINDS = new Set(['InputException', 'PermissionException', 'TokenException']);
 const CLOCK_TOLERANCE_MS = 10000, CLOCK_DATE_PRECISION_MS = 1000, CLOCK_MAX_AGE_SECONDS = 60;
+const RATE_CATEGORIES = ['historical', 'quote', 'orders', 'other'];
+const RATE_RETRY_MIN_SECONDS = 1, RATE_RETRY_MAX_SECONDS = 86400, RATE_FALLBACK_MAX_SECONDS = 300;
+const rateCategory = method => method === 'historical_data' ? 'historical' : method === 'quote' ? 'quote' :
+  ['place_order', 'modify_order', 'cancel_order'].includes(method) ? 'orders' : 'other';
 
 export function jsonable(value) {
   if (value instanceof Date) return value.toISOString();
@@ -16,14 +20,20 @@ export function jsonable(value) {
 }
 
 export class BrokerError extends Error {
-  constructor(kind, detail = '', {http_status = null, auth_required = false, definitive_rejection = false} = {}) {
-    super(`Zerodha request failed (${kind}). Check account activity and reconnect if needed.`);
+  constructor(kind, detail = '', {http_status = null, auth_required = false, definitive_rejection = false,
+    rate_limit_category = null, retry_after_seconds = null, retry_at = null} = {}) {
+    super(http_status === 429 ? 'Zerodha API rate limit reached. Requests of this type are temporarily paused.' :
+      `Zerodha request failed (${kind}). Check account activity and reconnect if needed.`);
     this.name = 'BrokerError';
     this.kind = kind;
     this.detail = detail;
     this.http_status = Number.isInteger(http_status) && http_status >= 100 && http_status <= 599 ? http_status : null;
     this.auth_required = this.http_status === 428 && auth_required === true;
     this.definitive_rejection = definitive_rejection === true && REJECTION_STATUSES.has(this.http_status) && REJECTION_KINDS.has(kind);
+    this.rate_limited = this.http_status === 429;
+    this.rate_limit_category = this.rate_limited && RATE_CATEGORIES.includes(rate_limit_category) ? rate_limit_category : null;
+    this.retry_after_seconds = this.rate_limited && Number.isFinite(retry_after_seconds) ? Math.min(RATE_RETRY_MAX_SECONDS, Math.max(RATE_RETRY_MIN_SECONDS, retry_after_seconds)) : null;
+    this.retry_at = this.retry_after_seconds !== null && typeof retry_at === 'string' && Number.isFinite(Date.parse(retry_at)) ? new Date(retry_at).toISOString() : null;
   }
 }
 
@@ -80,6 +90,7 @@ export class KiteBroker {
     this._rest_lock = new Mutex();
     this._last_call = -Infinity;
     this._last_quote = -Infinity;
+    this._rate_limits = Object.fromEntries(RATE_CATEGORIES.map(category => [category, {until: -Infinity, consecutive: 0, rate_limited_responses: 0, blocked_requests: 0}]));
     this.sockets = [];
     this._streamSlots = new Set(); this._retiringSockets = new Set();
     this._streamLifecycle = new Mutex();
@@ -139,15 +150,60 @@ export class KiteBroker {
       last_observation_status: last };
   }
 
+  _rateMetadata(category) {
+    const remaining = Math.max(0, this._rate_limits[category].until - this._clock());
+    return {http_status: 429, rate_limit_category: category, retry_after_seconds: Math.max(RATE_RETRY_MIN_SECONDS, Math.ceil(remaining)),
+      retry_at: new Date(Number(this._wallClock()) + Math.max(RATE_RETRY_MIN_SECONDS, remaining) * 1000).toISOString()};
+  }
+
+  _checkRateLimit(category) {
+    const state = this._rate_limits[category];
+    if (state.until > this._clock()) {
+      state.blocked_requests++;
+      throw new BrokerError('RateLimitException', 'This request category is cooling down after HTTP 429.', this._rateMetadata(category));
+    }
+  }
+
+  _recordRateLimit(method, response) {
+    const category = rateCategory(method), state = this._rate_limits[category];
+    const raw = response.headers?.get?.('retry-after');
+    let delay = typeof raw === 'string' && /^\d+(?:\.\d+)?$/.test(raw.trim()) ? Number(raw) : NaN;
+    if (!Number.isFinite(delay) && typeof raw === 'string') {
+      const retryDate = Date.parse(raw), serverDate = Date.parse(response.headers?.get?.('date'));
+      if (Number.isFinite(retryDate) && new Date(retryDate).toUTCString() === raw.trim()) delay = (retryDate - (Number.isFinite(serverDate) ? serverDate : Number(this._wallClock()))) / 1000;
+    }
+    if (!Number.isFinite(delay)) delay = Math.min(RATE_FALLBACK_MAX_SECONDS, 30 * 2 ** Math.min(state.consecutive, 4));
+    delay = Math.min(RATE_RETRY_MAX_SECONDS, Math.max(RATE_RETRY_MIN_SECONDS, delay));
+    state.until = Math.max(state.until, this._clock() + delay);
+    state.consecutive++;state.rate_limited_responses++;
+    return this._rateMetadata(category);
+  }
+
+  rate_limit_health() {
+    const categories = RATE_CATEGORIES.map(category => {
+      const state = this._rate_limits[category], remaining = Math.max(0, state.until - this._clock());
+      return {category, status: remaining > 0 ? 'cooldown' : 'ready', retry_after_seconds: Math.ceil(remaining),
+        retry_at: remaining > 0 ? new Date(Number(this._wallClock()) + remaining * 1000).toISOString() : null,
+        rate_limited_responses: state.rate_limited_responses, blocked_requests: state.blocked_requests};
+    });
+    return {status: categories.some(category => category.status === 'cooldown') ? 'cooldown' : 'ready', categories,
+      total_rate_limited_responses: categories.reduce((total, category) => total + category.rate_limited_responses, 0)};
+  }
+
   async call(method, ...args) {
+    const category = rateCategory(method);
+    this._checkRateLimit(category);
     return this._rest_lock.run(async () => {
+      // Calls queued before a 429 also fail promptly. Do not occupy the shared
+      // REST lock for a cooldown: account checks and protection need to proceed.
+      this._checkRateLimit(category);
       await this._sleep(Math.max(0, 0.36 - (this._clock() - this._last_call)) * 1000);
       if (method === 'quote') {
         await this._sleep(Math.max(0, 1.05 - (this._clock() - this._last_quote)) * 1000);
         this._last_quote = this._clock();
       }
       this._last_call = this._clock();
-      try { return await this._call(method, args); }
+      try { const result = await this._call(method, args);this._rate_limits[category].consecutive = 0;return result; }
       catch (error) {
         let detail = String(error.detail || error.message || 'Broker request failed');
         for (const secret of [this.api_key, this.access_token]) if (secret) detail = detail.split(secret).join('[redacted]');
@@ -157,6 +213,7 @@ export class KiteBroker {
         const kind = /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(rawKind) ? rawKind : 'BrokerException';
         throw new BrokerError(kind, detail, error instanceof BrokerError ? {
           http_status: error.http_status, auth_required: error.auth_required, definitive_rejection: error.definitive_rejection,
+          rate_limit_category: error.rate_limit_category, retry_after_seconds: error.retry_after_seconds, retry_at: error.retry_at,
         } : {});
       }
     });
@@ -266,11 +323,12 @@ export class KiteBroker {
     const startedWall = Number(this._wallClock()), startedMono = this._clock();
     const response = await this._fetch(`https://api.kite.trade${path}`, request);
     this._observe_clock(response, startedWall, startedMono);
+    const rateLimit = response.status === 429 ? this._recordRateLimit(method, response) : {};
     if (method === 'instruments' && response.ok) return transform(await response.text());
     let body;
     try { body = await response.json(); }
-    catch { throw new BrokerError('NetworkException', `Invalid broker response (HTTP ${response.status})`, {http_status: response.status}); }
-    if (!response.ok || body?.status !== 'success') {
+    catch { throw new BrokerError(response.status === 429 ? 'RateLimitException' : 'NetworkException', `Invalid broker response (HTTP ${response.status})`, {http_status: response.status, ...rateLimit}); }
+    if (response.status === 429 || !response.ok || body?.status !== 'success') {
       const validError = body && typeof body === 'object' && !Array.isArray(body) && body.status === 'error' &&
         typeof body.message === 'string' && body.message.trim().length > 0 &&
         typeof body.error_type === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(body.error_type) &&
@@ -286,14 +344,20 @@ export class KiteBroker {
         http_status: response.status, auth_required: response.status === 428 && Boolean(validError) && !acknowledged,
         definitive_rejection: response.ok === false && Boolean(validError) && !acknowledged &&
           REJECTION_STATUSES.has(response.status) && REJECTION_KINDS.has(body.error_type),
+        ...rateLimit,
       });
     }
     return transform(body.data);
   }
 
-  async account() {
+  async account(onProgress) {
     const result = {};
-    for (const key of ['margins', 'holdings', 'positions', 'orders', 'trades']) result[key] = jsonable(await this.call(key));
+    const keys = ['margins', 'holdings', 'positions', 'orders', 'trades'];
+    for (const [completed,key] of keys.entries()) {
+      onProgress?.({phase:key,message:`Downloading ${key === 'margins' ? 'funds and margins' : key} from Zerodha.`,completed,total:keys.length});
+      result[key] = jsonable(await this.call(key));
+    }
+    onProgress?.({phase:'reconcile',message:'Reconciling current balances, holdings and orders.',completed:keys.length,total:keys.length});
     result.updated_at = new Date().toISOString();
     return result;
   }

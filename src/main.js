@@ -9,6 +9,7 @@ import { ProcessLock, LoginLimiter, Fernet, digest_token, randomSecret, constant
 import { Mutex, isoIST, dateIST, parseTime } from './util.js';
 import { ResourceMonitor } from './resources.js';
 import { HistoricalResearch } from './historical-research.js';
+import { createResearchApplier } from './research-application.js';
 import { requestContext } from './http-context.js';
 import { setImmediate as yieldIO } from 'node:timers/promises';
 
@@ -28,22 +29,48 @@ export async function createApp(options={}){
   const cfg=options.settings instanceof Settings?options.settings:new Settings(options.settings);
   cfg.validate();const manager=options.configManager;
   const lock=new ProcessLock(path.join(cfg.data_dir,'server-owner.sqlite3'));
-  lock.acquire();let store,engine,sampler,research,resources;const streams=new Set();let closing=false;
+  lock.acquire();let store,engine,sampler,research,resources,startupWork;const streams=new Set();let closing=false;
   try{
     store=new Store(path.join(cfg.data_dir,'stockpilot.sqlite3'),[cfg.kite_api_key,cfg.kite_api_secret,cfg.session_secret,cfg.token_encryption_key,cfg.admin_password_hash]);
     const Engine=options.engineFactory||(await import('./trading.js')).TradingEngine;engine=new Engine(cfg,store);
     research=options.researchFactory?options.researchFactory(engine,store,cfg):new HistoricalResearch(engine,store,cfg);
     const app=express();app.disable('x-powered-by');app.set('trust proxy',false);
     resources=new ResourceMonitor(cfg.data_dir);
-    const state={settings:cfg,store,engine,resources,cipher:new Fernet(cfg.token_encryption_key),limiter:new LoginLimiter(store),control:new Mutex(),loginLock:new Mutex(),postbackLock:new Mutex(),lastPostback:-Infinity,restartRequired:false};
+    const state={settings:cfg,store,engine,resources,cipher:new Fernet(cfg.token_encryption_key),limiter:new LoginLimiter(store),control:new Mutex(),loginLock:new Mutex(),postbackLock:new Mutex(),lastPostback:-Infinity,restartRequired:false,startup:{status:'idle',phase:'idle',message:'Start Trading to connect and check the account.',completed:0,total:0,started_at:null,updated_at:null,finished_at:null,lifecycle_id:crypto.randomUUID(),operation_id:crypto.randomUUID(),revision:0}};
+    let startupJob=null,oauthEpoch=randomSecret(16);
+    function launchStartup({phase,message,total,restore=false,validate=()=>{},run}){
+      if(startupJob)return state.startup;
+      const job={cancelled:false};startupJob=job;
+      state.startup={status:'running',phase,message,completed:0,total,started_at:isoIST(),updated_at:isoIST(),finished_at:null,lifecycle_id:state.startup.lifecycle_id,operation_id:crypto.randomUUID(),revision:state.startup.revision+1};
+      const isCancelled=()=>job.cancelled||closing;
+      const check=()=>{if(isCancelled())throw Object.assign(new Error('Startup cancelled'),{startupCancelled:true});};
+      const progress=update=>{if(startupJob!==job||isCancelled())return;state.startup={...state.startup,...update,status:'running',completed:Math.min(total,Math.max(state.startup.completed,Number(update.completed)||0)),total,updated_at:isoIST(),revision:state.startup.revision+1};};
+      job.task=state.control.run(async()=>{
+        check();validate();await run({check,isCancelled,progress});check();
+        state.startup={...state.startup,status:'complete',phase:'complete',message:restore?'Account monitoring restored. New entries remain paused.':'Startup checks finished. Background downloads and account readiness checks continue.',completed:total,updated_at:isoIST(),finished_at:isoIST(),revision:state.startup.revision+1};
+      }).catch(error=>{
+        const cancelled=isCancelled()||error?.startupCancelled;
+        state.startup={...state.startup,status:cancelled?'cancelled':'failed',phase:cancelled?'cancelled':'failed',message:cancelled?'Startup cancelled. New entries remain paused.':error?.startupCode==='account_mismatch'?'Zerodha login rejected: client ID did not match the configured account.':restore?'Saved Zerodha session could not be restored. Use Start Trading to reconnect.':'Trading could not start. Check Entry readiness and Activity, then retry Start Trading.',updated_at:isoIST(),finished_at:isoIST(),revision:state.startup.revision+1};
+        if(!cancelled)store.event(restore?'session.restore_failed':'session.start_failed',state.startup.message,{},'error');
+      }).finally(()=>{if(startupJob===job)startupJob=null;});
+      startupWork=job.task;
+      return state.startup;
+    }
+    function cancelStartup(){
+      if(!startupJob)return false;
+      startupJob.cancelled=true;
+      state.startup={...state.startup,phase:'cancelling',message:'Pausing startup. Waiting for the current broker request to finish; trading will not be armed.',updated_at:isoIST(),revision:state.startup.revision+1};
+      return true;
+    }
     engine.runtime_health=()=>state.resources.snapshot();
+    research.applyParameters=createResearchApplier({settings:cfg,manager,engine,store,canApply:()=>!closing&&!state.restartRequired&&!fs.existsSync(path.join(cfg.data_dir,'maintenance.lock'))});
     app.state=state;state.research=research;
     const fingerprint=digest_token(cfg.admin_username+':'+cfg.admin_password_hash,cfg.session_secret);
     if(store.get('admin_fingerprint')!==fingerprint){store.revoke_sessions();store.set('admin_fingerprint',fingerprint);}
     if(store.get('strategy_settings')===null)store.set('strategy_settings',defaultStrategies());
     store.event('server.started','Node.js server started. New entries remain paused until Start Trading.',{mode:cfg.trading_mode});
     const saved=store.get('kite_session');
-    if(saved){try{const session=JSON.parse(state.cipher.decrypt(saved));if(session.expires>Date.now()/1000&&session.user_id.toUpperCase()===cfg.kite_user_id.toUpperCase()){store.add_secret(session.access_token);await engine.connect(session.access_token,session.user_id);store.event('session.restored','Zerodha monitoring restored. New entries are paused.');}else store.delete('kite_session');}catch{store.event('session.restore_failed','Reconnect to Zerodha. The saved session could not be restored.',{},'warning');}}
+    if(saved){try{const session=JSON.parse(state.cipher.decrypt(saved));if(session.expires>Date.now()/1000&&session.user_id.toUpperCase()===cfg.kite_user_id.toUpperCase()){store.add_secret(session.access_token);launchStartup({phase:'restoring',message:'Restoring Zerodha account monitoring.',total:10,restore:true,run:async({check,progress})=>{await engine.connect(session.access_token,session.user_id,{onProgress:progress});check();store.event('session.restored','Zerodha monitoring restored. New entries are paused.');}});}else store.delete('kite_session');}catch{store.event('session.restore_failed','Reconnect to Zerodha. The saved session could not be restored.',{},'warning');}}
     await research.startAutomatic({canRun:()=>!closing&&!state.restartRequired&&!fs.existsSync(path.join(cfg.data_dir,'maintenance.lock'))});
     sampler=setInterval(()=>{if(closing)return;const view=engine.snapshot();if(view.connected&&Number.isFinite(view.equity))store.sample(cfg.trading_mode,view.equity);},30000);sampler.unref();
     app.use((req,res,next)=>{
@@ -62,7 +89,7 @@ export async function createApp(options={}){
     app.use((req,res,next)=>{if(req.body?.length){try{req.body=strictJSON(req.body);}catch{return next(failure(400,'Invalid JSON payload'));}}else req.body={};next();});
     function authenticated(req,mutation=false){const value=cookie(req),session=value?store.session(digest_token(value,cfg.session_secret)):null;if(!session)throw failure(401,'Sign in to continue');if(mutation&&!constantEqual(req.get('x-csrf-token')||'',session.csrf))throw failure(403,'Invalid session protection token');return session;}
     function ready(){if(state.restartRequired)throw failure(409,'Settings saved. Restart the server before trading.');if(fs.existsSync(path.join(cfg.data_dir,'maintenance.lock')))throw failure(409,'Server maintenance is in progress');if(!cfg.configured)throw failure(409,'Set KITE_API_KEY, KITE_API_SECRET and KITE_USER_ID in .env first');if(cfg.trading_mode==='live'&&!cfg.live_trading_enabled)throw failure(409,'Enable live execution in Settings');}
-    function snapshot(){const view=engine.snapshot();return {...store.redact(view),configured:cfg.configured,resources:state.resources.snapshot(),strategy_settings:view.strategy_settings||store.get('strategy_settings'),holdings_authorization:view.mode==='live'?engine.holdings_authorization?.snapshot():null,limits:{capital:view.capital||0,risk_per_trade_pct:cfg.risk_per_trade_pct,daily_loss_pct:cfg.daily_loss_pct,max_positions:cfg.max_positions,max_position_pct:cfg.max_position_pct,entry_cutoff:cfg.entry_cutoff,exit_time:cfg.exit_time},server_time:isoIST(),maintenance:state.restartRequired||fs.existsSync(path.join(cfg.data_dir,'maintenance.lock')),restart_required:state.restartRequired};}
+    function snapshot(){const view=engine.snapshot(),researchView=research.summary?.()||research.status();return {...store.redact(view),startup:store.redact(state.startup),background:{...store.redact(view.background||{}),research:store.redact({status:researchView.status,progress:researchView.progress,message:researchView.message,error:researchView.error,issues:researchView.issues,cooldown:researchView.cooldown,tuning:researchView.tuning,started_at:researchView.started_at,completed_at:researchView.completed_at,automation:researchView.automation})},configured:cfg.configured,resources:state.resources.snapshot(),strategy_settings:view.strategy_settings||store.get('strategy_settings'),holdings_authorization:view.mode==='live'?engine.holdings_authorization?.snapshot():null,limits:{capital:view.capital||0,risk_per_trade_pct:cfg.risk_per_trade_pct,daily_loss_pct:cfg.daily_loss_pct,max_positions:cfg.max_positions,max_position_pct:cfg.max_position_pct,entry_cutoff:cfg.entry_cutoff,exit_time:cfg.exit_time},server_time:isoIST(),maintenance:state.restartRequired||fs.existsSync(path.join(cfg.data_dir,'maintenance.lock')),restart_required:state.restartRequired};}
     app.get('/health',(_req,res)=>res.json({status:'ok',safe_to_stop:engine.snapshot().safe_to_stop===true}));
     app.get('/api/readiness',(req,res)=>{authenticated(req);res.json({configured:cfg.configured,restart_required:state.restartRequired,...engine.readiness?.()});});
     app.get(['/','/settings'],(req,res)=>{try{authenticated(req);}catch{return res.redirect(303,'/login');}res.sendFile(path.join(STATIC,'index.html'));});
@@ -90,41 +117,47 @@ export async function createApp(options={}){
       await state.control.run(async()=>{const view=engine.snapshot();if(state.restartRequired||view.status==='running'||view.positions?.length||view.pending_orders?.length)throw failure(409,'Pause entries and resolve managed exposure before changing settings');values.managed_symbols=[...new Set(values.managed_symbols)].sort();store.set('strategy_settings',values);store.event('settings.changed','Trading strategies and holding permissions updated.',values);});res.json({ok:true,settings:values});
     });
     app.post('/api/trading/start',async(req,res)=>{
-      const session=authenticated(req,true);
-      const result=await state.control.run(async()=>{
-        authenticated(req,true);ready();
-        if(engine.snapshot().connected){await engine.start();return {ok:true};}
-        const nonce=randomSecret(32);store.set('oauth:'+session.digest,{nonce,origin:req.context.origin,expires:Date.now()/1000+600});
-        store.event('session.login_requested','Start Trading requested. Waiting for Zerodha sign-in.');
-        return {redirect_url:'https://kite.zerodha.com/connect/login?'+new URLSearchParams({v:'3',api_key:cfg.kite_api_key,redirect_params:new URLSearchParams({state:nonce}).toString()})};
-      });res.json(result);
+      const session=authenticated(req,true);ready();
+      if(startupJob)return res.status(202).json({ok:true,accepted:true,startup:store.redact(state.startup)});
+      if(engine.snapshot().connected){
+        const startup=launchStartup({phase:'account',message:'Refreshing the account before enabling entries.',total:2,validate:()=>{authenticated(req,true);ready();},run:async({isCancelled,progress})=>engine.start({onProgress:progress,isCancelled})});
+        return res.status(202).json({ok:true,accepted:true,startup:store.redact(startup)});
+      }
+      const nonce=randomSecret(32);store.set('oauth:'+session.digest,{nonce,epoch:oauthEpoch,origin:req.context.origin,expires:Date.now()/1000+600});
+      store.event('session.login_requested','Start Trading requested. Waiting for Zerodha sign-in.');
+      res.json({redirect_url:'https://kite.zerodha.com/connect/login?'+new URLSearchParams({v:'3',api_key:cfg.kite_api_key,redirect_params:new URLSearchParams({state:nonce}).toString()})});
     });
     app.get('/auth/kite/callback',async(req,res)=>{
       let session;try{session=authenticated(req);}catch{return res.redirect(303,'/login?error=expired');}
-      const target=await state.control.run(async()=>{
-        const pending=store.get('oauth:'+session.digest);
-        if(!pending||pending.origin!==req.context.origin||pending.expires<Date.now()/1000||!constantEqual(pending.nonce,req.query.state||'')){
-          store.event('session.rejected','A Zerodha callback failed its session check.',{},'warning');return '/?error=callback';
-        }
-        store.delete('oauth:'+session.digest);const token=req.query.request_token;
-        if(typeof token!=='string'||!token||token.length>1024||req.query.status!=='success')return '/?error=kite_login';
-        store.add_secret(token);
-        try{
-          authenticated(req);ready();const result=await (options.exchangeToken||exchangeToken)(cfg,token);
+      const pending=store.get('oauth:'+session.digest);
+      if(!pending||pending.epoch!==oauthEpoch||pending.origin!==req.context.origin||pending.expires<Date.now()/1000||!constantEqual(pending.nonce,req.query.state||'')){
+        store.event('session.rejected','A Zerodha callback failed its session check.',{},'warning');return res.redirect(303,'/?error=callback');
+      }
+      store.delete('oauth:'+session.digest);const token=req.query.request_token;
+      if(typeof token!=='string'||!token||token.length>1024||req.query.status!=='success')return res.redirect(303,'/?error=kite_login');
+      if(startupJob)return res.redirect(303,'/');
+      store.add_secret(token);
+      try{ready();}catch{return res.redirect(303,'/?error=start');}
+      launchStartup({phase:'authenticating',message:'Verifying Zerodha sign-in.',total:13,validate:()=>{authenticated(req);ready();},run:async({check,isCancelled,progress})=>{
+          const result=await (options.exchangeToken||exchangeToken)(cfg,token);check();
           if(String(result.user_id).toUpperCase()!==cfg.kite_user_id.toUpperCase()){
-            store.event('session.wrong_account','Zerodha login rejected: client ID did not match.',{},'error');return '/?error=wrong_account';
+            store.event('session.wrong_account','Zerodha login rejected: client ID did not match.',{},'error');throw Object.assign(new Error('Account mismatch'),{startupCode:'account_mismatch'});
           }
           store.add_secret(result.access_token);
           const expiry=parseTime(dateIST(new Date(Date.now()+86400000))+'T06:00:00').getTime()/1000;
           store.set('kite_session',state.cipher.encrypt(JSON.stringify({access_token:result.access_token,user_id:result.user_id,expires:expiry})));
-          await research.cancel({suppressAuto:false});await engine.connect(result.access_token,result.user_id);store.event('session.connected','Zerodha monitoring is active.');await engine.start();await research.maybeStart();return '/';
-        }catch{
-          store.event('session.start_failed','Zerodha session could not start trading. Check account recovery status.',{},'error');return '/?error=start';
-        }
-      });res.redirect(303,target);
+          progress({phase:'connecting',message:'Downloading and reconciling the Zerodha account.',completed:1});
+          await research.cancel({suppressAuto:false});check();
+          await engine.connect(result.access_token,result.user_id,{onProgress:update=>progress({...update,completed:1+update.completed})});check();
+          store.event('session.connected','Zerodha monitoring is active.');
+          progress({phase:'account',message:'Checking the account before enabling entries.',completed:11});
+          await engine.start({onProgress:update=>progress({...update,completed:11+update.completed}),isCancelled});check();
+          try{await research.maybeStart();}catch{store.event('research.retry_wait','Trading startup finished. Automatic research will retry separately.',{},'warning');}
+      }});
+      res.redirect(303,'/');
     });
-    app.post('/api/trading/pause',async(req,res)=>{authenticated(req,true);await state.control.run(()=>engine.pause());res.json({ok:true});});
-    app.post('/api/trading/flatten',async(req,res)=>{authenticated(req,true);await state.control.run(()=>engine.flatten());res.json({ok:true});});
+    app.post('/api/trading/pause',async(req,res)=>{authenticated(req,true);oauthEpoch=randomSecret(16);const cancelled=cancelStartup();if(cancelled){const pause=engine.pause();pause.catch(()=>{});const task=state.control.run(()=>pause);task.catch(()=>store.event('trading.pause_failed','Pause could not complete. Check Entry readiness.',{},'error'));return res.status(202).json({ok:true,accepted:true,startup:store.redact(state.startup)});}await state.control.run(()=>engine.pause());res.json({ok:true});});
+    app.post('/api/trading/flatten',async(req,res)=>{authenticated(req,true);oauthEpoch=randomSecret(16);cancelStartup();await state.control.run(()=>engine.flatten());res.json({ok:true});});
     app.get('/api/research',(req,res)=>{authenticated(req);res.json(store.redact(research.status()));});
     app.post('/api/research/start',async(req,res)=>{
       authenticated(req,true);if(!plainObject(req.body)||Object.keys(req.body).length)throw failure(422,'Research uses account funds and Settings; no order or credential inputs are accepted');
@@ -133,6 +166,26 @@ export async function createApp(options={}){
     app.post('/api/research/cancel',async(req,res)=>{
       authenticated(req,true);if(!plainObject(req.body)||Object.keys(req.body).length)throw failure(422,'No inputs are needed to cancel research');
       const result=await state.control.run(()=>{authenticated(req,true);return research.cancel();});res.json(store.redact(result));
+    });
+    app.post('/api/research/apply',async(req,res)=>{
+      authenticated(req,true);
+      if(!plainObject(req.body)||Object.keys(req.body).length!==2||Object.keys(req.body).some(key=>!['report_id','parameter_set_id'].includes(key))||typeof req.body.report_id!=='string'||!/^[0-9a-f-]{36}$/i.test(req.body.report_id)||typeof req.body.parameter_set_id!=='string'||!/^P(?:[1-9]|[1-9][0-9]|100)$/.test(req.body.parameter_set_id))throw failure(422,'Choose a parameter set from the current research report; custom parameter values are not accepted here');
+      const result=await state.control.run(()=>{authenticated(req,true);if(state.restartRequired)throw failure(409,'Restart after the saved Settings change');return research.selectParameterSet(req.body.report_id,req.body.parameter_set_id);});res.json(store.redact(result));
+    });
+    app.put('/api/research/settings',async(req,res)=>{
+      authenticated(req,true);
+      const numericKeys=['research_symbols','research_tuning_trials'],keys=[...numericKeys,'research_cpu_affinity'];
+      if(!plainObject(req.body)||Object.keys(req.body).some(key=>!keys.includes(key))||numericKeys.some(key=>!Number.isInteger(req.body[key]))||Object.hasOwn(req.body,'research_cpu_affinity')&&!['pinned','automatic'].includes(req.body.research_cpu_affinity))throw failure(422,'Provide research stock count, parameter set count, and an optional CPU scheduling choice');
+      if(!manager)throw failure(409,'Settings storage is unavailable');
+      const values=Object.fromEntries(keys.filter(key=>Object.hasOwn(req.body,key)).map(key=>[key,req.body[key]]));
+      await state.control.run(()=>{
+        authenticated(req,true);
+        if(closing||state.restartRequired||fs.existsSync(path.join(cfg.data_dir,'maintenance.lock')))throw failure(409,'Wait for maintenance or restart before changing research settings');
+        if(['collecting','running'].includes(research.status().status)||research.applying||store.get('research_pending_tuning'))throw failure(409,'Wait for research and any pending parameter application to finish, or cancel them first');
+        manager.candidate(values);manager.save(values);Object.assign(cfg,values);
+        store.event('research.settings_changed','Research sample size, candidate count and CPU scheduling saved for the next manual or automatic run.',values);
+      });
+      res.json({ok:true,settings:values});
     });
     function authorizationRequest(req,refresh=false){
       authenticated(req,true);
@@ -186,7 +239,7 @@ export async function createApp(options={}){
     app.use('/static',express.static(STATIC,{etag:false,maxAge:0}));
     app.use((_req,_res,next)=>next(failure(404,'Not found')));
     app.use((err,_req,res,_next)=>{if(res.headersSent)return res.end();const status=err.type==='entity.too.large'?413:err.status||409;res.status(status).json({detail:status>=500?'Server request failed; inspect the activity log.':store.redact(err.message||'Request failed')});});
-    app.shutdown=async()=>{if(closing)return;closing=true;clearInterval(sampler);for(const res of streams)res.end();try{await research.close();await state.control.run(()=>engine.shutdown());store.event('server.stopped','Server stopped. Broker orders remain at Zerodha.',{},'warning');}finally{state.resources.close();store.close();lock.release();}};
+    app.shutdown=async()=>{if(closing)return;closing=true;cancelStartup();clearInterval(sampler);for(const res of streams)res.end();try{await research.close();await state.control.run(()=>engine.shutdown());await startupJob?.task;store.event('server.stopped','Server stopped. Broker orders remain at Zerodha.',{},'warning');}finally{state.resources.close();store.close();lock.release();}};
     return app;
-  }catch(error){clearInterval(sampler);try{await research?.close();await engine?.shutdown();}finally{resources?.close();store?.close();lock.release();}throw error;}
+  }catch(error){closing=true;clearInterval(sampler);try{await research?.close();await startupWork;await engine?.shutdown();}finally{resources?.close();store?.close();lock.release();}throw error;}
 }

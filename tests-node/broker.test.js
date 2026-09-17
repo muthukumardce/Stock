@@ -25,6 +25,95 @@ test('REST requests are serialized with independent quote rate limiting', async 
   assert.equal(requests[0].options.redirect, 'error');
 });
 
+const historicalArgs = [123, '2026-09-16T09:15:00+05:30', '2026-09-17T09:15:00+05:30', '5minute'];
+function rateFixture(handler) {
+  let now = 100, wall = Date.parse('2026-09-17T06:30:00Z');
+  const requests = [], sleeps = [];
+  const advance = seconds => {now += seconds;wall += seconds * 1000;};
+  const broker = new KiteBroker('private-key', 'private-token', {clock: () => now, wallClock: () => wall,
+    sleep: async ms => {sleeps.push(ms);advance(ms / 1000);},
+    fetch: async (url, options) => {requests.push({url: new URL(url), options, at: now});return handler(url, options, requests.length);},
+  });
+  return {broker, requests, sleeps, advance, jump: seconds => {wall += seconds * 1000;}};
+}
+function limitedResponse({retryAfter = null, date = null, nonJSON = false} = {}) {
+  return {ok: false, status: 429, headers: {get: name => name === 'retry-after' ? retryAfter : name === 'date' ? date : null},
+    json: async () => {if (nonJSON) throw new Error('private-token HTML response');return {status:'error',error_type:'GeneralException',message:'private-token exceeded requests'};},
+  };
+}
+
+test('HTTP 429 remains a typed rate limit with safe retry metadata even when the response is not JSON', async () => {
+  for (const nonJSON of [false, true]) {
+    const f = rateFixture(() => limitedResponse({retryAfter:'17',nonJSON}));
+    await assert.rejects(f.broker.call('historical_data', ...historicalArgs), error => {
+      assert.equal(error.http_status,429);assert.equal(error.rate_limited,true);assert.equal(error.rate_limit_category,'historical');
+      assert.equal(error.retry_after_seconds,17);assert.ok(Number.isFinite(Date.parse(error.retry_at)));
+      assert.equal(error.definitive_rejection,false);assert.doesNotMatch(error.message,/private-token|HTML/);return true;
+    });
+    assert.equal(f.requests.length,1,'No automatic replay occurs');
+    const health=f.broker.rate_limit_health();assert.equal(health.status,'cooldown');assert.equal(health.total_rate_limited_responses,1);
+    assert.equal(health.categories.find(item=>item.category==='historical').retry_after_seconds,17);
+    assert.doesNotMatch(JSON.stringify(health),/private-key|private-token|api.kite/);
+  }
+});
+
+test('shared historical cooldown rejects queued and new downloads without delaying account or order protection', async () => {
+  const f=rateFixture(url=>url.includes('/historical/')?limitedResponse({retryAfter:'120'}):success({order_id:'protected-order'}));
+  const result=await Promise.allSettled([
+    f.broker.call('historical_data',...historicalArgs),f.broker.call('historical_data',...historicalArgs),
+    f.broker.call('holdings'),f.broker.call('cancel_order',{variety:'regular',order_id:'protect-order'}),
+  ]);
+  assert.deepEqual(result.map(item=>item.status),['rejected','rejected','fulfilled','fulfilled']);
+  assert.equal(result[1].reason.rate_limit_category,'historical');
+  await assert.rejects(f.broker.call('historical_data',...historicalArgs),error=>error.http_status===429);
+  assert.equal(f.requests.length,3);assert.ok(f.sleeps.every(ms=>ms<=361),'No cooldown sleep may occupy the common REST queue');
+  const health=f.broker.rate_limit_health().categories.find(item=>item.category==='historical');
+  assert.equal(health.rate_limited_responses,1);assert.equal(health.blocked_requests,2);
+});
+
+test('Retry-After supports bounded seconds and broker-relative HTTP dates despite a skewed local clock', async () => {
+  for(const [retryAfter,expected] of [['0',1],['999999',86400],['invalid',30],['-1',30],[null,30]]) {
+    const f=rateFixture(()=>limitedResponse({retryAfter}));
+    await assert.rejects(f.broker.call('profile'),error=>error.retry_after_seconds===expected);
+  }
+  const date='Thu, 17 Sep 2026 06:33:43 GMT',retryAfter='Thu, 17 Sep 2026 06:34:28 GMT';
+  const f=rateFixture(()=>limitedResponse({date,retryAfter}));
+  await assert.rejects(f.broker.call('quote',['NSE:INFY']),error=>error.retry_after_seconds===45&&error.rate_limit_category==='quote');
+  f.jump(-3600);assert.equal(f.broker.rate_limit_health().categories.find(item=>item.category==='quote').retry_after_seconds,45);
+  f.advance(45);assert.equal(f.broker.rate_limit_health().status,'ready');
+});
+
+test('explicit Retry-After longer than the fallback cap prevents requests for its full duration', async () => {
+  let limited=true;
+  const f=rateFixture(()=>limited?limitedResponse({retryAfter:'600'}):success({candles:[]}));
+  await assert.rejects(f.broker.call('historical_data',...historicalArgs),error=>error.retry_after_seconds===600);
+  limited=false;f.advance(300);
+  await assert.rejects(f.broker.call('historical_data',...historicalArgs),error=>error.retry_after_seconds===300);
+  assert.equal(f.requests.length,1);
+  f.advance(299);await assert.rejects(f.broker.call('historical_data',...historicalArgs),error=>error.retry_after_seconds===1);
+  assert.equal(f.requests.length,1);
+  f.advance(1);await f.broker.call('historical_data',...historicalArgs);assert.equal(f.requests.length,2);
+});
+
+test('repeated throttling backs off within bounds and only successful calls reset the category backoff', async () => {
+  let fail=true;const f=rateFixture(()=>fail?limitedResponse():success({candles:[]}));
+  for(const expected of [30,60,120,240,300]){
+    await assert.rejects(f.broker.call('historical_data',...historicalArgs),error=>error.retry_after_seconds===expected);
+    f.advance(expected);
+  }
+  fail=false;await f.broker.call('historical_data',...historicalArgs);fail=true;
+  await assert.rejects(f.broker.call('historical_data',...historicalArgs),error=>error.retry_after_seconds===30);
+  assert.equal(f.broker.rate_limit_health().total_rate_limited_responses,6);
+});
+
+test('rate limited order mutations are never replayed and malformed acknowledgements stay ambiguous', async () => {
+  const f=rateFixture(()=>limitedResponse({retryAfter:'60',nonJSON:true}));
+  await assert.rejects(f.broker.call('place_order',{variety:'regular',tradingsymbol:'INFY'}),error=>error.http_status===429&&error.rate_limit_category==='orders'&&!error.definitive_rejection);
+  await assert.rejects(f.broker.call('modify_order',{variety:'regular',order_id:'existing',price:100}),error=>error.http_status===429);
+  assert.equal(f.requests.length,1);assert.equal(f.requests[0].options.method,'POST');
+  f.advance(60);assert.equal(f.requests.length,1,'Cooldown expiration must not automatically replay a mutation');
+});
+
 function clockFixture() {
   let wall = Date.parse('2026-09-17T06:30:00Z'), mono = 100, requests = 0;
   let sample = { offset: 0, latency: 200, jump: 0 };

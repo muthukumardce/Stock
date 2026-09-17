@@ -9,7 +9,7 @@
   "scripts": {
     "setup": "node src/cli.js setup",
     "start": "node src/index.js",
-    "tunnel": "cloudflared tunnel --url http://localhost:3000",
+    "tunnel": "cloudflared tunnel --url http://127.0.0.1:3000",
     "check": "node src/cli.js check",
     "research": "node src/cli.js research",
     "backup": "node src/cli.js backup",
@@ -28,5 +28,8 @@
   },
   "devDependencies": {
     "@playwright/test": "1.63.0"
+  },
+  "optionalDependencies": {
+    "koffi": "3.3.0"
   }
 }

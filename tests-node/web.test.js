@@ -22,11 +22,11 @@ class Engine {
   request_reconciliation(){this.notifications++;}
   snapshot(){return {mode:this.settings.trading_mode,status:this.status,connected:this.connected,positions:this.positions,pending_orders:this.pending,capital:75000,equity:75000,account:{},safe_to_stop:!this.positions.length};}
 }
-async function fixture(t,{root,environment={},exchangeToken}={}) {
+async function fixture(t,{root,environment={},exchangeToken,engineFactory=Engine,researchFactory}={}) {
   const directory=root||fs.mkdtempSync(path.join(os.tmpdir(),'stockpilot-web-'));
   const manager=new ConfigManager(directory,{ADMIN_PASSWORD_HASH:HASH,KITE_API_KEY:'testapikey',KITE_API_SECRET:'testapisecret',KITE_USER_ID:'AB1234',...environment});
   const settings=await manager.load();
-  const app=await createApp({settings,configManager:manager,engineFactory:Engine,exchangeToken:exchangeToken||(async()=>({user_id:'AB1234',access_token:'test-access-token-private'}))});
+  const app=await createApp({settings,configManager:manager,engineFactory,researchFactory,exchangeToken:exchangeToken||(async()=>({user_id:'AB1234',access_token:'test-access-token-private'}))});
   const server=app.listen(0,'127.0.0.1');await once(server,'listening');
   const origin=`http://127.0.0.1:${server.address().port}`;
   let cookie='',csrf='';
@@ -74,6 +74,58 @@ test('state polling retains contiguous bounded activity pages and rejects malfor
   assert.equal((await f.request('/api/state?after=0')).status,200);
 });
 
+test('research cooldown is enforced over HTTP and background status carries safe diagnostics without a full report',async t=>{
+  const f=await fixture(t);await f.login();
+  const next=new Date(Date.now()+600000).toISOString();
+  f.store.set('research_rate_limit',{next_retry_at:next});
+  const diagnostic={code:'rate_limit',message:'History cooldown testapisecret',http_status:429,phase:'collection',symbol:'INFY',retryable:true,next_retry_at:next};
+  Object.assign(f.app.state.research.state,{status:'failed',message:'History cooldown',error:diagnostic,issues:[diagnostic],report:{private_marker:'DO_NOT_INCLUDE_LARGE_REPORT'}});
+  const view=f.engine.snapshot.bind(f.engine);f.engine.snapshot=()=>({...view(),api_limits:{status:'cooldown',categories:[{category:'historical',status:'cooldown',retry_after_seconds:600}]}});
+  const response=await f.request('/api/trading/pause','POST',{});assert.equal(response.status,200);
+  const blocked=await f.request('/api/research/start','POST',{});assert.equal(blocked.status,429);assert.match((await blocked.json()).detail,/rate limited until/);
+  const state=(await (await f.request('/api/state')).json()).state;
+  assert.equal(state.background.research.error.code,'rate_limit');assert.equal(state.background.research.error.http_status,429);assert.ok(Math.abs(Date.parse(state.background.research.error.next_retry_at)-Date.parse(next))<100);assert.ok(state.background.research.cooldown.next_retry_at);
+  assert.equal(state.api_limits.categories[0].category,'historical');assert.equal(state.background.research.issues.length,1);
+  assert.doesNotMatch(JSON.stringify(state),/testapisecret|DO_NOT_INCLUDE_LARGE_REPORT/);assert.equal(f.engine.starts,0);
+});
+
+test('research detail retains all 100 parameter sets and 96 active progress rows alongside background polling',async t=>{
+  const f=await fixture(t);await f.login();const research=f.app.state.research;
+  const trials=Array.from({length:100},(_,index)=>({id:index?'candidate_'+index:'incumbent',parameter_set_id:`P${index+1}`,
+    status:index<96?'training':'pending',parameters:index?{min_signal_score:60+index/10}:{},effective_parameters:{min_signal_score:60+index/10,min_adx:18,min_setup_volume:1.2,max_atr_extension:2.5}}));
+  const active=trials.slice(0,96).map((trial,index)=>({parameter_set_id:trial.parameter_set_id,phase:'tuning_train',interval:'5minute',process_id:10000+index,
+    progress:(500+index)/10000,processed_bars:500+index,total_bars:10000,completed_intervals:0,total_intervals:1,thread_limit:4,active_threads:4,
+    workers:Array.from({length:4},(_,thread)=>({process_id:10000+index,worker_id:thread+2,state:'busy',affinity:{status:'pinned',verified:true,group:Math.floor(index/32),cpu:(index%32)*2+thread%2,core:index}}))}));
+  const parallelism={worker_limit:96,active_workers:96,process_limit:96,active_processes:96,thread_limit:384,active_threads:384,
+    completed_tasks:0,total_tasks:100,failed_tasks:0,active_sets:active,workers:active.flatMap(set=>set.workers),memory_waiting:false,
+    available_memory_mib:60000,memory_reserve_mib:8000,startup_memory_mib:2176,initializing_processes:0,max_initializing:4};
+  const tuning={status:'running',phase:'tuning_train',progress:.03,trial:1,trial_count:100,trials,parallelism};
+  Object.assign(research.state,{status:'running',progress:17.8,message:'Training parameter sets',tuning,report:{marker:'previous-full-report'}});
+  const read=async url=>{const response=await f.request(url);assert.equal(response.status,200);return response.json();};
+  const expectedIds=trials.map(trial=>trial.parameter_set_id),activeIds=expectedIds.slice(0,96);
+  for(let round=0;round<3;round++){
+    const [detail,background,otherDetail]=await Promise.all([read('/api/research'),read('/api/state'),read('/api/research')]);
+    const summary=background.state.background.research;
+    for(const full of [detail,otherDetail]){
+      assert.equal(full.status,'running');assert.deepEqual(full.tuning.trials.map(trial=>trial.parameter_set_id),expectedIds);
+      assert.deepEqual(full.tuning.parallelism.active_sets.map(set=>set.parameter_set_id),activeIds);
+      assert.deepEqual(full.tuning.parallelism.active_sets,active);assert.equal(full.tuning.parallelism.workers.length,384);
+      assert.equal(full.tuning.parallelism.active_processes,96);assert.equal(full.tuning.parallelism.active_threads,384);
+      assert.deepEqual(full.tuning.trials.slice(96).map(trial=>trial.status),['pending','pending','pending','pending']);
+      assert.equal(full.report.marker,'previous-full-report');
+    }
+    assert.deepEqual(summary.tuning.parallelism.active_sets,active);assert.equal(summary.tuning.parallelism.workers.length,384);
+    assert.equal(Object.hasOwn(summary.tuning,'trials'),false);assert.equal(Object.hasOwn(summary,'report'),false);
+    // Summary and full status are independent snapshots, so consumers cannot
+    // truncate the live catalogue or its per-process progress through a read.
+    const localSummary=research.summary(),localDetail=research.status();
+    localSummary.tuning.parallelism.active_sets.length=0;localDetail.tuning.trials.length=0;
+    assert.equal(research.state.tuning.trials.length,100);assert.equal(research.state.tuning.parallelism.active_sets.length,96);
+    for(const set of active){set.processed_bars+=100;set.progress=set.processed_bars/set.total_bars;}
+  }
+  assert.equal(f.engine.starts,0);assert.equal(f.engine.connected,false);assert.equal(research.worker.worker,null);
+});
+
 test('research endpoints are authenticated read-only jobs with CSRF and no arbitrary dataset or credentials',async t=>{
   const f=await fixture(t);let starts=0,cancels=0;
   f.app.state.research.start=()=>{starts++;return {status:'collecting',progress:0,report:null};};
@@ -88,6 +140,36 @@ test('research endpoints are authenticated read-only jobs with CSRF and no arbit
   assert.equal((await f.request('/api/research/cancel','POST',{})).status,200);assert.equal(cancels,1);
   f.app.state.restartRequired=true;assert.equal((await f.request('/api/research/start','POST',{})).status,409);assert.equal(starts,1);
   assert.doesNotMatch(JSON.stringify(f.store.events()),/must-not-be-accepted/);
+});
+
+test('manual research application requires authentication, CSRF and report/set identities only',async t=>{
+  const f=await fixture(t);let applied=0;const body={report_id:'12345678-1234-4321-8321-123456789012',parameter_set_id:'P2'};
+  f.app.state.research.selectParameterSet=async(report,set)=>{assert.equal(report,body.report_id);assert.equal(set,'P2');applied++;return {status:'complete',report:{optimization:{application:{status:'waiting'}}}};};
+  assert.equal((await f.request('/api/research/apply','POST',body)).status,401);await f.login();
+  assert.equal((await f.request('/api/research/apply','POST',body,{'x-csrf-token':'bad'})).status,403);
+  for(const invalid of [{...body,parameters:{min_adx:20}},{...body,parameter_set_id:'P101'},{...body,report_id:'old'},{parameter_set_id:'P2'}])assert.equal((await f.request('/api/research/apply','POST',invalid)).status,422);
+  assert.equal((await f.request('/api/research/apply','POST',body)).status,200);assert.equal(applied,1);assert.equal(f.engine.starts,0);
+  f.app.state.restartRequired=true;assert.equal((await f.request('/api/research/apply','POST',body)).status,409);assert.equal(applied,1);
+});
+
+test('Research page sizes persist without pausing trading or granting arbitrary settings access',async t=>{
+  const f=await fixture(t),values={research_symbols:150,research_tuning_trials:50};
+  assert.equal((await f.request('/api/research/settings','PUT',values)).status,401);await f.login();
+  assert.equal((await f.request('/api/research/settings','PUT',values,{'x-csrf-token':'bad'})).status,403);
+  assert.equal((await f.request('/api/research/settings','PUT',{...values,risk_per_trade_pct:.05})).status,422);
+  for(const invalid of [{...values,research_symbols:151},{...values,research_tuning_trials:101},{...values,research_symbols:0}])assert.equal((await f.request('/api/research/settings','PUT',invalid)).status,409);
+  assert.equal((await f.request('/api/research/settings','PUT',{...values,research_symbols:'150'})).status,422);
+  f.engine.status='running';f.engine.positions=[{symbol:'INFY'}];const risk=f.settings.risk_per_trade_pct;
+  const saved=await f.request('/api/research/settings','PUT',values);assert.equal(saved.status,200);assert.deepEqual((await saved.json()).settings,values);
+  for(const mode of ['invalid',null,1])assert.equal((await f.request('/api/research/settings','PUT',{...values,research_cpu_affinity:mode})).status,422);
+  const affinityValues={...values,research_cpu_affinity:'automatic'},affinitySaved=await f.request('/api/research/settings','PUT',affinityValues);
+  assert.equal(affinitySaved.status,200);assert.deepEqual((await affinitySaved.json()).settings,affinityValues);
+  assert.equal(f.settings.research_cpu_affinity,'automatic');assert.equal(f.manager.candidate({}).research_cpu_affinity,'automatic');
+  assert.equal(f.settings.research_symbols,150);assert.equal(f.manager.candidate({}).research_tuning_trials,50);assert.equal(f.settings.risk_per_trade_pct,risk);
+  assert.equal(f.engine.status,'running');assert.equal(f.engine.positions.length,1);assert.equal(f.app.state.restartRequired,false);assert.equal(f.engine.starts,0);
+  f.app.state.research.state.status='running';assert.equal((await f.request('/api/research/settings','PUT',values)).status,409);f.app.state.research.state.status='idle';
+  f.store.set('research_pending_tuning',{id:'queued'});assert.equal((await f.request('/api/research/settings','PUT',values)).status,409);f.store.delete('research_pending_tuning');
+  f.app.state.restartRequired=true;assert.equal((await f.request('/api/research/settings','PUT',values)).status,409);
 });
 
 test('all enhanced controls have editable defaults and invalid combinations are rejected before saving',async t=>{
@@ -140,8 +222,108 @@ test('OAuth is session-bound, one use, account-bound and encrypts persisted toke
 test('wrong broker account never starts and does not persist an access token',async t=>{
   const f=await fixture(t,{exchangeToken:async()=>({user_id:'OTHER',access_token:'secret'})});await f.login();
   const {redirect_url}=await (await f.request('/api/trading/start','POST',{})).json(),nonce=new URLSearchParams(new URL(redirect_url).searchParams.get('redirect_params')).get('state');
-  assert.equal((await f.request(`/auth/kite/callback?status=success&request_token=x&state=${nonce}`)).headers.get('location'),'/?error=wrong_account');assert.equal(f.store.get('kite_session'),null);assert.equal(f.engine.starts,0);
+  assert.equal((await f.request(`/auth/kite/callback?status=success&request_token=x&state=${nonce}`)).headers.get('location'),'/');
+  const {state}=await (await f.request('/api/state')).json();assert.equal(state.startup.status,'failed');assert.match(state.startup.message,/client ID did not match/);assert.equal(f.store.get('kite_session'),null);assert.equal(f.engine.starts,0);
 });
+
+function deferred(){let resolve;const promise=new Promise(done=>{resolve=done;});return {promise,resolve};}
+async function waitStartup(f,status){
+  for(let attempt=0;attempt<100;attempt++){
+    const {state}=await (await f.request('/api/state')).json();
+    if(state.startup.status===status)return state;
+    await new Promise(resolve=>setTimeout(resolve,5));
+  }
+  assert.fail(`Startup did not reach ${status}`);
+}
+async function oauthCallback(f){
+  const {redirect_url}=await (await f.request('/api/trading/start','POST',{})).json();
+  const nonce=new URLSearchParams(new URL(redirect_url).searchParams.get('redirect_params')).get('state');
+  return `/auth/kite/callback?status=success&request_token=private-request&state=${nonce}`;
+}
+
+test('OAuth returns the dashboard and readable progress while token exchange is pending; duplicate starts reuse the job',{timeout:5000},async t=>{
+  const exchange=deferred();t.after(()=>exchange.resolve());let exchanges=0;
+  const f=await fixture(t,{exchangeToken:async()=>{exchanges++;await exchange.promise;return {user_id:'AB1234',access_token:'broker-private-token'};}});await f.login();
+  const callback=await oauthCallback(f);
+  assert.equal((await f.request(callback)).headers.get('location'),'/');
+  let state=(await (await f.request('/api/state')).json()).state;
+  assert.equal(state.startup.status,'running');assert.equal(state.startup.phase,'authenticating');assert.equal(state.startup.completed,0);assert.equal(f.engine.starts,0);
+  const repeated=await f.request('/api/trading/start','POST',{});assert.equal(repeated.status,202);assert.equal((await repeated.json()).startup.started_at,state.startup.started_at);
+  assert.equal((await f.request(callback)).headers.get('location'),'/?error=callback');assert.equal(exchanges,1);
+  const initialRevision=state.startup.revision,operation=state.startup.operation_id;
+  exchange.resolve();state=await waitStartup(f,'complete');assert.equal(f.engine.starts,1);assert.equal(state.startup.completed,state.startup.total);assert.ok(state.startup.revision>initialRevision);assert.equal(state.startup.operation_id,operation);
+  assert.doesNotMatch(JSON.stringify(state),/private-request|broker-private-token/);
+});
+
+test('slow account connection reports real stages and Pause prevents the pending OAuth startup from arming',{timeout:5000},async t=>{
+  const connection=deferred();t.after(()=>connection.resolve());
+  class SlowEngine extends Engine{
+    async connect(token,user,{onProgress}){onProgress({phase:'holdings',message:'Downloading current holdings.',completed:3,total:10});await connection.promise;await super.connect(token,user);}
+    async pause(){await connection.promise;await super.pause();}
+  }
+  const f=await fixture(t,{engineFactory:SlowEngine});await f.login();await f.request(await oauthCallback(f));
+  const state=(await (await f.request('/api/state')).json()).state;
+  assert.equal(state.startup.phase,'holdings');assert.match(state.startup.message,/Downloading current holdings/);assert.equal(state.startup.completed,4);assert.equal(state.startup.total,13);
+  assert.equal((await f.request('/health')).status,200);
+  const pause=await f.request('/api/trading/pause','POST',{});assert.equal(pause.status,202);assert.equal((await pause.json()).startup.phase,'cancelling');
+  connection.resolve();await waitStartup(f,'cancelled');assert.equal(f.engine.starts,0);assert.equal(f.engine.status,'paused');
+});
+
+test('connected Start responds before reconciliation ends, stays single-flight, and cancellation is visible before arming',{timeout:5000},async t=>{
+  const reconciliation=deferred();t.after(()=>reconciliation.resolve());let attempts=0;
+  class SlowStartEngine extends Engine{
+    async start({onProgress,isCancelled}){attempts++;onProgress({phase:'account',message:'Reconciling broker orders.',completed:0,total:2});await reconciliation.promise;if(isCancelled())return;await super.start();}
+  }
+  const f=await fixture(t,{engineFactory:SlowStartEngine});await f.login();f.engine.connected=true;
+  const start=await f.request('/api/trading/start','POST',{});assert.equal(start.status,202);
+  assert.equal((await (await f.request('/api/state')).json()).state.startup.message,'Reconciling broker orders.');
+  assert.equal((await f.request('/api/trading/start','POST',{})).status,202);assert.equal(attempts,1);
+  assert.equal((await f.request('/api/trading/pause','POST',{})).status,202);
+  reconciliation.resolve();await waitStartup(f,'cancelled');assert.equal(f.engine.starts,0);
+});
+
+test('Pause also invalidates an outstanding Zerodha login before its callback can start trading',async t=>{
+  let exchanges=0;const f=await fixture(t,{exchangeToken:async()=>{exchanges++;return {user_id:'AB1234',access_token:'secret'};}});await f.login();
+  const callback=await oauthCallback(f);assert.equal((await f.request('/api/trading/pause','POST',{})).status,200);
+  assert.equal((await f.request(callback)).headers.get('location'),'/?error=callback');assert.equal(exchanges,0);assert.equal(f.engine.starts,0);
+});
+
+test('failed background startup exposes a safe failure and can retry without leaking broker responses',async t=>{
+  let attempts=0;
+  class FailingEngine extends Engine{
+    async start({onProgress}){attempts++;onProgress({phase:'account',message:'Downloading current funds.',completed:0,total:2});if(attempts===1)throw new Error('unsafe upstream response private-request broker-private-token');await super.start();}
+  }
+  const f=await fixture(t,{engineFactory:FailingEngine});await f.login();f.engine.connected=true;
+  assert.equal((await f.request('/api/trading/start','POST',{})).status,202);
+  const failed=await waitStartup(f,'failed');assert.equal(failed.startup.completed,0);assert.match(failed.startup.message,/could not start/);assert.doesNotMatch(JSON.stringify(failed),/unsafe upstream|private-request|broker-private-token/);
+  assert.equal((await f.request('/api/trading/start','POST',{})).status,202);const retried=await waitStartup(f,'complete');assert.equal(f.engine.starts,1);assert.ok(retried.startup.revision>failed.startup.revision);assert.notEqual(retried.startup.operation_id,failed.startup.operation_id);assert.equal(retried.startup.lifecycle_id,failed.startup.lifecycle_id);
+  await f.close();const g=await fixture(t,{root:f.root});await g.login();const restarted=(await (await g.request('/api/state')).json()).state;
+  assert.notEqual(restarted.startup.lifecycle_id,retried.startup.lifecycle_id);assert.equal(restarted.startup.revision,0);await g.close();
+});
+
+test('saved-session restoration serves the dashboard while downloads run and never automatically enables entries',{timeout:5000},async t=>{
+  const connection=deferred();t.after(()=>connection.resolve());
+  const f=await fixture(t);f.store.set('kite_session',new Fernet(f.settings.token_encryption_key).encrypt(JSON.stringify({access_token:'saved-private-token',user_id:'AB1234',expires:Date.now()/1000+3600})));await f.close();
+  class RestoringEngine extends Engine{
+    async connect(token,user,{onProgress}){onProgress({phase:'instruments',message:'Downloading NSE instruments.',completed:7,total:10});await connection.promise;await super.connect(token,user);}
+  }
+  const g=await fixture(t,{root:f.root,engineFactory:RestoringEngine});await g.login();
+  let state=(await (await g.request('/api/state')).json()).state;assert.equal(state.startup.status,'running');assert.equal(state.startup.phase,'instruments');assert.equal(g.engine.starts,0);
+  connection.resolve();state=await waitStartup(g,'complete');assert.match(state.startup.message,/remain paused/);assert.equal(g.engine.connected,true);assert.equal(g.engine.starts,0);await g.close();
+});
+
+test('shutdown cancels a pending startup and waits for it without arming or writing after store closure',{timeout:5000},async t=>{
+  const exchange=deferred();t.after(()=>exchange.resolve());
+  const f=await fixture(t,{exchangeToken:async()=>{await exchange.promise;return {user_id:'AB1234',access_token:'late-token'};}});await f.login();await f.request(await oauthCallback(f));
+  const shuttingDown=f.app.shutdown();exchange.resolve();await shuttingDown;assert.equal(f.engine.starts,0);assert.equal(f.engine.connected,false);assert.equal(f.app.state.startup.status,'cancelled');
+});
+
+test('read-only research failure does not misreport successful trading startup as failed',async t=>{
+  const f=await fixture(t);await f.login();f.app.state.research.maybeStart=async()=>{throw new Error('Temporary research failure');};
+  await f.request(await oauthCallback(f));const state=await waitStartup(f,'complete');assert.equal(f.engine.starts,1);assert.equal(state.status,'running');
+  assert.ok(f.store.latest_events().some(event=>event.kind==='research.retry_wait'));
+});
+
 function postback(change={}){const value={order_id:'260917001',order_timestamp:'2026-09-17 09:40:00',user_id:'AB1234',status:'COMPLETE',...change};value.checksum=crypto.createHash('sha256').update(value.order_id+value.order_timestamp+'testapisecret').digest('hex');return value;}
 test('postbacks only request reconciliation, deduplicate durably and never trust unsigned order fields',async t=>{
   const f=await fixture(t),p=postback({average_price:123,filled_quantity:500});

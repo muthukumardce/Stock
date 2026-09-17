@@ -14,6 +14,7 @@ import { marketBreadth, portfolioExposure, portfolioEntryGate, returnCorrelation
 import { sideOf, directionOf, exitSideOf, plannedRisk, markedProfit } from './direction.js';
 import { MarketContext } from './market-context.js';
 import { EquityUniverse } from './equity-universe.js';
+import { BackgroundActivity } from './background-activity.js';
 import { validate_bars } from './indicators.js';
 import { Mutex, sleep, monotonic, nowIST, parseTime, dateIST, timeIST, isoIST, marketHours } from './util.js';
 
@@ -90,6 +91,11 @@ export class TradingEngine {
     this.analytics = options.analyticsFactory ? options.analyticsFactory(settings) : new AnalyticsPool(settings.analytics_workers || 0, settings.analytics_reserve_cpus ?? 4, settings.analytics_batch_size || 32);
     this._analysis_pending = new Map(); this._analysis_tasks = new Set(); this._analysis_cache = new Map(); this._analysis_generation = 0;
     this._analysis_requested = new Map(); this._analysis_sequence = 0;
+    this._activity = new BackgroundActivity(() => this._now());
+    this._active_batches = new Map();
+    this._last_analysis_error = null;
+    this._last_analysis_at = null;
+    this._batch_sequence = 0;
     this._correlation_wanted = new Set(); this._candidate_batch_at = null;
     this.previous_intraday={};
     this.market_context=options.marketContextFactory?options.marketContextFactory(store,settings):new MarketContext(store,settings,{now:()=>this._now()});
@@ -156,9 +162,12 @@ export class TradingEngine {
     return {...config,manage_existing_holdings:'selected',managed_symbols:[...symbols]};
   }
   async _refresh_universe_locked(instruments=null,onStage=null){
+    const activity=this._activity.begin('universe',{message:'Downloading NSE instruments.',total:3});
+    try {
     const today=dateIST(this._now());
     this._universe_retry_at=monotonic()+60;
     const master=instruments||(this._instrument_master_date===today&&this._instrument_master?this._instrument_master:await this.broker.call('instruments','NSE'));
+    activity({message:'Verifying official NSE stock and ETF lists.',completed:1});
     const managedSymbols=[...new Set([...Object.keys(this.positions),...values(this.intents).filter(i=>!['closed','rejected'].includes(i.state)).map(i=>i.symbol),...entries(this.delivery?.snapshot().positions||{}).filter(([,p])=>p.status!=='closed').map(([symbol])=>symbol)])];
     const result=await this.equity_universe.resolve(master,{managedSymbols});
     if(result.instruments.length>9000)throw new Error('Verified NSE shares plus managed exposure exceed the streaming capacity. No symbols were silently removed.');
@@ -185,8 +194,11 @@ export class TradingEngine {
     const activeBroker=this.broker;
     const current=()=>this.broker===activeBroker&&generation===this._universe_generation&&!this._shutdown;
     onStage?.('stream');
+    activity({message:`Subscribing to ${Object.keys(next).length} NSE instruments.`,completed:2});
     await activeBroker.stream(Object.keys(next).map(Number),ticks=>{if(current())this._on_ticks(ticks);},order=>{if(current())this._on_order(order);},(...args)=>{if(current())this._on_stream(...args);});
     if(current()&&dateIST(this._now())===today)this._universe_date=result.summary.status==='verified'?today:'';
+    activity({status:result.summary.status==='verified'?'idle':'waiting',message:result.summary.status==='verified'?`${Object.keys(next).length} NSE instruments classified; feed subscriptions requested.`:'Official NSE lists unavailable. Entries wait for verification.',completed:3});
+    } catch (error) { activity({status:'failed',message:'NSE universe refresh failed. Reconnect if startup failed; connected monitoring retries refreshes.',failed:1});throw error; }
   }
   _has_managed_or_authorized_exposure() {
     return count(this.positions) > 0 || this._authorized_holdings().length > 0 || values(this.delivery?.snapshot().positions || {}).some(p => p.status !== 'closed');
@@ -215,7 +227,7 @@ export class TradingEngine {
     }
   }
 
-  async connect(access_token, user_id) {
+  async connect(access_token, user_id, {onProgress} = {}) {
     return this._lock.run(async () => {
       if (this.user_id && this.user_id !== user_id) throw new Error('This data directory belongs to a different Zerodha account.');
       if (this.settings.kite_user_id && this.settings.kite_user_id !== user_id) throw new Error('The Zerodha account does not match KITE_USER_ID.');
@@ -229,19 +241,28 @@ export class TradingEngine {
       this.user_id = user_id; this.running = false; this._shutdown = false;
       let stage = 'profile';
       try {
+        onProgress?.({phase:'profile',message:'Verifying your Zerodha account.',completed:0,total:10});
         const profile = await this.broker.call('profile');
         if (String(profile.user_id || '').toUpperCase() !== String(user_id).toUpperCase()) throw new Error('Broker profile belongs to another account');
-        this._profile = profile;this._profile_verified = true; stage = 'account'; await this._refresh_account_locked({ rebase_capital: true });
+        this._profile = profile;this._profile_verified = true; stage = 'account';
+        onProgress?.({phase:'account',message:'Downloading your Zerodha account.',completed:1,total:10});
+        await this._refresh_account_locked({ rebase_capital: true, onProgress:progress=>onProgress?.({...progress,completed:1+progress.completed,total:10}) });
         stage = 'universe';
-        const instruments = await this.broker.call('instruments', 'NSE');
+        onProgress?.({phase:'instruments',message:'Downloading the NSE instrument list.',completed:7,total:10});
+        const universeActivity=this._activity.begin('universe',{message:'Downloading the NSE instrument list.',total:3});
+        let instruments;
+        try {instruments=await this.broker.call('instruments','NSE');}
+        catch(error){universeActivity({status:'failed',message:'NSE instrument download failed. Reconnect to retry startup.',failed:1});throw error;}
         this.connected = true;
-        await this._refresh_universe_locked(instruments, value => { stage = value; });
+        onProgress?.({phase:'universe',message:'Verifying NSE stock and ETF lists.',completed:8,total:10});
+        await this._refresh_universe_locked(instruments, value => { stage = value; onProgress?.({phase:value,message:'Subscribing to the live NSE market feed.',completed:9,total:10}); });
         stage = 'readiness';
         if (!this._unresolved_intents()) { this.status = 'monitoring'; this.error = null; this.message = 'Monitoring Zerodha. Entries wait for completed strategy candles, prior-session context and fresh risk checks.'; }
         this._advance_recovery();
         if (this._backgroundLoops) this._start_tasks();
         this._event('connected', 'Zerodha account connected; entries remain paused.', { user_id, universe_count: count(this.universe), mode: this.mode });
         this._event('analytics_capacity', 'Parallel analytics ready; order execution remains serial.', this.analytics.snapshot()); this._persist();
+        onProgress?.({phase:'connected',message:'Account connected. Background candle loading and monitoring are active.',completed:10,total:10});
       } catch (exc) {
         const failure = failureMetadata(exc, 'connect', stage);
         this.connected = false; this._halt(`Connection setup failed (${failure.kind}). Verify Kite API access and reconnect.`, 'connection_error', failure);
@@ -252,8 +273,9 @@ export class TradingEngine {
     });
   }
 
-  async start() {
+  async start({onProgress,isCancelled=()=>false} = {}) {
     return this._lock.run(async () => {
+      if (isCancelled()) return;
       if (this._maintenance()) throw new Error('Maintenance is active; trading cannot start.');
       if (this._other_mode_live_risk()) throw new Error('Unresolved real-money exposure exists from live mode. Restore live configuration and reconcile before using paper mode.');
       if (!this.connected || !this.broker) throw new Error('Connect Zerodha before starting trading.');
@@ -263,14 +285,19 @@ export class TradingEngine {
       if (allocations.some(c => !Number.isFinite(c) || c < 0) || sum(allocations) > 1.0000001) throw new Error('Saved strategy allocations exceed available capital. Update Settings before starting.');
       if (['intraday', 'swing'].some(s => config[`${s}_enabled`] && Number(config[`${s}_allocation_pct`] || 0) <= 0)) throw new Error('Every enabled strategy needs a positive allocation.');
       if (this.mode === 'live' && !this.settings.live_trading_enabled) throw new Error('Live trading must be enabled in Settings.');
-      this.running = false; this._begin_recovery(); this._roll_day(); await this._refresh_account_locked({ rebase_capital: true });
+      onProgress?.({phase:'account',message:'Refreshing account balances and reconciling existing positions.',completed:0,total:2});
+      this.running = false; this._begin_recovery(); this._roll_day(); await this._refresh_account_locked({ rebase_capital: true, onProgress:progress=>onProgress?.({...progress,completed:0,total:2}) });
+      if (isCancelled()) return;
+      onProgress?.({phase:'risk',message:'Checking recovery, strategy allocation and risk limits.',completed:1,total:2});
       if (this._unresolved_intents()) { this._advance_recovery(); throw new Error('An order or exit is unresolved. Reconcile it in Zerodha before restarting.'); }
       if (this.capital > 0 && this._daily_pnl() <= -this.capital * this.settings.daily_loss_pct) throw new Error('The daily loss limit has been reached.');
       if (this._maintenance()) throw new Error('Maintenance began during account reconciliation; trading remains paused.');
+      if (isCancelled()) return;
       this.running = true; this.status = 'running'; this.error = null;
       this._update_running_message();
       this._event('trading_started', 'Trading enabled.', { mode: this.mode, strategies: this.strategy_settings() }); this._advance_recovery();
       for (const token of Object.keys(this.universe)) if (monotonic() - (this.quotes[token]?.received_at ?? -Infinity) <= 10) this._queue_current_analysis(Number(token));
+      onProgress?.({phase:'armed',message:'Startup finished. Strategies wait for eligible data and all entry checks.',completed:2,total:2});
     });
   }
   _waiting_for_funds() {
@@ -360,6 +387,7 @@ export class TradingEngine {
   }
   async _stop_tasks() {
     this._controller?.abort(); this._wakeMonitor?.(); this._wakeMonitor = null;
+    this._activity.stop();
     this._invalidate_decisions();
     // A caller can own the execution mutex. Waiting here on another task queued
     // for that mutex would deadlock; tasks check cancellation after acquiring it.
@@ -444,7 +472,11 @@ export class TradingEngine {
   }
   async _market_context_loop(signal){
     while(!signal?.aborted&&!this._shutdown){
-      if(this.connected){await this.market_context.refresh(this);if(!signal?.aborted&&!this._shutdown&&this.connected)this._refresh_context_analyses();}
+      const activity=this._activity.begin('market_context',{message:'Refreshing benchmark, sector and event data.'});
+      try {
+        if(this.connected){await this.market_context.refresh(this);if(!signal?.aborted&&!this._shutdown&&this.connected)this._refresh_context_analyses();}
+        activity({status:'waiting',message:this.connected?'Refresh pass finished; individual source coverage is shown in Market context.':'Waiting for Zerodha connection.',next_retry_at:new Date(+this._now()+60000).toISOString()});
+      } catch(error) {activity({status:'failed',message:'Market context refresh failed.',failed:1});throw error;}
       await sleep(60000,signal);
     }
   }
@@ -471,10 +503,14 @@ export class TradingEngine {
       while (this._analysis_pending.size && this._analysis_tasks.size < this.analytics.worker_limit) {
         const batch = [...this._analysis_pending.keys()].slice(0, this.analytics.batch_size).map(key => { const job = this._analysis_pending.get(key); this._analysis_pending.delete(key); return job; });
         let task;
+        const batchId=++this._batch_sequence;
+        this._last_analysis_error=null;
+        this._last_analysis_at=isoIST(this._now());
+        this._active_batches.set(batchId,{symbols:[...new Set(batch.map(job=>this.universe[job.token]?.tradingsymbol).filter(Boolean))].slice(0,32),symbol_count:batch.length,strategies:[...new Set(batch.map(job=>job.strategy))],started_at:isoIST(this._now())});
         task = Promise.resolve().then(() => this.analytics.analyze(batch)).then(results => this._analysis_finished(results)).catch(exc => {
           const failure = failureMetadata(exc, 'analytics', 'analyze');
-          if (!signal?.aborted && !this._shutdown) this._halt(`Parallel analytics failed (${failure.kind}); entries paused while monitoring and exits continue.`, 'analytics_error', failure);
-        }).finally(() => this._analysis_tasks.delete(task));
+          if (!signal?.aborted && !this._shutdown) {this._last_analysis_error=`Parallel analytics failed (${failure.kind}). Entries paused; account monitoring continues.`;this._halt(`Parallel analytics failed (${failure.kind}); entries paused while monitoring and exits continue.`, 'analytics_error', failure);}
+        }).finally(() => {this._analysis_tasks.delete(task);this._active_batches.delete(batchId);this._last_analysis_at=isoIST(this._now());});
         this._analysis_tasks.add(task);
       }
       await sleep(100, signal);
@@ -641,12 +677,15 @@ export class TradingEngine {
   }
   async _run(signal = this._controller?.signal) {
     while (!signal?.aborted && !this._shutdown) {
+      const activity=this._activity.begin('execution',{status:'waiting',message:'Waiting for the account and execution lock.'});
       try {
-        await this._lock.run(async () => { if (!signal?.aborted && !this._shutdown) await this._run_once(); });
+        await this._lock.run(async () => { if (!signal?.aborted && !this._shutdown) {activity({status:'running',message:'Checking current positions, exits and eligible trade candidates.'});await this._run_once();} });
+        activity({status:'waiting',message:this.running?'Decision pass finished. New entries require all entry checks.':'Decision pass finished. New entries are paused; position management continues.',next_retry_at:new Date(+this._now()+1000).toISOString()});
         await sleep(1000, signal);
       } catch (exc) {
         if (signal?.aborted || this._shutdown) return;
         const failure = failureMetadata(exc, 'trading_loop', 'execution');
+        activity({status:'failed',message:`Decision pass interrupted (${failure.kind}); entries paused. The loop will retry.`,failed:1,next_retry_at:new Date(+this._now()+2000).toISOString()});
         this._halt(`Trading loop interrupted (${failure.kind}); entries paused.`, 'engine_error', failure); await sleep(2000, signal);
       }
     }
@@ -681,9 +720,12 @@ export class TradingEngine {
       }
     }
   }
-  async _refresh_account_locked({ rebase_capital = false, authorization_user_confirmed=false, reconcile_positions=true } = {}) {
+  async _refresh_account_locked({ rebase_capital = false, authorization_user_confirmed=false, reconcile_positions=true, onProgress } = {}) {
+    const activity=this._activity.begin('account',{message:'Downloading balances, holdings, positions, orders and trades.',total:6});
+    try {
     const wasWaitingForFunds = this._waiting_for_funds();
-    const account = await this.broker.account();
+    const account = await this.broker.account(progress=>{activity({message:progress.message,completed:progress.completed});onProgress?.(progress);});
+    activity({message:'Reconciling current balances, holdings and order protection.',completed:5});
     for (const order of account.orders || []) this._record_order(order);
     for (const trade of account.trades || []) {
       const key = JSON.stringify([String(trade.order_id), String(trade.trade_id)]);
@@ -721,6 +763,8 @@ export class TradingEngine {
       if (this.recovery.phase === 'ready') for (const token of Object.keys(this.universe)) if (monotonic() - (this.quotes[token]?.received_at ?? -Infinity) <= 10) this._queue_current_analysis(Number(token));
     }
     this._persist();
+    activity({status:'waiting',message:'Account reconciled. Monitoring order events; the next periodic check is scheduled in about 15 seconds.',completed:6,next_retry_at:new Date(+this._now()+15000).toISOString()});
+    } catch(error) {activity({status:'failed',message:'Account reconciliation failed. New entries remain subject to account safety checks.',failed:1});throw error;}
   }
   _available_cash() {
     return this._cash_balance() ?? 0;
@@ -1030,29 +1074,46 @@ export class TradingEngine {
     const attempts=Math.min(4,(this._daily_history_retry[token]?.attempts||0)+1);
     this._daily_history_retry[token]={attempts,next_at:monotonic()+Math.min(300,60*2**(attempts-1))};
   }
+  _history_rate_wait(activity, error=null) {
+    const health=this.broker?.rate_limit_health?.().categories?.find(item=>item.category==='historical'&&item.status==='cooldown');
+    if (!health && error?.http_status!==429) return false;
+    const delay=Math.max(1,Number(health?.retry_after_seconds||error?.retry_after_seconds)||30);
+    activity({status:'waiting',message:'Zerodha historical-data rate limit (HTTP 429). Downloads are paused until the cooldown ends; cached history is retained.',next_retry_at:health?.retry_at||error?.retry_at||new Date(+this._now()+delay*1000).toISOString()});
+    return true;
+  }
   async _history_pass(signal) {
     const config = this.strategy_settings(), today = dateIST(this._now()), holdingTokens = this._holding_tokens();
     const riskTokens=this.settings.correlation_filter?new Set([...this._correlation_wanted,...this._holding_tokens(),...values(this.positions).map(p=>Number(p.token))]):new Set();
     const wanted = this._priority_tokens(Object.keys(this.universe).map(Number).filter(t => config.swing_enabled || holdingTokens.has(t)||riskTokens.has(t)), new Set([...holdingTokens,...riskTokens]));
     const coverage = today + (config.swing_enabled ? ':all' : ':holdings:' + [...new Set([...holdingTokens,...riskTokens])].sort((a, b) => a - b).join(','));
-    if (!wanted.length || this._history_date === coverage || !this.connected) return;
+    const activity=this._activity.begin('daily_history',{message:'Checking completed daily candle coverage.',total:wanted.length});
+    if (!wanted.length || this._history_date === coverage || !this.connected) {
+      activity({status:'waiting',completed:this._history_date===coverage?wanted.length:0,message:!this.connected?'Waiting for Zerodha connection.':!wanted.length?'No daily history is currently required for holdings, swing or correlation checks.':'Daily candle coverage is current. Waiting for the next session or scope change.'});return;
+    }
+    if(this._history_rate_wait(activity)){
+      activity({completed:wanted.filter(token=>this._daily_history_bars(this.daily[token],today,holdingTokens.has(token)?21:55).length).length});return;
+    }
     const broker = this.broker,generation=this._universe_generation;
     const valid=()=>this.connected&&!signal?.aborted&&!this._shutdown&&broker===this.broker&&generation===this._universe_generation&&dateIST(this._now())===today;
     let completed = 0, failed = 0, deferred = 0;
+    let finished=false;
+    try {
     this._event('daily_history', 'Loading completed daily candles for NSE swing analysis. Coverage grows as the rate-limited download completes.');
     for (const token of wanted) {
       if(!valid())return;
       const symbol=this.universe[token]?.tradingsymbol;if(!symbol)return;
       const currentIdentity=()=>valid()&&this.universe[token]?.tradingsymbol===symbol;
       const minimum=holdingTokens.has(token)?21:55;
-      if(this._daily_history_bars(this.daily[token],today,minimum).length){completed++;continue;}
+      if(this._daily_history_bars(this.daily[token],today,minimum).length){completed++;activity({completed});continue;}
       if(monotonic()<(this._daily_history_retry[token]?.next_at||0)){deferred++;continue;}
       const cache = this.store.get(`daily:${token}`, {})||{};let downloaded=false;
+      activity({message:`Checking cached daily candles for ${symbol}.`,current_item:symbol,completed,failed});
       try {
         let bars=cache.date===today&&cache.symbol===symbol?this._daily_history_bars(cache.rows,today,minimum):[];
         if(!bars.length){
           const end = parseTime(`${today}T00:00:00+05:30`);
           downloaded=true;
+          activity({message:`Downloading daily candles for ${symbol}.`});
           const rows = await broker.call('historical_data', token, new Date(end - 160 * 86400000), new Date(end - 1000), 'day');
           if(!currentIdentity())return;
           bars=this._daily_history_bars(rows,today,minimum);
@@ -1066,9 +1127,11 @@ export class TradingEngine {
       } catch (exc) {
         if(!currentIdentity())return;
         if (!(exc instanceof BrokerError)) throw exc;
+        if(this._history_rate_wait(activity,exc)){activity({completed,failed});finished=true;return;}
         failed++;this._retry_daily_history(token);
         if (exc.kind === 'TokenException') { this.connected = false; this._halt('Authentication expired while loading daily history. Reconnect Zerodha.', 'auth_expired', failureMetadata(exc, 'daily_history', 'download')); break; }
       }
+      activity({completed,failed});
       if ((completed + failed) % 100 === 0) this._event('daily_history', 'Daily candle download progress.', { downloaded: completed, failed, ready: count(this.daily), total: count(this.universe) });
       if(downloaded)await sleep(100,signal);
     }
@@ -1076,6 +1139,10 @@ export class TradingEngine {
     this._history_failures = wanted.length-completed;
     this._history_date=this.connected&&completed===wanted.length?coverage:'';
     this._event('daily_history', 'Daily history pass finished.', { ready:completed,failed,deferred,total:wanted.length });
+    const retryTimes=wanted.map(t=>this._daily_history_retry[t]?.next_at).filter(Number.isFinite);
+    activity({status:'waiting',completed,failed,message:completed===wanted.length?'Daily candle coverage is current.':`${completed} of ${wanted.length} symbols ready; incomplete or unavailable histories will be retried.`,next_retry_at:completed===wanted.length?null:new Date(+this._now()+Math.max(30000,retryTimes.length?(Math.min(...retryTimes)-monotonic())*1000:30000)).toISOString()});finished=true;
+    } catch(error) {activity({status:'failed',message:'Daily candle loading failed; the background loop will retry.',failed:failed+1});finished=true;throw error;}
+    finally {if(!finished)activity({status:this.connected?'waiting':'failed',completed,failed,message:this.connected?'Daily candle pass interrupted; waiting for a current account and universe.':'Daily candle loading stopped. Reconnect Zerodha to resume.'});}
   }
   async _history(signal = this._controller?.signal) {
     while (!signal?.aborted && !this._shutdown) {
@@ -1091,7 +1158,11 @@ export class TradingEngine {
     return priorDay<today&&age<=7*86400000&&timeIST(last)==='15:25';
   }
   async _intraday_history_pass(signal) {
-    if (!this.connected || !marketHours(this._now()) || !this.strategy_settings().intraday_enabled || !count(this.quotes)) return;
+    const activity=this._activity.begin('intraday_history',{message:'Checking five-minute candle coverage.',completed:this._intraday_history_loaded.size,total:count(this.universe),failed:this._intraday_history_failed});
+    if (!this.connected || !marketHours(this._now()) || !this.strategy_settings().intraday_enabled || !count(this.quotes)) {
+      activity({status:'waiting',message:!this.connected?'Waiting for Zerodha connection.':!this.strategy_settings().intraday_enabled?'Intraday trading is disabled.':!marketHours(this._now())?'Waiting for market hours to load current-session candles.':this._clock_block()?'Waiting for system clock verification and fresh market prices.':'Waiting for fresh market prices.'});return;
+    }
+    if(this._history_rate_wait(activity))return;
     const today=dateIST(this._now());
     for(const [token,seed] of entries(this.previous_intraday))if(!this._valid_intraday_seed(seed,today)){
       delete this.previous_intraday[token];this._intraday_history_loaded.delete(Number(token));delete this._intraday_history_retry[token];
@@ -1100,12 +1171,15 @@ export class TradingEngine {
     if (wanted.length) this._event('intraday_history', 'Loading completed five-minute candles, prioritising current turnover.', { remaining: wanted.length });
     const broker = this.broker,generation=this._universe_generation;
     const valid=()=>this.connected&&!signal?.aborted&&!this._shutdown&&broker===this.broker&&generation===this._universe_generation&&dateIST(this._now())===today;
+    let finished=false;
+    try {
     for (const token of wanted) {
       if(!valid()||!marketHours(this._now()))return;
       const symbol=this.universe[token]?.tradingsymbol;if(!symbol)return;
       const currentIdentity=()=>valid()&&this.universe[token]?.tradingsymbol===symbol;
       const now = this._now(), boundary = new Date(Math.floor(now.getTime() / 300000) * 300000), start = parseTime(`${dateIST(now)}T09:15:00+05:30`);
       if (boundary <= start) break;
+      activity({message:`Downloading five-minute candles for ${symbol}.`,current_item:symbol,completed:this._intraday_history_loaded.size});
       try {
         const cache=this.store.get(`intraday_seed:${token}`,{})||{},needsSeed=this.settings.enhanced_signals===true;
         if(!this.previous_intraday[token]?.length&&cache.date===dateIST(now)&&cache.symbol===symbol&&this._valid_intraday_seed(cache.bars,dateIST(now)))this.previous_intraday[token]=cache.bars.map(b=>new Candle(b.time??b.date,...['open','high','low','close','volume'].map(k=>b[k])));
@@ -1129,13 +1203,19 @@ export class TradingEngine {
       } catch (exc) {
         if(!currentIdentity())return;
         if (!(exc instanceof BrokerError)) throw exc;
+        if(this._history_rate_wait(activity,exc)){finished=true;return;}
         this._intraday_history_failed++;
         this._intraday_history_retry[token]=monotonic()+60;
         if (exc.kind === 'TokenException') { this.connected = false; this._halt('Authentication expired loading intraday history. Reconnect Zerodha.', 'auth_expired', failureMetadata(exc, 'intraday_history', 'download')); break; }
       }
+      activity({completed:this._intraday_history_loaded.size,failed:this._intraday_history_failed});
       if (this._intraday_history_loaded.size % 100 === 0) this._event('intraday_history', 'Intraday warmup progress.', { loaded: this._intraday_history_loaded.size, failed: this._intraday_history_failed, warmed: values(this.books).filter(b => b.bars.length >= 21).length, total: count(this.universe) });
       await sleep(100, signal);
     }
+    const remaining=count(this.universe)-this._intraday_history_loaded.size,retries=values(this._intraday_history_retry).filter(Number.isFinite);
+    activity({status:this.connected?'waiting':'failed',completed:this._intraday_history_loaded.size,failed:this._intraday_history_failed,message:!this.connected?'Five-minute candle loading stopped. Reconnect Zerodha to resume.':remaining?`${remaining} symbols still need complete candles; waiting for fresh data or retry. Current candles must close before use.`:'Historical warmup is complete. Live candles continue to build from market prices.',next_retry_at:this.connected&&remaining?new Date(+this._now()+Math.max(15000,retries.length?(Math.min(...retries)-monotonic())*1000:15000)).toISOString():null});finished=true;
+    } catch(error) {activity({status:'failed',message:'Five-minute candle loading failed; the background loop will retry.',failed:this._intraday_history_failed+1});finished=true;throw error;}
+    finally {if(!finished)activity({status:'waiting',message:'Candle loading paused; waiting for market hours and a current account/universe.'});}
   }
   async _intraday_history(signal = this._controller?.signal) {
     while (!signal?.aborted && !this._shutdown) {
@@ -1204,17 +1284,23 @@ export class TradingEngine {
     }
     this.holdings_signals = results;
   }
+  _background_snapshot() {
+    const tasks=this._activity.snapshot(),analytics=tasks.find(task=>task.id==='analytics');
+    const active=this._active_batches.size,pending=this._analysis_pending.size;
+    Object.assign(analytics,{status:active?'running':this._shutdown?'stopped':this._last_analysis_error?'failed':'waiting',message:active?`Analyzing ${active} batches of completed candles; ${pending} symbol/strategy jobs queued.`:this._last_analysis_error|| (pending?`${pending} symbol/strategy jobs queued for workers.`:this.connected?'Waiting for completed candles or changed market context.':'Waiting for Zerodha connection.'),completed:this.analytics.completed_symbols||0,total:0,current_item:null,updated_at:this._last_analysis_at||analytics.updated_at});
+    return {tasks};
+  }
   snapshot() {
     const positions = values(this.positions).map(p => ({ ...p, side:sideOf(p), unrealised: round(markedProfit(p)) }));
     const pending = values(this.intents).some(i => !['closed', 'rejected'].includes(i.state)), delivery = this.delivery?.snapshot() || {}, deliveryBusy = values(delivery.positions || {}).some(p => p.status !== 'closed'), unrealised = this._unrealised();
-    return jsonable({ mode: this.mode, status: this.status, connected: this.connected, user_id: this.user_id, capital: this.capital, waiting_for_funds: this._waiting_for_funds(), broker_clock: this.broker?.clock_health?.() || null,
+    return jsonable({ mode: this.mode, status: this.status, connected: this.connected, user_id: this.user_id, capital: this.capital, waiting_for_funds: this._waiting_for_funds(), broker_clock: this.broker?.clock_health?.() || null,api_limits:this.broker?.rate_limit_health?.()||null,
       equity: round(this.capital + this.realised - this._capital_accounted_pnl + unrealised), realised_pnl: round(this.realised), unrealised_pnl: round(unrealised), daily_pnl: round(this._daily_pnl()), pnl_fees_estimated: true,
       capital_source: this.mode === 'paper' ? 'persisted_paper_balance_seeded_from_broker_cash' : 'verified_broker_cash', broker_available_cash: this._broker_available_cash,
       risk_used: round(sum(values(this.positions).map(plannedRisk))), universe_count: count(this.universe), universe_classification:this.universe_summary,
       subscribed_count: sum(entries(this.streams).filter(([, ready]) => ready).map(([i]) => Math.min(3000, count(this.universe) - Number(i) * 3000))),
       warmed_count: entries(this.books).filter(([t,b]) => this._intraday_warmed(t,b)).length,prior_session_seed_count:count(this.previous_intraday),swing_warmed_count: count(this.daily), swing_history_failures: this._history_failures,
       heartbeat: this._heartbeat, market_open: marketHours(this._now()), feed_fresh: monotonic() - this._last_tick_received <= 10, account_fresh: monotonic() - this._account_at <= 45,
-      positions, account: this.account, signals: this.signals, holdings_signals: this._holding_signals(), delivery, performance: this.analytics.snapshot(this._analysis_pending.size, this._analysis_cache.size),
+      positions, account: this.account, signals: this.signals, holdings_signals: this._holding_signals(), delivery, background:this._background_snapshot(),performance: {...this.analytics.snapshot(this._analysis_pending.size, this._analysis_cache.size),active_batches:[...this._active_batches.values()].slice(0,32),active_batch_count:this._active_batches.size},
       intents: values(this.intents).slice(-100), strategy_settings: this.strategy_settings(), pending_orders: [...values(this.intents).filter(i => !['closed', 'rejected', 'open'].includes(i.state)), ...values(delivery.positions || {}).filter(p => p.status !== 'closed')],
       safe_to_stop: !this._other_mode_live_risk() && (this.mode !== 'live' || (!positions.length && !pending && !deliveryBusy && !this.running)), unmanaged_live_exposure: this._other_mode_live_risk(),
       message: this.message, error: this.error, recovery: { ...this.recovery }, readiness:this.readiness(),live_swing_supported: true, decision_controls:this._decision_controls(),

@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { ConfigManager, DEFAULTS } from '../src/config.js';
+import { ConfigManager, DEFAULTS, FIELDS } from '../src/config.js';
 import { Fernet, strictJSON, verifyPassword, ProcessLock } from '../src/security.js';
 import { Store } from '../src/storage.js';
 import { requestContext } from '../src/http-context.js';
@@ -22,6 +22,17 @@ test('only three Kite credentials are needed; other settings persist and env doe
   assert.equal(reload.port,3100);assert.equal(reload.kite_api_key,'changed-key');assert.equal(reload.analytics_reserve_cpus,2);assert.equal(reload.admin_password_hash,cfg.admin_password_hash);
   assert.doesNotMatch(fs.readFileSync(manager.filename,'utf8'),/test-key|test-secret/);
   assert.deepEqual(Object.keys(reload.publicValues()).sort(),Object.keys(DEFAULTS).sort());
+});
+test('research CPU scheduling defaults safely, persists either mode and rejects unsupported values atomically',async t=>{
+  const dir=temp(t),manager=new ConfigManager(dir,{}),initial=await manager.load({password:'Affinity-config-test-password!'});
+  assert.equal(initial.research_cpu_affinity,'pinned');assert.equal(initial.publicValues().research_cpu_affinity,'pinned');
+  assert.deepEqual(FIELDS.find(field=>field.key==='research_cpu_affinity'),{key:'research_cpu_affinity',label:'Research CPU scheduling',type:'select',choices:['pinned','automatic']});
+  for(const mode of ['automatic','pinned']){manager.save({research_cpu_affinity:mode});const restored=await new ConfigManager(dir,{}).load();assert.equal(restored.research_cpu_affinity,mode);}
+  const before=fs.readFileSync(manager.filename,'utf8');
+  for(const mode of ['auto','exclusive',true,null,0])assert.throws(()=>manager.save({research_cpu_affinity:mode}),/Research CPU scheduling/);
+  assert.equal(fs.readFileSync(manager.filename,'utf8'),before);
+  const legacy=JSON.parse(before);delete legacy.research_cpu_affinity;fs.writeFileSync(manager.filename,JSON.stringify(legacy));
+  assert.equal((await new ConfigManager(dir,{}).load()).research_cpu_affinity,'pinned');
 });
 test('legacy auth keys and directory import once; invalid config save leaves stored settings intact',async t=>{
   const dir=temp(t),key='AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
@@ -57,12 +68,31 @@ test('SQLite journals, sessions, events and redaction survive reopen',t=>{
   store.set('bot_state_live',{positions:{ABC:{quantity:3}}});store.new_session('digest','csrf',Date.now()/1000+60);store.event('sample','private-secret',{access_token:'secret',nested:{password:'password'},safe:42});store.close();
   store=new Store(filename);assert.equal(store.get('bot_state_live').positions.ABC.quantity,3);assert.equal(store.session('digest').csrf,'csrf');assert.equal(store.events()[0].data.safe,42);assert.doesNotMatch(JSON.stringify(store.events()),/private-secret|"secret"|"password":"password"/);assert.throws(()=>store.set('bad',NaN));store.revoke_sessions();assert.equal(store.session('digest'),null);store.close();
 });
-test('process ownership is released by the OS when a Node process crashes',async t=>{
-  const filename=path.join(temp(t),'owner.sqlite3'),url=new URL('../src/security.js',import.meta.url).href;
-  const script=`import {ProcessLock} from ${JSON.stringify(url)}; const lock=new ProcessLock(${JSON.stringify(filename)});lock.acquire();console.log('ready');setInterval(()=>{},1000);`;
-  const child=spawn(process.execPath,['--input-type=module','-e',script],{stdio:['ignore','pipe','pipe'],windowsHide:true});
-  t.after(()=>{if(child.exitCode===null)child.kill();});await once(child.stdout,'data');
-  const lock=new ProcessLock(filename);assert.throws(()=>lock.acquire(),/Another StockPilot/);const exited=once(child,'exit');child.kill();await exited;lock.acquire();lock.release();
+test('process ownership is released by the OS when a Node process crashes',{timeout:15000},async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'stockpilot-security-'));
+  const filename=path.join(dir,'owner.sqlite3'),url=new URL('../src/security.js',import.meta.url).href;
+  // An empty interval does not retain an eval module's local owner. Keep the
+  // native SQLite connection reachable until this child is deliberately killed.
+  const script=`import {ProcessLock} from ${JSON.stringify(url)};const lock=new ProcessLock(${JSON.stringify(filename)});lock.acquire();setInterval(()=>{if(!lock.db)process.exit(2);},1000);process.send({type:'lock-ready',pid:process.pid});`;
+  const child=spawn(process.execPath,['--input-type=module','-e',script],{stdio:['ignore','ignore','pipe','ipc'],windowsHide:true});
+  child.stderr.resume();
+  const lock=new ProcessLock(filename);
+  const crash=async()=>{
+    if(child.pid===undefined||child.exitCode!==null||child.signalCode!==null)return;
+    const exited=once(child,'exit',{signal:AbortSignal.timeout(5000)});
+    child.kill('SIGKILL');await exited;
+  };
+  t.after(async()=>{lock.release();try{await crash();}finally{fs.rmSync(dir,{recursive:true,force:true,maxRetries:3});}});
+  const ready=await new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>finish(new Error('Lock owner did not signal readiness within 5 seconds')),5000);
+    const message=value=>{if(value?.type==='lock-ready'&&value.pid===child.pid)finish();};
+    const exited=()=>finish(new Error('Lock owner exited before acquiring ownership'));
+    const failed=error=>finish(error);
+    function finish(error){clearTimeout(timer);child.off('message',message);child.off('exit',exited);child.off('error',failed);error?reject(error):resolve(true);}
+    child.on('message',message);child.once('exit',exited);child.once('error',failed);
+  });
+  assert.equal(ready,true);assert.throws(()=>lock.acquire(),/Another StockPilot/);
+  await crash();lock.acquire();lock.release();
 });
 test('proxy metadata is accepted only from loopback and Cloudflare HTTPS',()=>{
   const headers={host:'dashboard.example.org','cf-ray':'aabbccddeeff1234-BOM','x-forwarded-proto':'https','cf-connecting-ip':'203.0.113.1'};

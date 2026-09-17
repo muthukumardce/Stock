@@ -99,3 +99,16 @@ test('shared daily management ratchets an exact tick floor and confirms SMA tren
   assert.equal(daily_holding_exit(bars.slice(1),{}),null);assert.equal(daily_holding_exit(bars,{tick_size:0}),null);
   assert.equal(swing_signal(bars,{enhanced_signals:false})[0],null);
 });
+
+test('one decision shares its immutable candle snapshot between directions without caching later calls',()=>{
+  const {bars,options,context}=fixture('opening_drive');let reads=0;
+  const observed={...context,get previous_bars(){reads++;return context.previous_bars;}};
+  const before=structuredClone({bars,options,context}),first=intraday_signal(bars,options,observed);
+  assert.equal(first[0].side,'BUY');assert.equal(reads,1,'Both directions must use one candle/context snapshot');
+  assert.deepEqual({bars,options,context},before);
+  const altered=intraday_signal(bars,{...options,min_signal_score:100},observed);
+  assert.equal(reads,2);assert.equal(altered[0],null);
+  const stale=intraday_signal(bars,options,{...observed,as_of:new Date(+context.as_of+300000)});
+  assert.equal(stale[1],'stale_signal_candle');
+  const again=intraday_signal(bars,options,observed);assert.deepEqual(again,first);
+});

@@ -1,14 +1,20 @@
 /** Offline chronological research. This module never opens a broker connection. */
 import * as rules from './strategy.js';
 import { parseTime, dateIST, timeIST } from './util.js';
+import {evaluateComparisonTask} from './backtest-analytics.js';
 
 const MINUTE = 60000, DAY = 86400000;
-const LIMIT_BARS = 250000, LIMIT_SYMBOLS = 5000;
+export const MAX_RESEARCH_BARS = 1000000;
+const LIMIT_BARS = MAX_RESEARCH_BARS, LIMIT_SYMBOLS = 5000;
+export const MAX_RESEARCH_RUNTIME_MS = 600000;
+// Comparison variants can cover the full supported research sample. Optimizer
+// candidates retain their separate, shorter MAX_RESEARCH_RUNTIME_MS cap.
+export const MAX_COMPARISON_RUNTIME_MS = 1800000;
 const DEFAULTS = Object.freeze({ initial_capital: 100000, risk_per_trade_pct: 0.0025,
   max_position_pct: 0.1, max_positions: 5, fee_rate: 0.001, slippage_rate: 0.0005,
   entry_cutoff: '14:45', exit_time: '15:10', split_fractions: [0.6, 0.2, 0.2],
-  max_bars: LIMIT_BARS, max_runtime_ms: 45000, max_equity_points: 2000,
-  strategy_options: {} });
+  max_bars: 250000, max_runtime_ms: 45000, max_equity_points: 2000,
+  strategy_options: {}, score_from:null, score_to:null });
 const CAVEATS = [
   'Historical research is not evidence of future profitability. No parameters are optimized using these results.',
   'Signals use completed candles; entries and technical exits use the next available candle open. Intrabar execution is a conservative approximation.',
@@ -36,11 +42,13 @@ function configuration(options = {}) {
   for (const key of ['fee_rate', 'slippage_rate']) if (!finite(cfg[key]) || cfg[key] < 0 || cfg[key] > 0.05) throw new RangeError(`${key} must be a fraction between 0 and 0.05`);
   if (!Number.isInteger(cfg.max_positions) || cfg.max_positions < 1 || cfg.max_positions > 100) throw new RangeError('Maximum positions must be between 1 and 100');
   if (!Number.isInteger(cfg.max_bars) || cfg.max_bars < 1 || cfg.max_bars > LIMIT_BARS) throw new RangeError(`Maximum bars must be between 1 and ${LIMIT_BARS}`);
-  if (!Number.isInteger(cfg.max_runtime_ms) || cfg.max_runtime_ms < 100 || cfg.max_runtime_ms > 120000) throw new RangeError('Maximum runtime must be between 100 and 120000 ms');
+  if (!Number.isInteger(cfg.max_runtime_ms) || cfg.max_runtime_ms < 100 || cfg.max_runtime_ms > MAX_COMPARISON_RUNTIME_MS) throw new RangeError(`Maximum runtime must be between 100 and ${MAX_COMPARISON_RUNTIME_MS} ms`);
   if (!Number.isInteger(cfg.max_equity_points) || cfg.max_equity_points < 2 || cfg.max_equity_points > 10000) throw new RangeError('Equity points must be between 2 and 10000');
   if (![cfg.entry_cutoff, cfg.exit_time].every(v => typeof v === 'string' && /^\d\d:\d\d$/.test(v) && Number(v.slice(3)) < 60) || !('09:15' < cfg.entry_cutoff && cfg.entry_cutoff < cfg.exit_time && cfg.exit_time <= '15:30')) throw new RangeError('Require 09:15 < entry cutoff < exit time <= 15:30');
   if (!Array.isArray(cfg.split_fractions) || cfg.split_fractions.length !== 3 || cfg.split_fractions.some(v => !finite(v) || v <= 0 || v >= 1) || Math.abs(sum(cfg.split_fractions) - 1) > 1e-9) throw new RangeError('Three positive chronological split fractions must sum to one');
   if (!ownObject(cfg.strategy_options) || JSON.stringify(cfg.strategy_options).length > 10000) throw new TypeError('Strategy options must be a small object');
+  for(const key of ['score_from','score_to'])if(cfg[key]!==null&&(typeof cfg[key]!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(cfg[key])||!parseTime(cfg[key])||dateIST(parseTime(cfg[key]))!==cfg[key]))throw new TypeError('Scoring boundaries must be valid IST dates');
+  if(cfg.score_from&&cfg.score_to&&cfg.score_from>cfg.score_to)throw new RangeError('Scoring start must not follow scoring end');
   return cfg;
 }
 
@@ -119,11 +127,23 @@ function splits(dates, cfg) {
 
 /** One shared cash account across every symbol; no future OHLCV reaches rules. */
 export function runBacktest(dataset, options = {}, hooks = {}) {
-  const started = Date.now(), cfg = configuration(options), data = normalize(dataset, cfg);
-  const strategy = data.intraday ? 'intraday' : 'swing', signalRule = data.intraday ? rules.intraday_signal : rules.swing_signal;
+  const steps=backtestSteps(dataset,options,hooks);let step=steps.next();
+  while(!step.done)step=steps.next(step.value.tasks.map(task=>evaluateComparisonTask(task,step.value.strategy_options)));
+  return step.value;
+}
+
+/** The portfolio has exactly one owner. Only pure, closed-candle analytics are
+ * yielded, and every timestamp is settled before the following opening. */
+export function* backtestSteps(dataset, options = {}, hooks = {}) {
+  const started = performance.now(), cfg = configuration(options), data = normalize(dataset, cfg);
+  const scoreFrom=cfg.score_from??data.sessions[0],scoreTo=cfg.score_to??data.sessions.at(-1),scoredSessions=data.sessions.filter(date=>date>=scoreFrom&&date<=scoreTo);
+  if(!scoredSessions.length)throw new RangeError('Scoring window contains no observed sessions');
+  data.events=data.events.filter(event=>event.date<=scoreTo);
+  const scoredEvents=data.events.filter(event=>event.date>=scoreFrom);
+  const strategy = data.intraday ? 'intraday' : 'swing';
   const positions = new Map(), pending = new Map(), marks = new Map(), traded = new Set(), trades = [], equity = [];
   const sessions = new Map(), previousBars = new Map(), contextCursors = new Map(), gapSessions = new Set(), gaps = [];
-  const overall = accumulator(cfg.initial_capital), periods = splits(data.sessions, cfg), counts = {};
+  const overall = accumulator(cfg.initial_capital), periods = splits(scoredSessions, cfg), counts = {};
   let cash = cfg.initial_capital, activePeriod = null, processed = 0, gapCount = 0;
   const direction = p => p.side === 'SELL' ? -1 : 1;
   const equityValue = () => cash + sum([...positions].map(([symbol, p]) => p.quantity * (p.entry + direction(p) * ((marks.get(symbol) ?? p.entry) - p.entry))));
@@ -141,6 +161,7 @@ export function runBacktest(dataset, options = {}, hooks = {}) {
     trades.push(trade); overall.trades.push(trade); activePeriod?.acc.trades.push(trade); positions.delete(symbol);
   }
   function recordGap(symbol, expected, observed, reason) {
+    if(dateIST(new Date(expected))<scoreFrom||dateIST(new Date(expected))>scoreTo)return;
     gapCount++; count(reason); gapSessions.add(symbol + ':' + dateIST(new Date(expected)));
     if (gaps.length < 1000) gaps.push({symbol, expected_at:timestamp(expected), observed_at:observed === null ? null : timestamp(observed), reason});
   }
@@ -158,18 +179,27 @@ export function runBacktest(dataset, options = {}, hooks = {}) {
       previous_bars:previousBars.get(symbol) ?? [], benchmark_bars:closedContext('benchmark',data.benchmark,at),
       sector_bars:sector ? closedContext('sector:' + sector,data.sectors.get(sector),at) : [] };
   }
-  function updateDailyProtection(p, history) {
-    if (data.intraday || typeof rules.daily_holding_exit !== 'function') return;
-    const daily = rules.daily_holding_exit(history,p,cfg.strategy_options);
+  function applyDailyProtection(p, daily) {
     if (!daily) return;
     if (finite(daily.trailing_stop) && daily.trailing_stop > 0) p.stop = p.trailing_stop = Math.max(p.stop,daily.trailing_stop);
     if (daily.trend_exit) p.pending_exit = 'daily_trend_loss';
   }
+  function updateDailyProtection(p, history) {
+    if (data.intraday || typeof rules.daily_holding_exit !== 'function') return;
+    applyDailyProtection(p,rules.daily_holding_exit(history,p,cfg.strategy_options));
+  }
+  const guard=()=>{
+    const elapsed=performance.now()-started;
+    if(elapsed>cfg.max_runtime_ms)throw Object.assign(new RangeError('Backtest runtime limit exceeded; use a smaller dataset'),{
+      code:'worker_timeout',runtime_budget_ms:cfg.max_runtime_ms,elapsed_ms:Math.round(elapsed),processed_bars:processed,total_bars:data.events.length,
+    });
+    if(hooks.cancelled?.())throw new Error('Research cancelled');
+  };
   const stride = Math.max(1, Math.ceil(data.events.length / cfg.max_equity_points));
   for (let index = 0; index < data.events.length;) {
-    if (Date.now() - started > cfg.max_runtime_ms) throw new RangeError('Backtest runtime limit exceeded; use a smaller dataset');
-    if (hooks.cancelled?.()) throw new Error('Research cancelled');
+    guard();
     const batch = [], at = data.events[index].ms, date = data.events[index].date;
+    const scoring=date>=scoreFrom&&date<=scoreTo;
     while (index < data.events.length && data.events[index].ms === at) batch.push(data.events[index++]);
     const period = periods.find(p => p.from <= date && date <= p.to) ?? null;
     if (period !== activePeriod) { activePeriod = period; if (period && !period.acc) period.acc = accumulator(equityValue()); }
@@ -234,6 +264,7 @@ export function runBacktest(dataset, options = {}, hooks = {}) {
       positions.set(symbol,position); updateDailyProtection(position,data.histories.get(symbol));
       marks.set(symbol, bar.open);
     }
+    const analytics=[],actions=[];
     // Stop first when OHLC alone cannot tell which boundary was touched first.
     for (const { symbol, bar } of batch) {
       const p = positions.get(symbol), closeTime = data.intraday ? at + 5 * MINUTE : +parseTime(date + 'T15:30:00');
@@ -248,21 +279,30 @@ export function runBacktest(dataset, options = {}, hooks = {}) {
       let history = data.histories.get(symbol);
       history.push(bar); if (history.length > 200) history.shift();
       const held = positions.get(symbol);
-      if (held) updateDailyProtection(held,history);
       const context = contextFor(symbol,at);
-      if (held && typeof rules.technical_exit === 'function') {
-        const exit = rules.technical_exit(history, held, cfg.strategy_options,context);
-        if (exit?.exit && !held.pending_exit) held.pending_exit = exit.reason || 'technical_exit';
-      }
-      if (!positions.has(symbol) && !traded.has(symbol + ':' + date)) {
-        if (data.intraday && sessions.get(symbol)?.gapped) { count('entries_blocked_after_data_gap'); continue; }
-        const [signal, reason] = signalRule(history, cfg.strategy_options,context); count(reason);
-        if (signal && (!data.intraday || timeIST(new Date(closeTime)) < cfg.entry_cutoff)) pending.set(symbol, { signal, bar_time: at, signal_time: closeTime, date });
+      const signal=scoring&&!held&&!traded.has(symbol+':'+date),blocked=signal&&data.intraday&&sessions.get(symbol)?.gapped;
+      const taskIndex=held||signal&&!blocked?analytics.length:null;
+      if(taskIndex!==null)analytics.push({symbol,strategy,history,context,position:held?{...held}:null,signal:signal&&!blocked});
+      actions.push({symbol,held,closeTime,blocked,signal,taskIndex});
+    }
+    const calculated=analytics.length?yield {tasks:analytics,strategy_options:cfg.strategy_options,guard,processed_bars:processed,total_bars:data.events.length,batch_timestamp:timestamp(at),batch_bars:batch.length}:[];
+    if(!Array.isArray(calculated)||calculated.length!==analytics.length)throw new Error('Comparison analytics returned an incomplete timestamp batch');
+    // Worker completion order cannot choose which signal wins portfolio cash.
+    // Apply in the original symbol order; pending entries still execute at the
+    // next observed opening using the unchanged score and symbol ordering.
+    for(const {symbol,held,closeTime,blocked,signal:requested,taskIndex} of actions){
+      if(blocked){count('entries_blocked_after_data_gap');continue;}
+      if(taskIndex===null)continue;
+      const result=calculated[taskIndex];
+      if(held){applyDailyProtection(held,result.daily);if(result.technical?.exit&&!held.pending_exit)held.pending_exit=result.technical.reason||'technical_exit';}
+      if(requested){
+        const {signal,reason}=result;count(reason);
+        if(signal&&(!data.intraday||timeIST(new Date(closeTime))<cfg.entry_cutoff))pending.set(symbol,{signal,bar_time:at,signal_time:closeTime,date});
       }
     }
-    const value = equityValue(); observe(overall, value); if (activePeriod) observe(activePeriod.acc, value);
+    const value = equityValue(); if(scoring)observe(overall, value); if (activePeriod) observe(activePeriod.acc, value);
     processed += batch.length;
-    if (!equity.length || processed % stride < batch.length || index === data.events.length) equity.push({ timestamp: timestamp(data.intraday ? at + 5 * MINUTE : +parseTime(date + 'T15:30:00')), equity: round(value), cash: round(cash), positions: positions.size });
+    if (scoring&&(!equity.length || processed % stride < batch.length || index === data.events.length)) equity.push({ timestamp: timestamp(data.intraday ? at + 5 * MINUTE : +parseTime(date + 'T15:30:00')), equity: round(value), cash: round(cash), positions: positions.size });
     if (processed % 250 < batch.length || index === data.events.length) hooks.onProgress?.({ processed_bars: processed, total_bars: data.events.length, progress: processed / data.events.length });
   }
   const caveats = [...CAVEATS];
@@ -277,9 +317,10 @@ export function runBacktest(dataset, options = {}, hooks = {}) {
   if (!data.benchmark.length) caveats.push('No historical benchmark candles were supplied; setups requiring benchmark context cannot be evaluated.');
   if (!periods.length) caveats.push('At least three distinct sessions are needed for chronological reporting partitions; no holdout partitions were produced.');
   return { strategy_version: rules.STRATEGY_VERSION ?? '1.0.0', strategy, options: cfg,
-    dataset: { interval: dataset.interval, symbol_count: data.symbols.length, bar_count: data.events.length,
-      from: timestamp(data.events[0].ms), to: timestamp(data.events.at(-1).ms), session_count: data.sessions.length,
-      context_bar_count:data.totalBars - data.events.length, benchmark_bar_count:data.benchmark.length, sector_series_count:data.sectors.size,
+    dataset: { interval: dataset.interval, symbol_count: data.symbols.length, bar_count: scoredEvents.length,
+      from: timestamp(scoredEvents[0].ms), to: timestamp(scoredEvents.at(-1).ms), session_count: scoredSessions.length,
+      warmup_bar_count:data.events.length-scoredEvents.length,score_from:scoreFrom,score_to:scoreTo,
+      context_bar_count:data.benchmark.length+[...data.sectors.values()].reduce((total,rows)=>total+rows.length,0), benchmark_bar_count:data.benchmark.length, sector_series_count:data.sectors.size,
       excluded_intraday_symbol_sessions:0, source: String(dataset.metadata?.source ?? 'user_supplied') },
     metrics: metrics(overall, positions.size), period_metrics: periods.map(({ acc, ...period }) => ({ ...period, metrics: metrics(acc ?? accumulator(cfg.initial_capital)), trade_assignment: 'exit_session; equity is marked across boundaries' })),
     trades, equity: equity.length > cfg.max_equity_points ? equity.filter((_, i) => i === 0 || i === equity.length - 1 || i % Math.ceil(equity.length / cfg.max_equity_points) === 0) : equity,
@@ -293,12 +334,22 @@ export function runBacktest(dataset, options = {}, hooks = {}) {
 
 export function compareStrategies(dataset, options = {}, hooks = {}) {
   const { baseline_options = {}, enhanced_options = { enhanced_signals: true }, ...common } = options;
-  const baseline = runBacktest(dataset, { ...common, strategy_options: { ...baseline_options, enhanced_signals: false } }, {
-    ...hooks, onProgress: p => hooks.onProgress?.({ ...p, phase: 'baseline', progress: p.progress / 2 }),
-  });
-  const enhanced = runBacktest(dataset, { ...common, strategy_options: { ...enhanced_options, enhanced_signals: true } }, {
-    ...hooks, onProgress: p => hooks.onProgress?.({ ...p, phase: 'enhanced', progress: 0.5 + p.progress / 2 }),
-  });
+  function variant(phase,strategyOptions,offset) {
+    // Announce the new variant before normalization and its first candle batch.
+    // The caller retains its known total until actual normalized counts arrive.
+    hooks.onProgress?.({phase,progress:offset,processed_bars:0});
+    try {
+      return runBacktest(dataset,{...common,strategy_options:strategyOptions},{
+        ...hooks,onProgress:p=>hooks.onProgress?.({...p,phase,progress:offset+p.progress/2}),
+      });
+    } catch(error) {if(error&&typeof error==='object')error.phase=phase;throw error;}
+  }
+  const baseline = variant('baseline',{...baseline_options,enhanced_signals:false},0);
+  const enhanced = variant('enhanced',{...enhanced_options,enhanced_signals:true},0.5);
+  return comparisonReport(baseline,enhanced);
+}
+
+export function comparisonReport(baseline,enhanced){
   const comparison = Object.fromEntries(['net_return_pct', 'net_pnl', 'max_drawdown_pct', 'trade_count', 'expectancy'].map(key => [key, round(enhanced.metrics[key] - baseline.metrics[key])]));
   return { strategy_version: enhanced.strategy_version, dataset: enhanced.dataset, baseline, enhanced,
     comparison, comparison_complete:baseline.data_quality.completed_result && enhanced.data_quality.completed_result,

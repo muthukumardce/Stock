@@ -6,9 +6,51 @@
  */
 import os from 'node:os';
 import {spawnSync} from 'node:child_process';
+import {readFileSync} from 'node:fs';
 
 const MAX_CPUS=65536;
 const validCount=value=>typeof value==='number'&&Number.isSafeInteger(value)&&value>0&&value<=MAX_CPUS;
+const UNKNOWN_PHYSICAL='Physical core count could not be verified. Research may use the eligible logical CPU count as a scheduling estimate; it is not a verified physical core count.';
+
+// Sysfs/procfs CPU lists have a bounded numeric range grammar. Expanding a
+// repeated large range must not turn a small input into unbounded parsing work.
+function cpuList(text){
+  if(typeof text!=='string'||text.length>MAX_CPUS*6||!text.trim())throw new Error('Invalid CPU list');
+  const cpus=new Set();let expanded=0;
+  for(const item of text.trim().split(',')){
+    const match=/^(\d{1,5})(?:-(\d{1,5}))?$/.exec(item);if(!match)throw new Error('Invalid CPU range');
+    const first=Number(match[1]),last=Number(match[2]??match[1]);
+    if(first>=MAX_CPUS||last>=MAX_CPUS||last<first||(expanded+=last-first+1)>MAX_CPUS)throw new Error('CPU list exceeds bounds');
+    for(let cpu=first;cpu<=last;cpu++)cpus.add(cpu);
+  }
+  return cpus;
+}
+function topologyId(value){
+  if(typeof value!=='string'||value.length>16||!/^\d{1,5}\s*$/.test(value))throw new Error('Unknown CPU topology');
+  const id=Number(value);if(id>=MAX_CPUS)throw new Error('CPU topology exceeds bounds');return id;
+}
+function linuxPhysical(read,available){
+  // thread-self follows the actual calling Node thread, including a research
+  // coordinator. Older kernels may only expose the process/main-thread mask.
+  let status,source='linux_sysfs_thread_allowed';
+  try{status=read('/proc/thread-self/status','utf8');}
+  catch{status=read('/proc/self/status','utf8');source='linux_sysfs_process_allowed';}
+  if(typeof status!=='string'||status.length>1024*1024)throw new Error('Invalid process CPU status');
+  const matches=[...status.matchAll(/^Cpus_allowed_list:[ \t]*([^\r\n]+)$/gm)];
+  if(matches.length!==1)throw new Error('CPU allowance could not be read');
+  const allowed=cpuList(matches[0][1]),online=cpuList(read('/sys/devices/system/cpu/online','utf8')),cores=new Set();
+  for(const cpu of allowed){
+    if(!online.has(cpu))continue;
+    const base=`/sys/devices/system/cpu/cpu${cpu}/topology/`;
+    const packageId=topologyId(read(base+'physical_package_id','utf8')),coreId=topologyId(read(base+'core_id','utf8'));
+    cores.add(packageId+':'+coreId);
+  }
+  if(!cores.size)throw new Error('No verified eligible physical cores');
+  return {physical_cpus:Math.min(cores.size,available),physical_source:source,
+    physical_scope:source==='linux_sysfs_thread_allowed'
+      ?'Distinct physical package/core pairs among this thread\'s allowed online CPUs, capped by runtime usable parallelism. No SMT ratio is assumed.'
+      :'Distinct physical package/core pairs among the process\'s allowed online CPUs, capped by runtime usable parallelism. The older-kernel process mask is an estimate for another calling thread.'};
+}
 // Constant, read-only script: no application setting, account data, command-line
 // argument, or environment value is interpolated into PowerShell source.
 const WINDOWS_PROBE=String.raw`
@@ -32,7 +74,7 @@ try {
 `;
 
 /** Dependency injection is exposed for deterministic OS/timeout tests only. */
-export function createCapacityDetector({os:system=os,spawnSync:run=spawnSync}={}){
+export function createCapacityDetector({os:system=os,spawnSync:run=spawnSync,readFileSync:read=readFileSync}={}){
   let cached;
   return function detect(){
     if(cached)return cached;
@@ -42,7 +84,7 @@ export function createCapacityDetector({os:system=os,spawnSync:run=spawnSync}={}
     try{platform=system.platform();}catch{}
     runtimeAvailable ||= runtimeCpus || 1;runtimeCpus ||= runtimeAvailable;
     const result={logical_cpus:Math.max(runtimeCpus,runtimeAvailable),available_cpus:runtimeAvailable,
-      runtime_cpus:runtimeCpus,runtime_available_cpus:runtimeAvailable,physical_cpus:null,
+      runtime_cpus:runtimeCpus,runtime_available_cpus:runtimeAvailable,physical_cpus:null,physical_source:'unavailable',physical_scope:UNKNOWN_PHYSICAL,
       source:'runtime_available_parallelism',scope:'Runtime parallelism estimate; operating-system affinity and container restrictions reported by the runtime are respected. Hardware metadata is not a utilization guarantee.'};
     if(platform==='win32'){
       result.source='windows_runtime_fallback';
@@ -56,7 +98,10 @@ export function createCapacityDetector({os:system=os,spawnSync:run=spawnSync}={}
         if(!observed||!validCount(observed.logical_cpus)||observed.logical_cpus<Math.max(runtimeCpus,runtimeAvailable)
           ||!Number.isSafeInteger(observed.build)||observed.build<0||!Number.isSafeInteger(observed.product_type)||![1,2,3].includes(observed.product_type))throw new Error('Invalid capacity observation');
         result.logical_cpus=observed.logical_cpus;
-        if(validCount(observed.physical_cpus)&&observed.physical_cpus<=observed.logical_cpus)result.physical_cpus=observed.physical_cpus;
+        if(validCount(observed.physical_cpus)&&observed.physical_cpus<=observed.logical_cpus){
+          result.physical_cpus=observed.physical_cpus;result.physical_source='windows_cim_machine';
+          result.physical_scope='CIM machine physical core count; it does not identify which cores remain eligible under process, thread, CPU-set, or job restrictions.';
+        }
         const supported=observed.product_type===1?observed.build>=22000:observed.build>=20348;
         const groupWidth=Math.min(runtimeCpus,64),affinity=observed.primary_group_affinity_cpus;
         const affinityVerified=validCount(affinity)&&affinity<=64,restricted=runtimeAvailable<groupWidth||affinityVerified&&affinity<groupWidth;
@@ -72,6 +117,22 @@ export function createCapacityDetector({os:system=os,spawnSync:run=spawnSync}={}
             :'CIM machine hardware and runtime capacity agree. Actual affinity, CPU-set/job limits and worker utilization are not guaranteed by the hardware count.';
         }
       }catch{/* Never expose subprocess diagnostics or trust inherited CPU-count environment variables. */}
+    }else if(platform==='linux'){
+      // Kernel topology and effective allowed lists are read without a native
+      // FFI dependency or changing the thread/process affinity.
+      // https://www.kernel.org/doc/html/latest/admin-guide/cputopology.html
+      try{Object.assign(result,linuxPhysical(read,result.available_cpus));}catch{}
+    }else if(platform==='darwin'){
+      // Apple exposes enabled physical cores directly, including Apple silicon
+      // where logical/2 would undercount. This is a fixed read-only sysctl query.
+      // https://developer.apple.com/documentation/kernel/1387446-sysctlbyname/determining_system_capabilities
+      try{
+        const response=run('/usr/sbin/sysctl',['-n','hw.physicalcpu'],{encoding:'utf8',timeout:1000,maxBuffer:1024,windowsHide:true,stdio:['ignore','pipe','ignore'],shell:false});
+        if(response.error||response.status!==0||typeof response.stdout!=='string'||response.stdout.length>128||!/^\d{1,5}$/.test(response.stdout.trim()))throw new Error('Physical CPU query unavailable');
+        const physical=Number(response.stdout.trim());if(!validCount(physical)||physical>result.logical_cpus)throw new Error('Invalid physical CPU count');
+        result.physical_cpus=Math.min(physical,result.available_cpus);result.physical_source='macos_sysctl_enabled';
+        result.physical_scope='Enabled physical cores reported by hw.physicalcpu, capped by runtime usable logical CPUs. Individual eligible core identities are not exposed; no SMT ratio is assumed.';
+      }catch{}
     }
     cached=Object.freeze(result);return cached;
   };

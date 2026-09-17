@@ -168,21 +168,26 @@ function breakout_reason(bars,strategy){
   return null;
 }
 function enhanced_signal(strategy,bars,supplied,context){
-  const long=evaluate_direction(strategy,bars,supplied,context,'BUY');
+  // BUY and SELL inspect the same closed candles/context. Only orientation and
+  // setup gates differ. Keep this cache local to this one decision; callers may
+  // mutate their candle book or options before the next call.
+  let snapshot;
+  const snapshotFor=options=>snapshot??=strategy_snapshot(bars,strategy,context,options);
+  const long=evaluate_direction(strategy,bars,supplied,context,'BUY',snapshotFor);
   if(strategy!=='intraday'||supplied.intraday_short_enabled===false)return long;
-  const short=evaluate_direction(strategy,bars,supplied,context,'SELL');
+  const short=evaluate_direction(strategy,bars,supplied,context,'SELL',snapshotFor);
   const selected=[long,short].filter(row=>row[0]).sort((a,b)=>b[0].score-a[0].score||a[0].side.localeCompare(b[0].side))[0];
   const explanation={...long[2],setups:[...(long[2]?.setups??[]),...(short[2]?.setups??[])]};
   return selected?[selected[0],'candidate',explanation]:[null,long[1],explanation];
 }
-function evaluate_direction(strategy,bars,supplied,context,side){
+function evaluate_direction(strategy,bars,supplied,context,side,snapshotFor){
   const direction=side==='SELL'?-1:1,options={...ENHANCED_DEFAULTS,...supplied},explanation={strategy_version:STRATEGY_VERSION,mode:'enhanced',setups:[]};
   const reject=reason=>[null,reason,explanation];
   if(!options_valid(options))return reject('invalid_strategy_options');
   const quality=validate_bars(bars,{interval:strategy});if(!quality.valid)return reject(quality.reason);
   if(bars.length<(strategy==='swing'?55:2))return reject(strategy==='swing'?'warming_up_daily':'warming_up_indicators');
   if(strategy==='swing'&&bars.slice(1).some((bar,i)=>Math.abs(bar.open/bars[i].close-1)>.2))return reject('daily_discontinuity');
-  const snapshot=strategy_snapshot(bars,strategy,context,options);if(!snapshot.data_valid)return reject(snapshot.data_issue);
+  const snapshot=snapshotFor(options);if(!snapshot.data_valid)return reject(snapshot.data_issue);
   const metrics=oriented_metrics(snapshot,direction),price=bars.at(-1).close;
   if(!metrics.indicators_ready||!(metrics.atr_wilder14>0))return reject('warming_up_indicators');
   if(strategy==='intraday'&&!metrics.session_vwap_complete)return reject('incomplete_session_vwap');

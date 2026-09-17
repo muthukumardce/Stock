@@ -42,6 +42,64 @@ function ready(t, mode = 'paper') {
 const signal = (strategy = 'intraday') => new Signal(strategy, 100, 98, 104, 'test', 2);
 const entryDailyBars = () => Array.from({length:21},(_,i)=>new Candle(new Date(NOW-(21-i)*86400000),100,101,99,100,1000));
 
+test('startup cancellation while account data is pending never arms entries',async t=>{
+  const [engine]=ready(t);engine.running=false;engine.status='paused';let release,cancelled=false;
+  const pending=new Promise(resolve=>{release=resolve;});
+  engine.broker={account:async onProgress=>{onProgress({phase:'holdings',message:'Downloading holdings from Zerodha.',completed:1,total:5});await pending;return clone(engine.account);}};
+  const steps=[],starting=engine.start({isCancelled:()=>cancelled,onProgress:step=>steps.push(step)});
+  await new Promise(resolve=>setImmediate(resolve));
+  const job=engine.snapshot().background.tasks.find(task=>task.id==='account');
+  assert.equal(job.status,'running');assert.match(job.message,/Downloading holdings/);assert.equal(job.completed,1);
+  cancelled=true;release();await starting;
+  assert.equal(engine.running,false);assert.equal(steps.some(step=>step.phase==='armed'),false);
+  assert.equal(engine.snapshot().background.tasks.find(task=>task.id==='account').status,'waiting');
+});
+
+test('daily telemetry counts required holdings instead of the full NSE universe and retains incomplete coverage',async t=>{
+  const [engine]=ready(t);engine.universe[2]={tradingsymbol:'OTHER'};
+  engine.account.holdings=[{exchange:'NSE',tradingsymbol:'TEST',instrument_token:1,quantity:1}];
+  let release;const pending=new Promise(resolve=>{release=resolve;});
+  engine.broker={call:async()=>{await pending;return [];}};
+  const loading=engine._history_pass();await new Promise(resolve=>setImmediate(resolve));
+  let job=engine.snapshot().background.tasks.find(task=>task.id==='daily_history');
+  assert.equal(job.total,1);assert.equal(job.current_item,'TEST');assert.equal(job.completed,0);assert.match(job.message,/Downloading daily candles/);
+  release();await loading;
+  job=engine.snapshot().background.tasks.find(task=>task.id==='daily_history');
+  assert.equal(job.status,'waiting');assert.equal(job.completed,0);assert.equal(job.failed,1);assert.equal(job.current_item,null);assert.ok(job.next_retry_at);
+});
+
+test('intraday telemetry describes closed-market waiting without a fake active download',async t=>{
+  const [engine]=ready(t);engine._now=()=>new Date('2026-09-17T20:00:00+05:30');
+  await engine._intraday_history_pass();
+  const job=engine.snapshot().background.tasks.find(task=>task.id==='intraday_history');
+  assert.equal(job.status,'waiting');assert.match(job.message,/market hours/);assert.equal(job.completed,0);assert.equal(job.current_item,null);
+});
+
+for (const [scope,method] of [['daily','_history_pass'],['intraday','_intraday_history_pass']]) test(`${scope} history stops a rate-limited pass without cascading requests or false symbol failures`,async t=>{
+  const [engine]=ready(t);engine.universe[2]={tradingsymbol:'OTHER'};
+  engine.account.holdings=[{exchange:'NSE',tradingsymbol:'TEST',instrument_token:1,quantity:1},{exchange:'NSE',tradingsymbol:'OTHER',instrument_token:2,quantity:1}];
+  let calls=0,limited=false;const retry=new Date(+NOW+60000).toISOString();
+  engine.broker={call:async()=>{calls++;limited=true;throw new BrokerError('RateLimitException','private broker detail',{http_status:429,retry_after_seconds:60,retry_at:retry});},rate_limit_health:()=>({status:limited?'cooldown':'ready',categories:[{category:'historical',status:limited?'cooldown':'ready',retry_after_seconds:limited?60:0,retry_at:limited?retry:null}]})};
+  await engine[method]();assert.equal(calls,1);
+  let job=engine.snapshot().background.tasks.find(task=>task.id===scope+'_history');
+  assert.equal(job.status,'waiting');assert.match(job.message,/rate limit \(HTTP 429\)/);assert.equal(job.failed,0);assert.equal(job.next_retry_at,retry);
+  await engine[method]();assert.equal(calls,1,'cooling history category sends no additional requests');
+  assert.equal(engine.snapshot().api_limits.status,'cooldown');assert.equal(engine.connected,true);assert.equal(engine.running,true);
+});
+
+test('analytics activity exposes current symbols and strategies then retires completed batches',async t=>{
+  const [engine]=ready(t);let release;const pending=new Promise(resolve=>{release=resolve;});
+  engine.analytics.analyze=async()=>{await pending;return [];};
+  engine._queue_analysis(1,'intraday',entryDailyBars());
+  const controller=new AbortController(),loop=engine._analysis_loop(controller.signal);
+  await new Promise(resolve=>setImmediate(resolve));
+  const view=engine.snapshot();assert.equal(view.performance.active_batch_count,1);assert.deepEqual(view.performance.active_batches[0].symbols,['TEST']);assert.deepEqual(view.performance.active_batches[0].strategies,['intraday']);
+  assert.equal(view.background.tasks.find(task=>task.id==='analytics').status,'running');
+  release();await Promise.allSettled([...engine._analysis_tasks]);controller.abort();await assert.rejects(loop,{name:'AbortError'});
+  assert.equal(engine.snapshot().performance.active_batch_count,0);
+  assert.equal(engine.snapshot().background.tasks.find(task=>task.id==='analytics').status,'waiting');
+});
+
 test('broker clock health blocks new entries until measured alignment recovers without rearming a pause',async t=>{
   const [engine]=ready(t);let health={status:'skewed',blocked:true,stale:false};
   engine.broker={clock_health:()=>health};
