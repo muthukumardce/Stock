@@ -25,6 +25,112 @@ test('REST requests are serialized with independent quote rate limiting', async 
   assert.equal(requests[0].options.redirect, 'error');
 });
 
+function clockFixture() {
+  let wall = Date.parse('2026-09-17T06:30:00Z'), mono = 100, requests = 0;
+  let sample = { offset: 0, latency: 200, jump: 0 };
+  const advance = ms => { wall += ms; mono += ms / 1000; };
+  const broker = new KiteBroker('key', 'token', {
+    clock: () => mono, wallClock: () => wall, sleep: async ms => advance(ms),
+    fetch: async () => {
+      requests++;
+      const date = Object.hasOwn(sample, 'header') ? sample.header : new Date(wall + sample.latency / 2 + sample.offset).toUTCString();
+      advance(sample.latency); wall += sample.jump;
+      return { ...success({}), headers: { get: name => name.toLowerCase() === 'date' ? date : null } };
+    },
+  });
+  return { broker, advance, set: value => { sample = { offset: 0, latency: 200, jump: 0, ...value }; },
+    jump: ms => { wall += ms; }, get requests() { return requests; } };
+}
+
+test('broker clock health bounds positive and negative skew using response Date and both request endpoints', async () => {
+  for (const offset of [223000, -223000]) {
+    const f = clockFixture(); f.set({ offset });
+    assert.equal(f.broker.clock_health().status, 'unknown');
+    await f.broker.call('profile');
+    const health = f.broker.clock_health();
+    assert.equal(health.status, 'skewed'); assert.equal(health.blocked, true);
+    assert.ok(health.offset_lower_ms <= offset && health.offset_upper_ms >= offset);
+    assert.ok(offset > 0 ? health.offset_lower_ms > 10000 : health.offset_upper_ms < -10000);
+    assert.equal(health.offset_upper_ms - health.offset_lower_ms, 2200);
+    assert.ok(Math.abs(health.request_duration_ms - 200) < 1e-8);
+    assert.equal(health.age_seconds, 0); assert.equal(health.stale, false);
+    for (let i = 0; i < 5; i++) f.broker.clock_health();
+    assert.equal(f.requests, 1, 'Reading health must not issue HTTP requests');
+  }
+});
+
+test('clock bounds include Date precision and do not confirm skew when request latency spans the tolerance', async () => {
+  const f = clockFixture(); f.set({ offset: 10000, latency: 6000 });
+  await f.broker.call('profile');
+  let health = f.broker.clock_health();
+  assert.equal(health.status, 'uncertain'); assert.equal(health.blocked, false);
+  assert.deepEqual([health.offset_lower_ms, health.offset_upper_ms], [6000, 14000]);
+  f.set({ offset: 0 }); await f.broker.call('profile');
+  health = f.broker.clock_health();
+  assert.equal(health.status, 'aligned'); assert.equal(health.blocked, false);
+  assert.ok(health.offset_lower_ms <= 0 && health.offset_upper_ms >= 0);
+});
+
+test('missing or malformed dates cannot invent alignment or clear a confirmed clock skew', async () => {
+  const f = clockFixture();
+  for (const header of [null, '', 'not a date', '2026-09-17T06:30:00Z', 'Thu, 31 Sep 2026 06:30:00 GMT', 'Fri, 17 Sep 2026 06:30:00 GMT']) {
+    f.set({ header }); await f.broker.call('profile');
+    assert.equal(f.broker.clock_health().status, 'unknown');
+    assert.equal(f.broker.clock_health().blocked, false);
+  }
+  f.set({ offset: 223000 }); await f.broker.call('profile');
+  const confirmed = f.broker.clock_health();
+  for (const sample of [{ header: null }, { header: 'invalid' }, { offset: 10000, latency: 6000 }]) {
+    f.set(sample); await f.broker.call('profile');
+    const health = f.broker.clock_health();
+    assert.equal(health.status, 'skewed'); assert.equal(health.blocked, true);
+    assert.equal(health.offset_lower_ms, confirmed.offset_lower_ms);
+    assert.equal(health.offset_upper_ms, confirmed.offset_upper_ms);
+  }
+  f.set({ offset: 0 }); await f.broker.call('profile');
+  assert.equal(f.broker.clock_health().status, 'aligned'); assert.equal(f.broker.clock_health().blocked, false);
+});
+
+test('clock evidence age uses monotonic time and stale evidence never silently clears skew', async () => {
+  const f = clockFixture(); await f.broker.call('profile');
+  f.advance(61000);
+  let health = f.broker.clock_health();
+  assert.equal(health.status, 'uncertain'); assert.equal(health.stale, true);
+  assert.ok(Math.abs(health.age_seconds - 61) < 1e-8); assert.equal(health.blocked, false);
+  f.set({ offset: -223000 }); await f.broker.call('profile'); f.advance(61000);
+  health = f.broker.clock_health();
+  assert.equal(health.status, 'skewed'); assert.equal(health.stale, true); assert.equal(health.blocked, true);
+  f.set({ offset: 0 }); await f.broker.call('profile');
+  health = f.broker.clock_health();
+  assert.equal(health.status, 'aligned'); assert.equal(health.stale, false); assert.equal(health.age_seconds, 0);
+});
+
+test('wall-clock jumps during a request invalidate its observation without clearing prior confirmed skew', async () => {
+  for (const jump of [-223000, 223000]) {
+    const f = clockFixture(); f.set({ jump }); await f.broker.call('profile');
+    let health = f.broker.clock_health();
+    assert.equal(health.status, 'uncertain'); assert.equal(health.last_observation_status, 'wall_clock_changed');
+    assert.equal(health.blocked, false); assert.equal(health.offset_lower_ms, null);
+    f.set({ offset: 223000 }); await f.broker.call('profile');
+    assert.equal(f.broker.clock_health().blocked, true);
+    f.set({ jump }); await f.broker.call('profile');
+    health = f.broker.clock_health();
+    assert.equal(health.status, 'skewed'); assert.equal(health.blocked, true);
+    assert.equal(health.last_observation_status, 'wall_clock_changed');
+    f.set({ offset: 0 }); await f.broker.call('profile');
+    assert.equal(f.broker.clock_health().status, 'aligned');
+  }
+});
+
+test('a host-clock change after an aligned response is visible until a new valid observation', async () => {
+  const f = clockFixture(); await f.broker.call('profile');f.jump(223000);
+  assert.equal(f.broker.clock_health().status, 'uncertain');
+  assert.equal(f.broker.clock_health().last_observation_status, 'wall_clock_changed');
+  assert.equal(f.broker.clock_health().age_seconds, 0);
+  f.set({ offset: 0 }); await f.broker.call('profile');
+  assert.equal(f.broker.clock_health().status, 'aligned');
+});
+
 test('historical timestamps use exchange time regardless of host timezone', async () => {
   const {broker, requests} = fixture(() => success({candles: [['2026-09-17T09:15:00+0530', 100, 101, 99, 100.5, 50]]}));
   const rows = await broker.call('historical_data', 123, new Date('2026-09-17T03:45:00Z'), new Date('2026-09-17T04:45:00Z'), '5minute');

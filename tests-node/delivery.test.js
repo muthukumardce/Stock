@@ -8,6 +8,7 @@ import { Store } from '../src/storage.js';
 import { Candle } from '../src/strategy.js';
 import { BrokerError } from '../src/broker.js';
 import { monotonic } from '../src/util.js';
+import { pendingDeliveryQuantity } from '../src/decision-controls.js';
 
 const clone = value => structuredClone(value);
 const NOW = new Date('2026-09-17T10:00:00+05:30');
@@ -120,6 +121,100 @@ test('confirmed partial IOC fill is the only quantity protected', async t => {
   assert.deepEqual(mutations(broker, 'place_gtt')[0].orders.map(o => o.quantity), [4, 4]);
   const p = manager.snapshot().positions.INFY;
   assert.equal(p.quantity, 4); assert.equal(p.remaining_quantity, 4); assert.equal(p.token, 123); assert.equal(p.is_bot_owned, true);
+});
+
+function corruptOrderResponses(broker, matches, corrupt) {
+  const call=broker.call.bind(broker);let enabled=true;
+  broker.call=async(method,...args)=>{
+    const result=await call(method,...args);
+    return enabled&&['orders','order_history'].includes(method)?result.map(row=>{if(matches(row))corrupt(row);return row;}):result;
+  };
+  return ()=>{enabled=false;};
+}
+
+test('malformed delivery entry fills retain ownership and the full cash reservation until verified recovery',async t=>{
+  const corruptions=[
+    row=>delete row.filled_quantity,
+    ...[null,'',true,-1,.5,11,0,4].map(value=>row=>{row.filled_quantity=value;}),
+    row=>delete row.average_price,
+    ...[null,'',false,0,-1,Infinity].map(value=>row=>{row.average_price=value;}),
+  ];
+  for(const corrupt of corruptions){
+    const {manager,broker,restart}=context(t),restore=corruptOrderResponses(broker,row=>row.transaction_type==='BUY',corrupt);
+    const result=await enter(manager);assert.equal(result.blocked,true);
+    const state=manager.snapshot(),p=state.positions.INFY;
+    assert.notEqual(p.status,'closed');assert.equal(p.quantity,0);assert.equal(p.requested_quantity,10);
+    assert.equal(pendingDeliveryQuantity(p,state),10);assert.notEqual(state.intents[p.entry_intent].state,'terminal');
+    assert.equal((await broker.call('positions')).net[0].quantity,10);
+    assert.equal((await restart().reconcile()).blocked,true);
+    assert.equal(mutations(broker,'place_order').length,1);assert.equal(mutations(broker,'place_gtt').length,0);
+    restore();const resumed=restart();assert.equal((await resumed.reconcile()).blocked,false);
+    assert.equal(resumed.snapshot().positions.INFY.remaining_quantity,10);
+    assert.equal(mutations(broker,'place_order').length,1);assert.equal(mutations(broker,'place_gtt').length,1);
+  }
+});
+
+test('malformed explicit exit fills block another sell and preserve the last confirmed remaining quantity',async t=>{
+  for(const corrupt of [row=>delete row.filled_quantity,row=>{row.average_price=0;}]){
+    const {manager,broker,restart}=context(t);await enter(manager);broker.timeout_order_before=true;
+    await manager.request_exit('INFY',10,99);
+    broker.add_order(mutations(broker,'place_order').at(-1),4,'CANCELLED');
+    const restore=corruptOrderResponses(broker,row=>row.transaction_type==='SELL',corrupt),resumed=restart();
+    assert.equal((await resumed.reconcile()).blocked,true);
+    assert.equal(resumed.snapshot().positions.INFY.remaining_quantity,10);
+    assert.equal((await resumed.request_exit('INFY',10,99)).blocked,true);
+    assert.equal(mutations(broker,'place_order').length,2);assert.equal(mutations(broker,'place_gtt').length,1);
+    restore();await resumed.reconcile();assert.equal(resumed.snapshot().positions.INFY.remaining_quantity,6);
+    broker.timeout_order_before=false;
+    assert.equal((await resumed.request_exit('INFY',6,99)).status,'closed');
+    assert.equal(mutations(broker,'place_order').at(-1).quantity,6);
+  }
+});
+
+test('malformed triggered GTT fills cannot close ownership or authorize a competing explicit sell',async t=>{
+  for(const corrupt of [row=>delete row.filled_quantity,row=>{row.filled_quantity=-1;},row=>{row.average_price=null;},row=>{row.quantity=11;row.filled_quantity=11;}]){
+    const {manager,broker,restart}=context(t);await enter(manager);
+    const gtt=broker.gtts['1'];gtt.status='triggered';
+    const order=broker.add_order(gtt.orders[0],10,'COMPLETE');
+    gtt.orders[0].result={order_result:{status:'success',order_id:order.order_id}};
+    const restore=corruptOrderResponses(broker,row=>row.transaction_type==='SELL',corrupt),resumed=restart();
+    assert.equal((await resumed.reconcile()).blocked,true);
+    assert.equal(resumed.snapshot().positions.INFY.remaining_quantity,10);
+    assert.equal((await resumed.request_exit('INFY',10,99)).blocked,true);
+    assert.equal(mutations(broker,'place_order').length,1);assert.equal(mutations(broker,'delete_gtt').length,0);
+    restore();assert.equal((await resumed.reconcile()).blocked,false);
+    assert.equal(resumed.snapshot().positions.INFY.status,'closed');
+    assert.equal(mutations(broker,'place_order').length,1);
+  }
+});
+
+test('verified zero-fill cancellations and rejections release entries while numeric broker strings remain compatible',async t=>{
+  for(const status of ['CANCELLED','REJECTED']){
+    const {manager,broker}=context(t);broker.buy_fill=0;
+    corruptOrderResponses(broker,row=>row.transaction_type==='BUY',row=>{row.status=status;});
+    assert.equal((await enter(manager)).status,'closed');assert.equal(mutations(broker,'place_gtt').length,0);
+  }
+  const {manager,broker}=context(t);broker.buy_fill=4;
+  corruptOrderResponses(broker,()=>true,row=>{for(const key of ['quantity','filled_quantity','average_price'])row[key]=String(row[key]);});
+  assert.equal((await enter(manager)).status,'protected');assert.equal(manager.snapshot().positions.INFY.quantity,4);
+});
+
+test('invalid legacy terminal entry cache is discarded without releasing its allocation or preventing a verified retry',async t=>{
+  const {manager,broker,restart}=context(t);broker.entry_open=true;broker.buy_fill=0;
+  await enter(manager);
+  const p=manager.state.positions.INFY,intent=manager.state.intents[p.entry_intent];
+  intent.state='terminal';intent.order.status='COMPLETE';delete intent.order.filled_quantity;manager._save();
+  Object.assign(broker.rows[0],{status:'COMPLETE',filled_quantity:10,pending_quantity:0,average_price:100});
+  const restore=corruptOrderResponses(broker,row=>row.transaction_type==='BUY',row=>delete row.filled_quantity),resumed=restart();
+  assert.equal((await resumed.reconcile()).blocked,true);
+  const snapshot=resumed.snapshot(),recovered=snapshot.positions.INFY;
+  assert.equal(snapshot.intents[recovered.entry_intent].state,'unknown');
+  assert.equal(snapshot.intents[recovered.entry_intent].order,undefined);
+  assert.equal(pendingDeliveryQuantity(recovered,snapshot),10);
+  assert.equal(mutations(broker,'place_gtt').length,0);assert.equal(mutations(broker,'place_order').length,1);
+  restore();assert.equal((await resumed.reconcile()).blocked,false);
+  assert.equal(resumed.snapshot().positions.INFY.remaining_quantity,10);
+  assert.equal(mutations(broker,'place_gtt').length,1);assert.equal(mutations(broker,'place_order').length,1);
 });
 
 test('a terminal partial IOC releases its unfilled allocation for another protected holding',async t=>{

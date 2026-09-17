@@ -53,6 +53,19 @@ test('invalid, out-of-order and no-trade ticks cannot contaminate candle prices'
   assert.equal(book.complete, false);
 });
 
+for(const rollbackTime of ['09:20:00','09:20:01'])test(`same-session cumulative volume rollback at ${rollbackTime} cannot inflate a completed candle`,()=>{
+  const book=new CandleBook(),put=(time,volume,price=100)=>book.update(`2026-09-17T${time}+05:30`,price,volume);
+  put('09:15:00',1000);put('09:19:50',1100);put('09:20:00',1200);
+  const before=structuredClone(book);
+  assert.equal(put(rollbackTime,1000,999),null);assert.deepEqual(structuredClone(book),before,'Rejected rollback cannot lower the volume baseline or change candle timing/prices');
+  put('09:24:50',1400);const closed=put('09:25:00',1500);
+  assert.equal(closed.volume,300);assert.equal(closed.high,100);assert.equal(book.bars.length,1);
+  book.update('2026-09-18T09:15:00+05:30',101,100);
+  assert.equal(book.last_volume,100);assert.equal(book.current.volume,0);assert.equal(book.bars.length,0);assert.equal(book.complete,false);
+  book.update('2026-09-18T09:15:00+05:30',102,101);
+  assert.equal(book.current.volume,1);assert.equal(book.current.close,102);assert.equal(book.last_volume,101);
+});
+
 test('late boundary arrival excludes a candle rather than inventing completeness', () => {
   const book = new CandleBook();
   book.update('2026-09-17 09:15:00', 100, 1000);

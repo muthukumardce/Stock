@@ -7,6 +7,7 @@ import { TradingEngine } from '../src/trading.js';
 import { Store } from '../src/storage.js';
 import { BrokerError, KiteBroker } from '../src/broker.js';
 import { CandleBook, Candle, Signal } from '../src/strategy.js';
+import { marketBreadth } from '../src/decision-controls.js';
 import { monotonic, dateIST, isoIST } from '../src/util.js';
 
 const NOW = new Date('2026-09-17T12:00:00+05:30');
@@ -18,7 +19,8 @@ class MemoryStore {
   event(kind, message, data = null, level = 'info') { this.log.push({ kind, message, data: clone(data), level }); return this.log.length; }
 }
 const analyticsFactory = () => ({ worker_limit: 2, batch_size: 2, snapshot: () => ({}), close: async () => {}, analyze: async () => [] });
-const options = overrides => ({ now: () => NOW, backgroundLoops: false, analyticsFactory, ...overrides });
+const options = overrides => ({ now: () => NOW, backgroundLoops: false, analyticsFactory,
+  equityUniverse:{resolve:async instruments=>({instruments:instruments.filter(i=>i.exchange==='NSE'&&i.segment==='NSE'&&i.instrument_type==='EQ').map(i=>({...i,entry_eligible:true})),summary:{status:'verified'}})}, ...overrides });
 function settings(path, mode = 'paper') {
   return { trading_mode: mode, live_trading_enabled: mode === 'live', data_dir: path,
     kite_api_key: '', kite_user_id: '', max_position_pct: .1, risk_per_trade_pct: .0025, daily_loss_pct: .01, max_positions: 5, entry_cutoff: '14:45', exit_time: '15:10', max_spread_pct: .003, min_daily_turnover: 10000 };
@@ -39,6 +41,36 @@ function ready(t, mode = 'paper') {
 }
 const signal = (strategy = 'intraday') => new Signal(strategy, 100, 98, 104, 'test', 2);
 const entryDailyBars = () => Array.from({length:21},(_,i)=>new Candle(new Date(NOW-(21-i)*86400000),100,101,99,100,1000));
+
+test('broker clock health blocks new entries until measured alignment recovers without rearming a pause',async t=>{
+  const [engine]=ready(t);let health={status:'skewed',blocked:true,stale:false};
+  engine.broker={clock_health:()=>health};
+  assert.equal(await engine._enter_locked(1,signal()),'system_clock_skew');
+  assert.equal(engine.readiness().checks.find(c=>c.key==='system_clock').ok,false);
+  assert.deepEqual(engine.snapshot().broker_clock,health);assert.deepEqual(engine.positions,{});
+  for(const next of [{status:'unknown',blocked:false,stale:false},{status:'uncertain',blocked:false,stale:false},{status:'aligned',blocked:false,stale:true}]){
+    health=next;assert.equal(await engine._enter_locked(1,signal()),'system_clock_unverified');
+  }
+  health={status:'aligned',blocked:false,stale:false};
+  assert.equal(engine.readiness().checks.find(c=>c.key==='system_clock').ok,true);
+  const [funded]=ready(t);funded.broker=engine.broker;
+  assert.equal(await funded._enter_locked(1,signal()),'paper_buy_filled');
+  await engine.pause();assert.equal(engine.running,false);
+  assert.equal(await engine._enter_locked(1,signal()),'entries_paused');
+  assert.deepEqual(engine.positions,{});
+});
+
+test('known clock skew rejects matching old ticks and clears earlier executable quotes on account refresh',async t=>{
+  const [engine]=ready(t);let health={status:'skewed',blocked:true,stale:false};
+  engine.broker={clock_health:()=>health,account:async()=>clone(engine.account)};
+  engine._candidates.push(['old']);
+  await engine._refresh_account_locked();assert.deepEqual(engine.quotes,{});assert.equal(engine._candidates.length,0);
+  engine._on_ticks([{instrument_token:1,exchange_timestamp:NOW,last_price:100,volume_traded:100000}]);
+  assert.deepEqual(engine.quotes,{});assert.equal(engine.snapshot().feed_fresh,false);
+  health={status:'aligned',blocked:false,stale:false};engine.books[1]=new CandleBook();
+  engine._on_ticks([{instrument_token:1,exchange_timestamp:NOW,last_price:100,volume_traded:100000}]);
+  assert.equal(engine.quotes[1].last_price,100);
+});
 
 function shortSignal(){const s=signal();Object.assign(s,{side:'SELL',stop:102,target:96});return s;}
 
@@ -131,7 +163,7 @@ for(const [label,invalid]of[
   ['multiple sessions',()=>priorSessionRows().map((row,i)=>({...row,date:new Date(+row.date-(i<10?86400000:0))}))],
 ])test(`invalid same-day ${label} seed cache is replaced from prior-session history before marking intraday warmup complete`,async t=>{
   const [engine,store]=ready(t);engine.settings.enhanced_signals=true;engine.books[1]=new CandleBook();
-  store.set('intraday_seed:1',{date:dateIST(NOW),bars:invalid()});const ranges=[];
+  store.set('intraday_seed:1',{date:dateIST(NOW),symbol:'TEST',bars:invalid()});const ranges=[];
   engine.broker={call:async(method,token,from)=>{ranges.push(from);return [...priorSessionRows(),...currentSessionRows()];}};
   await engine._intraday_history_pass();
   assert.equal(ranges.length,1);assert.equal(+ranges[0],+new Date('2026-09-10T09:15:00+05:30'));
@@ -151,7 +183,7 @@ test('invalid in-memory prior seed invalidates old warmup completion and refetch
 test('valid prior cache and in-memory seeds retain current-session-only requests and no repeated download',async t=>{
   for(const memory of [false,true]){
     const [engine,store]=ready(t);engine.settings.enhanced_signals=true;engine.books[1]=new CandleBook();
-    store.set('intraday_seed:1',{date:dateIST(NOW),bars:memory?[{close:0}]:priorSessionRows()});
+    store.set('intraday_seed:1',{date:dateIST(NOW),symbol:'TEST',bars:memory?[{close:0}]:priorSessionRows()});
     if(memory)engine.previous_intraday[1]=priorSessionRows().map(row=>new Candle(row.date,row.open,row.high,row.low,row.close,row.volume));
     const ranges=[];engine.broker={call:async(method,token,from)=>{ranges.push(from);return currentSessionRows();}};
     await engine._intraday_history_pass();await engine._intraday_history_pass();
@@ -273,9 +305,64 @@ test('zero-fill rejection resolves without position; input rejection never becom
   assert.equal(await engine._enter_locked(1, signal()), 'cover_order_rejected'); assert.equal(engine._unresolved_intents(), false); assert.ok(store.log.some(e => e.kind === 'order_rejected'));
 });
 
+test('malformed cover entry fills retain ownership and reservation instead of resolving as an unfilled order',async t=>{
+  for(const patch of [{filled_quantity:undefined},{filled_quantity:null},{filled_quantity:''},{filled_quantity:false},{filled_quantity:-1},{filled_quantity:1.5},{filled_quantity:11},{filled_quantity:0},{filled_quantity:4},{average_price:undefined},{average_price:0},{average_price:Infinity}]){
+    const [engine,store]=ready(t,'live'),[parent]=journal(store,NOW,10);
+    engine.intents=store.get('bot_state_live').intents;Object.assign(parent,patch);
+    engine.account.orders=[parent];engine.account.positions.net=[{exchange:'NSE',tradingsymbol:'TEST',product:'MIS',quantity:10}];
+    let mutations=0;engine.broker={cancel_cover:async()=>{mutations++;}};
+    await engine._reconcile_live_locked();
+    assert.equal(engine.intents.EB1.state,'conflict',JSON.stringify(patch));
+    assert.equal(engine._unresolved_intents(),true);assert.ok(engine._exposure()>=1000);
+    assert.equal(engine._portfolio().rows.find(row=>row.symbol==='TEST').exposure,2000,'Unverified fill ownership retains its reservation alongside reported account exposure');
+    assert.equal(engine.snapshot().safe_to_stop,false);assert.equal(engine.running,false);assert.equal(mutations,0);
+    assert.equal(engine.intents.EB1.broker_parent,undefined,'Malformed terminal data must not replace verified cached broker evidence');
+    const [verifiedParent,verifiedChild]=journal(new MemoryStore(),NOW,10);engine.account.orders=[verifiedParent,verifiedChild];
+    await engine._reconcile_live_locked();assert.equal(engine.intents.EB1.state,'open');assert.equal(engine.positions.TEST.quantity,10);
+    assert.equal(engine._exposure(),1000);assert.equal(engine.running,false,'Verified recovery must not rearm entries');
+  }
+});
+
+test('legacy malformed terminal cover cache is refreshed from order history before releasing owned exposure',async t=>{
+  const [engine,store]=ready(t,'live'),[parent,child]=journal(store);engine.intents=store.get('bot_state_live').intents;
+  engine.account.orders=[parent,child];engine.account.positions.net=[{exchange:'NSE',tradingsymbol:'TEST',product:'MIS',quantity:4}];
+  await engine._reconcile_live_locked();
+  Object.assign(engine.intents.EB1.broker_children[0],{status:'COMPLETE',filled_quantity:undefined});
+  engine.account.orders=[parent];engine.account.positions.net[0].quantity=0;
+  const requests=[];engine.broker={call:async(method,id)=>{requests.push([method,id]);return [{...child,status:'COMPLETE',filled_quantity:4,pending_quantity:0,average_price:98}];}};
+  await engine._reconcile_live_locked();assert.deepEqual(requests,[['order_history','child']]);
+  assert.equal(engine.intents.EB1.state,'closed');assert.deepEqual(engine.positions,{});assert.equal(engine._exposure(),0);
+  assert.ok(engine.realised<0);
+});
+
+test('malformed cover exit fills preserve the previous owned position and verified order cache',async t=>{
+  for(const patch of [{filled_quantity:undefined},{filled_quantity:null},{filled_quantity:''},{filled_quantity:false},{filled_quantity:0},{filled_quantity:4,average_price:0}]){
+    const [engine,store]=ready(t,'live'),[parent,child]=journal(store);
+    engine.intents=store.get('bot_state_live').intents;engine.account.orders=[parent,child];
+    engine.account.positions.net=[{exchange:'NSE',tradingsymbol:'TEST',product:'MIS',quantity:4}];
+    let mutations=0;engine.broker={cancel_cover:async()=>{mutations++;}};
+    await engine._reconcile_live_locked();const verified=clone(engine.intents.EB1.broker_children);
+    Object.assign(child,{status:'COMPLETE',pending_quantity:0,filled_quantity:4,average_price:98},patch);
+    engine.account.positions.net[0].quantity=0;
+    await engine._reconcile_live_locked();
+    assert.equal(engine.intents.EB1.state,'conflict',JSON.stringify(patch));assert.equal(engine.positions.TEST.quantity,4);
+    assert.equal(engine.realised,0);assert.deepEqual(engine.intents.EB1.broker_children,verified);
+    assert.equal(engine.snapshot().safe_to_stop,false);assert.equal(mutations,0);
+  }
+});
+
 test('contradictory broker rejection retains ownership and cash until the accepted cover order is reconciled',async t=>{
   const [engine]=ready(t,'live');let calls=0;
-  engine.broker=new KiteBroker('test-key','test-token',{sleep:async()=>{},fetch:async()=>{calls++;return new Response(JSON.stringify({status:'error',error_type:'InputException',message:'Contradictory acknowledgement',data:{order_id:'parent'}}),{status:500});}});
+  engine.broker=new KiteBroker('test-key','test-token',{clock:()=>0,wallClock:()=>+NOW,sleep:async()=>{},fetch:async(url,request)=>{
+    const headers={Date:NOW.toUTCString()};
+    if(request.method==='GET'){
+      assert.equal(new URL(url).pathname,'/user/profile');
+      return new Response(JSON.stringify({status:'success',data:{user_id:'TEST'}}),{headers});
+    }
+    calls++;return new Response(JSON.stringify({status:'error',error_type:'InputException',message:'Contradictory acknowledgement',data:{order_id:'parent'}}),{status:500,headers});
+  }});
+  // Entry begins after the authenticated response has verified the host clock.
+  await engine.broker.call('profile');assert.equal(engine.broker.clock_health().status,'aligned');
   assert.equal(await engine._enter_locked(1,signal()),'cover_order_unknown');
   const intent=Object.values(engine.intents)[0];assert.equal(calls,1);assert.equal(engine._unresolved_intents(),true);assert.ok(engine._exposure()>0);assert.equal(engine.running,false);
   const [parent,child]=journal(new MemoryStore(),NOW,intent.quantity);parent.tag=intent.tag;
@@ -287,6 +374,74 @@ test('malformed turnover and visible depth cannot authorize a new order',async t
   const [engine]=ready(t);engine.quotes[1].volume_traded='invalid';assert.equal(await engine._enter_locked(1,signal()),'turnover_too_low');
   engine.quotes[1].volume_traded=100000;engine.quotes[1].depth.sell[0].quantity='invalid';assert.equal(await engine._enter_locked(1,signal()),'insufficient_visible_liquidity');
   engine.books[1]=new CandleBook();const before=engine.quotes[1];engine._on_ticks([{instrument_token:1,exchange_timestamp:NOW,last_price:200,volume_traded:'invalid'}]);assert.equal(engine.quotes[1],before);
+});
+
+test('older exchange ticks cannot roll back quotes, depth or position marks; equal timestamps still update',t=>{
+  let clock=100000,now=NOW;t.mock.method(process.hrtime,'bigint',()=>BigInt(clock)*1000000n);
+  const [engine]=ready(t);engine._now=()=>now;engine.books[1]=new CandleBook();engine.positions.TEST={last:100};
+  const tick={...engine.quotes[1],instrument_token:1,exchange_timestamp:NOW};engine._on_ticks([tick]);
+  const quote=engine.quotes[1],heartbeat=engine._heartbeat,freshness=engine._last_tick_received;
+  clock+=2000;now=new Date(+NOW+2000);
+  engine._on_ticks([{...tick,exchange_timestamp:new Date(+NOW-1000),last_price:90,volume_traded:99999,depth:{buy:[{price:89.95,quantity:100}],sell:[{price:90.05,quantity:100}]}}]);
+  assert.equal(engine.quotes[1],quote);assert.equal(engine.positions.TEST.last,100);assert.equal(engine.books[1].current.close,100);
+  assert.equal(engine._last_tick_received,freshness);assert.equal(engine._heartbeat,heartbeat);
+  engine._on_ticks([{...tick,last_price:100.1,volume_traded:100001,depth:{buy:[{price:100.05,quantity:100}],sell:[{price:100.15,quantity:100}]}}]);
+  assert.equal(engine.quotes[1].last_price,100.1);assert.equal(engine.quotes[1].depth.sell[0].price,100.15);assert.equal(engine.positions.TEST.last,100.1);
+  assert.equal(engine.books[1].current.close,100.1);assert.equal(engine.quotes[1].received_at,freshness,'Same exchange timestamp does not renew its freshness window');
+});
+
+test('same-session cumulative volume rollbacks cannot contaminate quotes, freshness, positions or completed analytics candles',t=>{
+  let now=new Date('2026-09-17T09:15:00+05:30');const [engine]=ready(t);engine._now=()=>now;engine.books[1]=new CandleBook();engine.positions.TEST={last:100};
+  const base={...engine.quotes[1],instrument_token:1};
+  const tick=(at,volume,price=100)=>{now=new Date(at);engine._on_ticks([{...base,exchange_timestamp:now,last_price:price,volume_traded:volume}]);};
+  tick('2026-09-17T09:15:00+05:30',1000);tick('2026-09-17T09:19:50+05:30',1100);tick('2026-09-17T09:20:00+05:30',1200);
+  const quote=engine.quotes[1],book=structuredClone(engine.books[1]),heartbeat=engine._heartbeat,freshness=engine._last_tick_received;
+  for(const at of ['09:20:00','09:20:01']){
+    tick(`2026-09-17T${at}+05:30`,1000,999);
+    assert.equal(engine.quotes[1],quote);assert.equal(engine.positions.TEST.last,100);assert.deepEqual(structuredClone(engine.books[1]),book);
+    assert.equal(engine._heartbeat,heartbeat);assert.equal(engine._last_tick_received,freshness);assert.equal(engine._analysis_pending.size,0);
+  }
+  tick('2026-09-17T09:24:50+05:30',1400);tick('2026-09-17T09:25:00+05:30',1500);
+  assert.equal(engine.books[1].bars[0].volume,300);assert.equal(engine._analysis_pending.get('intraday:1').bars[0].volume,300);assert.equal(engine.quotes[1].volume_traded,1500);
+  tick('2026-09-18T09:15:00+05:30',100,101);
+  assert.equal(engine.quotes[1].volume_traded,100);assert.equal(engine.positions.TEST.last,101);assert.equal(engine.books[1].bars.length,0);assert.equal(engine.books[1].current.volume,0);assert.equal(engine.books[1].complete,false);
+  tick('2026-09-18T09:15:00+05:30',101,102);
+  assert.equal(engine.quotes[1].volume_traded,101);assert.equal(engine.books[1].current.volume,1);assert.equal(engine.positions.TEST.last,102);
+  tick('2026-09-18T09:15:00+05:30',101,103);
+  assert.equal(engine.quotes[1].last_price,103);assert.equal(engine.books[1].current.volume,1);assert.equal(engine.books[1].current.close,102,'An unchanged-volume quote is accepted without inventing a candle trade');
+});
+
+test('cumulative volume rollback is rejected against retained candle history after quotes are cleared',t=>{
+  const [engine]=ready(t);engine.books[1]=new CandleBook();engine.books[1].update(NOW,100,1000);delete engine.quotes[1];
+  engine._on_ticks([{instrument_token:1,exchange_timestamp:NOW,last_price:999,volume_traded:900}]);
+  assert.equal(engine.quotes[1],undefined);assert.equal(engine.books[1].last_volume,1000);assert.equal(engine.books[1].current.close,100);
+});
+
+test('delayed ticks expire at ten seconds of exchange age for breadth, entries, exits and readiness',async t=>{
+  let clock=100000,now=NOW;t.mock.method(process.hrtime,'bigint',()=>BigInt(clock)*1000000n);
+  const [engine]=ready(t);engine._now=()=>now;engine.books[1]=new CandleBook();
+  const tick={...engine.quotes[1],instrument_token:1,exchange_timestamp:new Date(+NOW-9000),ohlc:{open:99}};
+  engine._on_ticks([tick]);assert.equal(engine.quotes[1].received_at,91);assert.equal(engine._last_tick_received,91);
+  const breadthSettings={...engine.settings,market_regime_filter:true,min_market_samples:1,min_market_coverage:1,min_market_breadth:.5};
+  assert.equal(marketBreadth(engine.universe,engine.quotes,breadthSettings,monotonic()).status,'eligible');assert.equal(engine.snapshot().feed_fresh,true);
+  clock+=2000;now=new Date(+NOW+2000);
+  assert.equal(marketBreadth(engine.universe,engine.quotes,breadthSettings,monotonic()).status,'warming_up');
+  assert.equal(engine.snapshot().feed_fresh,false);assert.equal(engine.readiness().checks.find(check=>check.key==='live_feed').ok,false);
+  assert.equal(await engine._enter_locked(1,signal()),'quote_stale');
+  engine.positions.TEST={symbol:'TEST',token:1,strategy:'intraday',side:'BUY',quantity:10,entry:100,last:100,stop:98,target:104,opened_at:isoIST(NOW)};
+  await engine._exit_locked('TEST','test');assert.ok(engine.positions.TEST,'Stale executable quote cannot fill a simulated exit');
+  const stale=engine.quotes[1];engine._on_ticks([tick]);assert.equal(engine.quotes[1],stale,'Repeated stale packet cannot renew freshness');
+});
+
+test('freshness windows never move into the future and older instruments cannot reset feed freshness',t=>{
+  let clock=100000;t.mock.method(process.hrtime,'bigint',()=>BigInt(clock)*1000000n);
+  const [engine]=ready(t);engine.books[1]=new CandleBook();engine.universe[2]={tradingsymbol:'SECOND'};engine.books[2]=new CandleBook();
+  const tick={...engine.quotes[1],instrument_token:1,exchange_timestamp:new Date(+NOW+10000)};
+  engine._on_ticks([tick]);assert.equal(engine.quotes[1].received_at,100);
+  engine._on_ticks([{...tick,instrument_token:2,exchange_timestamp:new Date(+NOW-9000)}]);
+  assert.equal(engine.quotes[2].received_at,91);assert.equal(engine._last_tick_received,100);
+  const before=engine.quotes[1];engine._on_ticks([{...tick,exchange_timestamp:new Date(+NOW+10001),last_price:200}]);assert.equal(engine.quotes[1],before);
+  clock+=10001;assert.equal(engine.snapshot().feed_fresh,false,'Future tolerance does not extend receipt freshness beyond ten seconds');
 });
 test('intraday historical seed excludes current, future, malformed and invalid candles', t => {
   const [engine] = ready(t); engine.books[1] = new CandleBook();
@@ -360,6 +515,54 @@ test('existing-holding paper sell needs selection, is idempotent, and never chan
   store.set('strategy_settings', { manage_existing_holdings: 'selected', managed_symbols: ['TEST'] }); engine._analyze_holdings(); engine._analyze_holdings();
   assert.equal(Object.keys(engine._paper_holding_actions).length, 1); assert.equal(engine.account.holdings[0].quantity, 10); assert.equal(engine.realised, 0);
 });
+test('holding snapshots explain excluded and other-exchange holdings without taking paper actions', t => {
+  const [engine,store]=ready(t);engine.universe_summary={status:'verified'};engine._universe_date=dateIST(NOW);
+  store.set('strategy_settings',{manage_existing_holdings:'all'});
+  engine.account.holdings=[
+    {exchange:'NSE',tradingsymbol:'TEST',instrument_token:1,quantity:10},
+    {exchange:'NSE',tradingsymbol:'EXCLUDED',instrument_token:99,quantity:10},
+    {exchange:'BSE',tradingsymbol:'TEST',instrument_token:1,quantity:10},
+  ];
+  for(const token of [1,99]){engine.daily[token]=entryDailyBars();engine._analysis_cache.set(`swing:${token}`,{holding:{trailing:95,trend_exit:true}});}
+  const rows=engine.snapshot().holdings_signals;
+  assert.equal(rows.length,3);assert.equal(rows[0].status,'exit_candidate');assert.equal(rows[0].managed,true);
+  assert.equal(rows[1].status,'unsupported');assert.match(rows[1].reason,/Outside the verified NSE/);assert.equal(rows[1].managed,false);
+  assert.equal(rows[2].status,'unsupported');assert.equal(rows[2].exchange,'BSE');assert.equal(rows[2].managed,false);
+  assert.deepEqual(engine._paper_holding_actions,{});assert.equal(store.log.some(row=>row.kind==='paper_holding_exit'),false);
+  engine._analyze_holdings();assert.deepEqual(Object.keys(engine._paper_holding_actions),[`${engine.day}:TEST`]);
+  assert.deepEqual(engine.account.holdings.map(row=>row.quantity),[10,10,10]);
+});
+test('holding statuses distinguish unverified eligibility from unsupported instruments after verification', t => {
+  const [engine]=ready(t);engine.universe={};engine.universe_summary={status:'unavailable'};
+  engine.account.holdings=[{exchange:'NSE',tradingsymbol:'UNKNOWN',instrument_token:99,quantity:10}];
+  assert.equal(engine.snapshot().holdings_signals[0].status,'universe_unavailable');
+  engine.universe_summary={status:'verified'};
+  assert.equal(engine.snapshot().holdings_signals[0].status,'unsupported');
+});
+test('recovery-only holdings retain exit analysis without allowing new holding adoption', t => {
+  const [engine,store]=ready(t);store.set('strategy_settings',{manage_existing_holdings:'all'});
+  engine.universe[1].entry_eligible=false;engine.universe[1].recovery_only=true;
+  engine.account.holdings=[{exchange:'NSE',tradingsymbol:'TEST',instrument_token:1,quantity:10}];
+  engine.daily[1]=entryDailyBars();engine._analysis_cache.set('swing:1',{holding:{trailing:95,trend_exit:true}});
+  let row=engine.snapshot().holdings_signals[0];assert.equal(row.scope,'recovery_only');assert.equal(row.status,'exit_candidate');assert.equal(row.managed,false);
+  engine._analyze_holdings();assert.deepEqual(engine._paper_holding_actions,{});assert.deepEqual(engine._authorized_holdings(),[]);
+  engine.delivery={snapshot:()=>({positions:{TEST:{status:'protected',source:'existing',remaining_quantity:10}},blocked:false})};
+  row=engine.snapshot().holdings_signals[0];assert.equal(row.scope,'recovery_only');assert.equal(row.managed,true);assert.equal(row.status,'exit_candidate');
+  assert.deepEqual(engine._paper_holding_actions,{},'Reading status must never execute a simulated exit');
+});
+test('holding history and status follow the current matching symbol token and recover from unusable history', async t => {
+  const [engine]=ready(t);engine.universe[2]={tradingsymbol:'OTHER',tick_size:.05};
+  engine.account.holdings=[{exchange:'NSE',tradingsymbol:'TEST',instrument_token:2,quantity:10}];
+  let usable=false;const requests=[];engine.broker={call:async(method,token)=>{assert.equal(method,'historical_data');requests.push(token);return usable?completedDailyRows():[];}};
+  assert.equal(engine.snapshot().holdings_signals[0].status,'warming_up');
+  await engine._history_pass();let row=engine.snapshot().holdings_signals[0];assert.equal(row.token,1);assert.equal(row.status,'history_unavailable');assert.match(row.reason,/retry automatically/);
+  usable=true;engine._daily_history_retry[1].next_at=0;await engine._history_pass();
+  assert.deepEqual(requests,[1,1]);assert.equal(engine.snapshot().holdings_signals[0].status,'analysing');
+  engine._analysis_cache.set('swing:1',{holding:{trailing:95,trend_exit:false}});
+  assert.equal(engine.snapshot().holdings_signals[0].status,'hold');
+  engine.quotes[1].received_at=monotonic()-20;row=engine.snapshot().holdings_signals[0];assert.equal(row.status,'awaiting_market_data');assert.match(row.reason,/fresh quote/);
+  engine._analysis_cache.delete('swing:1');assert.match(engine.snapshot().holdings_signals[0].reason,/start exit analysis/);
+});
 test('account audit tracks changes without logging every market-price movement', async t => {
   const [engine, store] = ready(t); engine.broker = { account: async () => clone(engine.account) };
   engine.account.holdings = [{ tradingsymbol: 'TEST', exchange: 'NSE', quantity: 10, average_price: 100, last_price: 101 }];
@@ -388,6 +591,136 @@ class RecoveryBroker {
   async cancel_cover(oid) { this.calls.push('cancel:' + oid); }
   close() { this.calls.push('close'); }
 }
+test('connection classifies the full broker master before applying the streaming capacity limit', async t => {
+  const broker=new RecoveryBroker(),original=broker.call.bind(broker),master=Array.from({length:10111},(_,i)=>({instrument_token:i+1,exchange:'NSE',segment:'NSE',instrument_type:'EQ',tradingsymbol:i===0?'TEST':`DEBT${i}`,tick_size:.05}));
+  broker.call=async(method,...args)=>method==='instruments'?master:original(method,...args);
+  let subscribed;
+  broker.stream=async tokens=>{subscribed=tokens;};
+  const engine=new TradingEngine(settings(temp(t)),new MemoryStore(),options({brokerFactory:()=>broker,equityUniverse:{resolve:async instruments=>{
+    assert.equal(instruments.length,10111);
+    return {instruments:[{...instruments[0],entry_eligible:true}],summary:{status:'verified',entry_eligible_count:1,excluded_counts:{outside_equity_directory:10110}}};
+  }}}));
+  t.after(()=>engine.shutdown());await engine.connect('synthetic-session','AB1234');
+  assert.equal(engine.connected,true);assert.deepEqual(subscribed,[1]);assert.equal(engine.snapshot().universe_count,1);
+  assert.equal(engine.readiness().checks.find(c=>c.key==='equity_universe').ok,true);
+  assert.equal(engine.snapshot().universe_classification.excluded_counts.outside_equity_directory,10110);
+});
+
+test('unavailable equity directory blocks entries and automatically recovers through bounded monitoring retry',async t=>{
+  const broker=new RecoveryBroker();let available=false,resolutions=0;
+  const engine=new TradingEngine(settings(temp(t)),new MemoryStore(),options({brokerFactory:()=>broker,equityUniverse:{resolve:async instruments=>{
+    resolutions++;return {instruments:available?instruments.map(i=>({...i,entry_eligible:true})):[],summary:{status:available?'verified':'unavailable'}};
+  }}}));
+  t.after(()=>engine.shutdown());await engine.connect('synthetic-session','AB1234');await engine.start();
+  assert.equal(engine.connected,true);assert.equal(engine.running,true);assert.equal(engine.recovery.blocked,true);assert.equal(engine.universe_summary.status,'unavailable');
+  const pass=async()=>{const controller=new AbortController();engine._wait_reconciliation=async()=>controller.abort();await engine._monitor(controller.signal);};
+  await pass();assert.equal(resolutions,1,'failed sources are not retried on every account poll');
+  available=true;engine._universe_retry_at=0;await pass();
+  assert.equal(resolutions,2);assert.equal(engine.recovery.phase,'ready');assert.equal(engine.running,true);assert.equal(engine.universe[22].entry_eligible,true);
+  assert.equal(broker.calls.filter(c=>c==='instruments').length,1,'same-day retry reuses the broker master');
+});
+
+test('directory outage retains owned instruments for exits without authorizing fresh entries or new holding adoption',async t=>{
+  const [engine,store]=ready(t);t.after(()=>engine.shutdown());
+  const instrument={instrument_token:22,exchange:'NSE',segment:'NSE',instrument_type:'EQ',tradingsymbol:'TEST',tick_size:.05};
+  engine.positions.TEST={symbol:'TEST',token:1,strategy:'intraday',side:'BUY',quantity:1,entry:100,last:100,stop:98,target:104,entry_fee:.1,opened_at:isoIST(NOW),protection:'simulated'};
+  engine.broker=new RecoveryBroker();engine.equity_universe={resolve:async(instruments,{managedSymbols})=>{
+    assert.deepEqual(managedSymbols,['TEST']);return {instruments:[{...instruments[0],entry_eligible:false}],summary:{status:'unavailable'}};
+  }};
+  store.set('strategy_settings',{intraday_enabled:true,swing_enabled:false,intraday_allocation_pct:1,swing_allocation_pct:0,manage_existing_holdings:'all',managed_symbols:[]});
+  engine.account.holdings=[{exchange:'NSE',product:'CNC',tradingsymbol:'TEST',quantity:10}];
+  await engine._refresh_universe_locked([instrument]);engine._advance_recovery();
+  assert.equal(engine.positions.TEST.token,22);assert.equal(engine.connected,true);assert.equal(engine.recovery.blocked,true);
+  assert.equal(await engine._enter_locked(22,signal()),'instrument_not_entry_eligible');assert.deepEqual(engine._authorized_holdings(),[]);
+  engine.quotes[22]={last_price:97,received_at:monotonic(),depth:{buy:[{price:97,quantity:100}],sell:[{price:97.05,quantity:100}]}};
+  await engine._run_once();assert.equal(engine.positions.TEST,undefined,'existing simulated stop still exits during directory failure');
+  assert.ok(store.log.some(row=>row.kind==='paper_fill'&&row.data.reason==='stop_loss'));
+});
+
+test('a new trading day refreshes both the broker master and official directory before admitting entries',async t=>{
+  const broker=new RecoveryBroker();let now=NOW,resolutions=0;
+  const engine=new TradingEngine(settings(temp(t)),new MemoryStore(),options({now:()=>now,brokerFactory:()=>broker,equityUniverse:{resolve:async instruments=>{
+    resolutions++;return {instruments:instruments.map(i=>({...i,entry_eligible:true})),summary:{status:'verified'}};
+  }}}));
+  t.after(()=>engine.shutdown());await engine.connect('synthetic-session','AB1234');await engine.start();
+  now=new Date(+NOW+86400000);
+  assert.equal(await engine._enter_locked(22,signal()),'equity_directory_unavailable');
+  engine._universe_retry_at=0;
+  const controller=new AbortController();engine._wait_reconciliation=async()=>controller.abort();await engine._monitor(controller.signal);
+  assert.equal(resolutions,2);assert.equal(broker.calls.filter(c=>c==='instruments').length,2);assert.equal(engine._universe_date,dateIST(now));
+});
+
+const cashInstrument=(symbol,token=1)=>({instrument_token:token,exchange:'NSE',segment:'NSE',instrument_type:'EQ',tradingsymbol:symbol,tick_size:.05});
+const repriceRows=(rows,delta)=>rows.map(row=>({...row,open:row.open+delta,high:row.high+delta,low:row.low+delta,close:row.close+delta}));
+
+test('token reuse discards the previous security memory and disk history before analysing its replacement',async t=>{
+  const [engine,store]=ready(t);engine.settings.enhanced_signals=true;
+  store.set('strategy_settings',{intraday_enabled:true,swing_enabled:true,intraday_allocation_pct:.5,swing_allocation_pct:.5});
+  engine.books[1]=new CandleBook();engine.books[1].bars=currentSessionRows().map(row=>new Candle(row.date,row.open,row.high,row.low,row.close,row.volume));
+  engine.daily[1]=completedDailyRows().map(row=>new Candle(row.date,row.open,row.high,row.low,row.close,row.volume));
+  engine.previous_intraday[1]=priorSessionRows().map(row=>new Candle(row.date,row.open,row.high,row.low,row.close,row.volume));
+  store.set('daily:1',{date:dateIST(NOW),symbol:'TEST',rows:completedDailyRows()});
+  store.set('intraday_seed:1',{date:dateIST(NOW),symbol:'TEST',bars:priorSessionRows()});
+  engine._daily_history_retry[1]={attempts:4,next_at:monotonic()+300};engine._intraday_history_loaded.add(1);
+  const calls=[];engine.broker={stream:async()=>{},call:async(method,token,from,to,interval)=>{
+    calls.push({method,token,from,interval});return repriceRows(interval==='day'?completedDailyRows():[...priorSessionRows(),...currentSessionRows()],100);
+  }};
+  await engine._refresh_universe_locked([cashInstrument('NEW')]);
+  assert.equal(engine.books[1].bars.length,0);assert.equal(engine.daily[1],undefined);assert.equal(engine.previous_intraday[1],undefined);
+  assert.equal(engine._daily_history_retry[1],undefined);assert.equal(engine._intraday_history_loaded.has(1),false);
+  engine.quotes[1]={last_price:200,received_at:monotonic()};await engine._history_pass();await engine._intraday_history_pass();
+  assert.deepEqual(calls.map(call=>call.interval),['day','5minute']);assert.equal(dateIST(calls[1].from),'2026-09-10');
+  assert.equal(engine.daily[1][0].close,200);assert.equal(engine.books[1].bars[0].close,200);
+  assert.equal(engine._strategy_context(1).previous_bars[0].close,200);
+  assert.equal(store.get('daily:1').symbol,'NEW');assert.equal(store.get('intraday_seed:1').symbol,'NEW');
+  const daily=engine.daily[1],prior=engine.previous_intraday[1];
+  await engine._refresh_universe_locked([cashInstrument('NEW')]);
+  assert.equal(engine.daily[1],daily);assert.equal(engine.previous_intraday[1],prior,'Unchanged identity retains verified memory');
+});
+
+for(const symbol of [undefined,'OTHER'])test(`${symbol?'mismatched':'legacy unbound'} history caches refetch rather than borrowing a token identity`,async t=>{
+  const [engine,store]=ready(t);requireHistoryForHolding(engine);engine.settings.enhanced_signals=true;engine.books[1]=new CandleBook();
+  store.set('daily:1',{date:dateIST(NOW),symbol,rows:repriceRows(completedDailyRows(),-20)});
+  store.set('intraday_seed:1',{date:dateIST(NOW),symbol,bars:repriceRows(priorSessionRows(),-20)});
+  const calls=[];engine.broker={call:async(method,token,from,to,interval)=>{calls.push(interval);return interval==='day'?completedDailyRows():[...priorSessionRows(),...currentSessionRows()];}};
+  await engine._history_pass();await engine._intraday_history_pass();
+  assert.deepEqual(calls,['day','5minute']);assert.equal(engine.daily[1][0].close,100);assert.equal(engine.previous_intraday[1][0].close,100);
+  assert.equal(store.get('daily:1').symbol,'TEST');assert.equal(store.get('intraday_seed:1').symbol,'TEST');
+  const restored=new TradingEngine(engine.settings,store,options());restored.connected=true;restored.broker=engine.broker;restored.universe=clone(engine.universe);restored.account=clone(engine.account);
+  await restored._history_pass();assert.equal(calls.length,2,'Verified symbol-bound daily cache is reusable after restart');
+});
+
+for(const interval of ['day','5minute'])for(const change of ['token reuse','same-symbol refresh','broker replacement','date rollover'])test(`late ${interval} response cannot publish after ${change}`,async t=>{
+  const [engine,store]=ready(t);requireHistoryForHolding(engine);engine.settings.enhanced_signals=true;engine.books[1]=new CandleBook();
+  let resolve,requests=0;const pending=new Promise(done=>{resolve=done;});
+  engine.broker={stream:async()=>{},call:async()=>{requests++;return pending;}};
+  const task=interval==='day'?engine._history_pass():engine._intraday_history_pass();assert.equal(requests,1);
+  if(change==='token reuse'||change==='same-symbol refresh')await engine._refresh_universe_locked([cashInstrument(change==='token reuse'?'NEW':'TEST')]);
+  else if(change==='broker replacement')engine.broker={call:async()=>{throw new Error('Not requested');}};
+  else{engine._now=()=>new Date(+NOW+86400000);engine._roll_day();}
+  resolve(interval==='day'?completedDailyRows():[...priorSessionRows(),...currentSessionRows()]);await task;
+  assert.equal(engine.daily[1],undefined);assert.equal(engine.previous_intraday[1],undefined);assert.equal(engine.books[1].bars.length,0);
+  assert.equal(store.get('daily:1'),null);assert.equal(store.get('intraday_seed:1'),null);
+  assert.equal(engine._analysis_pending.size,0);assert.equal(engine._history_date,'');assert.equal(engine._intraday_history_loaded.has(1),false);
+});
+
+test('failed stream replacement remains blocked and retries through the bounded monitor path',async t=>{
+  const broker=new RecoveryBroker(),engine=new TradingEngine(settings(temp(t)),new MemoryStore(),options({brokerFactory:()=>broker}));
+  t.after(()=>engine.shutdown());await engine.connect('synthetic-session','AB1234');await engine.start();
+  const stream=broker.stream.bind(broker);let attempts=0;
+  broker.stream=async(...args)=>{if(++attempts===1)throw new Error('Feed worker termination unconfirmed');return stream(...args);};
+  const began=monotonic();await assert.rejects(engine._refresh_universe_locked(),/termination unconfirmed/);engine._advance_recovery();
+  assert.equal(engine._universe_date,'');assert.equal(engine.recovery.blocked,true);
+  assert.equal(engine.readiness().checks.find(check=>check.key==='equity_universe').ok,false);
+  assert.equal(await engine._enter_locked(22,signal()),'equity_directory_unavailable');
+  assert(engine._universe_retry_at>=began+60);
+  const pass=async()=>{const controller=new AbortController();engine._wait_reconciliation=async()=>controller.abort();await engine._monitor(controller.signal);};
+  await pass();assert.equal(attempts,1,'Account polling cannot bypass the setup retry delay');
+  engine._universe_retry_at=0;await pass();
+  assert.equal(attempts,2);assert.equal(engine._universe_date,dateIST(NOW));assert.equal(engine.recovery.phase,'ready');
+  assert.equal(engine.streams[0],true);assert.equal(broker.calls.filter(method=>method==='instruments').length,1);
+});
+
 test('SQLite restart discovers offline cover fill via history and refreshes manual holdings/cash without duplicate P&L', async t => {
   const path = temp(t), filename = join(path, 'recovery.sqlite'); let store = new Store(filename); const broker = new RecoveryBroker(), [parent, child] = journal(store);
   broker.current.orders = [parent, child]; broker.current.positions.net = [{ exchange: 'NSE', tradingsymbol: 'TEST', product: 'MIS', quantity: 4 }];
@@ -410,6 +743,76 @@ test('restart never infers a fill from missing order and retains reconciliation 
 test('wrong broker profile is rejected before account access or order work', async t => {
   const broker = new RecoveryBroker(); broker.profile_id = 'ZZ9999'; const store = new MemoryStore(), engine = new TradingEngine(settings(temp(t)), store, options({ brokerFactory: () => broker }));
   await assert.rejects(engine.connect('session', 'AB1234'), /Connection setup failed/); assert.equal(broker.calls.includes('account'), false); assert.equal(engine.connected, false); assert.equal(engine.recovery.phase, 'blocked'); await engine.shutdown();
+});
+
+const diagnosticSecret = 'synthetic-private-session-value';
+const sensitiveFailureText = `${diagnosticSecret} https://broker.invalid/?access_token=${diagnosticSecret} Authorization: token private-key:${diagnosticSecret}`;
+function assertPrivateFailure(engine, store) {
+  const recorded = JSON.stringify({ events: store.log, journal: store.values, snapshot: engine.snapshot() });
+  assert.equal(recorded.includes(diagnosticSecret), false); assert.equal(recorded.includes('broker.invalid'), false);
+  assert.equal(recorded.includes('Authorization:'), false); assert.equal(recorded.includes('private-key'), false);
+}
+for (const [stage, makeError, kind, http_status] of [
+  ['profile', () => new BrokerError('TokenException', sensitiveFailureText, { http_status: 403 }), 'TokenException', 403],
+  ['account', () => new BrokerError('PermissionException', sensitiveFailureText, { http_status: 403 }), 'PermissionException', 403],
+  ['universe', () => new BrokerError('NetworkException', sensitiveFailureText, { http_status: 502 }), 'NetworkException', 502],
+  ['stream', () => new TypeError(sensitiveFailureText), 'TypeError', null],
+  ['account', () => Object.assign(new Error(sensitiveFailureText), { name: sensitiveFailureText, kind: 'TokenException', http_status: 403 }), 'Error', null],
+  ['profile', () => new BrokerError('SyntheticPrivateKind', sensitiveFailureText, { http_status: 403 }), 'BrokerException', 403],
+  ['account', () => null, 'Error', null],
+]) test(`connection ${stage} failure records safe ${kind} diagnostics without credentials`, async t => {
+  const broker = new RecoveryBroker(), store = new MemoryStore(), error = makeError(), original = broker.call.bind(broker);
+  if (stage === 'account') broker.account = async () => { throw error; };
+  else if (stage === 'stream') broker.stream = async () => { throw error; };
+  else broker.call = async (method, ...args) => { if (method === (stage === 'profile' ? 'profile' : 'instruments')) throw error; return original(method, ...args); };
+  const engine = new TradingEngine(settings(temp(t)), store, options({ brokerFactory: () => broker })); t.after(() => engine.shutdown());
+  await assert.rejects(engine.connect('synthetic-session', 'AB1234'), rejected => { assert.equal(rejected.message.includes(diagnosticSecret), false); return rejected.message.includes(kind); });
+  const event = store.log.find(row => row.kind === 'connection_error');
+  assert.deepEqual(event.data, { operation: 'connect', stage, kind, http_status }); assert.equal(event.level, 'error');
+  assert.equal(engine.running, false); assert.equal(engine.connected, false); assert.equal(engine.recovery.phase, 'blocked'); assertPrivateFailure(engine, store);
+});
+
+for (const [kind, http_status] of [['TokenException', 403], ['PermissionException', 403], ['NetworkException', 502]]) test(`monitor retains ${kind} and HTTP status while preserving halt behavior`, async t => {
+  const [engine, store] = ready(t), controller = new AbortController(), originalHalt = engine._halt.bind(engine);
+  engine._refresh_account_locked = async () => { throw new BrokerError(kind, sensitiveFailureText, { http_status }); };
+  engine._halt = (...args) => { originalHalt(...args); controller.abort(); };
+  await assert.rejects(engine._monitor(controller.signal), { name: 'AbortError' });
+  const event = store.log.find(row => row.kind === (kind === 'TokenException' ? 'auth_expired' : 'account_error'));
+  assert.deepEqual(event.data, { operation: 'account_monitor', stage: 'account', kind, http_status });
+  assert.equal(engine.running, false); assert.equal(engine.connected, kind !== 'TokenException'); assert.equal(engine.status, 'error'); assertPrivateFailure(engine, store);
+});
+
+test('monitor identifies stream renewal failures separately from account reads', async t => {
+  const [engine, store] = ready(t), broker = new RecoveryBroker(), controller = new AbortController(), originalHalt = engine._halt.bind(engine);
+  engine.broker = broker; engine._refresh_account_locked = async () => {};
+  broker.stream = async () => { throw new BrokerError('NetworkException', sensitiveFailureText, { http_status: 503 }); };
+  engine._halt = (...args) => { originalHalt(...args); controller.abort(); };
+  await assert.rejects(engine._monitor(controller.signal), { name: 'AbortError' });
+  assert.deepEqual(store.log.find(row => row.kind === 'account_error').data, { operation: 'account_monitor', stage: 'stream', kind: 'NetworkException', http_status: 503 });
+  assert.equal(engine.running, false); assertPrivateFailure(engine, store);
+});
+
+for (const [makeError, kind, http_status] of [
+  [() => new BrokerError('NetworkException', sensitiveFailureText, { http_status: 502 }), 'NetworkException', 502],
+  [() => Object.assign(new Error(sensitiveFailureText), { name: sensitiveFailureText, http_status: 999 }), 'Error', null],
+  [() => Object.assign(new BrokerError('TokenException', sensitiveFailureText), { http_status: '403 private-key' }), 'TokenException', null],
+  [() => undefined, 'Error', null],
+]) test(`trading loop safely classifies ${kind} failures with status ${http_status}`, async t => {
+  const [engine, store] = ready(t), controller = new AbortController(), originalHalt = engine._halt.bind(engine);
+  engine._run_once = async () => { throw makeError(); };
+  engine._halt = (...args) => { originalHalt(...args); controller.abort(); };
+  await assert.rejects(engine._run(controller.signal), { name: 'AbortError' });
+  assert.deepEqual(store.log.find(row => row.kind === 'engine_error').data, { operation: 'trading_loop', stage: 'execution', kind, http_status });
+  assert.equal(engine.running, false); assertPrivateFailure(engine, store);
+});
+
+test('definitive broker rejection journals useful metadata without raw broker detail', async t => {
+  const [engine, store] = ready(t, 'live');
+  engine.broker = { buy_cover: async () => { throw new BrokerError('InputException', sensitiveFailureText, { http_status: 400, definitive_rejection: true }); } };
+  assert.equal(await engine._enter_locked(1, signal()), 'cover_order_rejected');
+  const event = store.log.find(row => row.kind === 'order_rejected');
+  assert.equal(event.data.kind, 'InputException'); assert.equal(event.data.http_status, 400); assert.equal(event.data.operation, 'cover_entry');
+  assert.equal(event.data.stage, 'submission'); assert.equal(Object.hasOwn(event.data, 'detail'), false); assertPrivateFailure(engine, store);
 });
 test('overdue paper position waits for fresh current-session executable price after restart', async t => {
   const store = new MemoryStore(), broker = new RecoveryBroker(), yesterday = new Date(NOW - 86400000);
@@ -478,7 +881,7 @@ for(const [label,invalid] of [
   ['daily gap',()=>{const rows=completedDailyRows();for(let i=0;i<20;i++)rows[i].date=new Date(rows[i].date-8*86400000);return rows;}],
   ['price discontinuity',()=>{const rows=completedDailyRows();Object.assign(rows[10],{open:50,low:49});return rows;}],
 ])test(`legacy same-day ${label} daily cache is bypassed and replaced only with validated history`,async t=>{
-  const [engine,store]=ready(t);requireHistoryForHolding(engine);store.set('daily:1',{date:dateIST(NOW),rows:invalid()});let calls=0;
+  const [engine,store]=ready(t);requireHistoryForHolding(engine);store.set('daily:1',{date:dateIST(NOW),symbol:'TEST',rows:invalid()});let calls=0;
   engine.broker={call:async()=>{calls++;return completedDailyRows();}};await engine._history_pass();
   assert.equal(calls,1);assert.equal(engine.daily[1].length,55);assert.equal(engine.daily[1][10].open,100);assert.equal(engine._history_failures,0);
   assert.equal(store.get('daily:1').rows.length,55);assert.notEqual(engine._history_date,'');
@@ -526,11 +929,44 @@ test('capital starts unknown and seeds paper only once from verified cash, exclu
   broker.current.margins.equity.available = { cash: 999000, live_balance: 999000 }; await engine._refresh_account_locked({ rebase_capital: true }); assert.equal(engine.capital, 45000);
   const restored = new TradingEngine(engine.settings, store, options({ brokerFactory: () => broker })); await restored.connect('restart', 'AB1234'); assert.equal(restored.capital, 45000); assert.equal(restored.snapshot().equity, 44000); await restored.shutdown(); await engine.shutdown();
 });
-test('empty or invalid broker cash cannot start but paper seeds when funds first arrive', async t => {
+for (const mode of ['paper', 'live']) test(`${mode} Start waits for verified funding and admits a later deposit only through existing entry gates`, async t => {
   const broker = new RecoveryBroker(); broker.current.margins.equity.available = { cash: 0, live_balance: 0 };
-  const engine = new TradingEngine(settings(temp(t)), new MemoryStore(), options({ brokerFactory: () => broker })); await engine.connect('session', 'AB1234'); await assert.rejects(engine.start(), /no verified available cash/);
-  broker.current.margins.equity.available = { cash: 12000, live_balance: 15000, collateral: 5000 }; await engine.start(); assert.equal(engine.capital, 10000);
-  engine.account.margins.equity.available.cash = NaN; assert.equal(engine._available_cash(), 0); await engine.shutdown();
+  const engine = new TradingEngine(settings(temp(t), mode), new MemoryStore(), options({ brokerFactory: () => broker }));
+  t.after(() => engine.shutdown()); await engine.connect('session', 'AB1234'); await engine.start();
+  assert.equal(engine.running, true); assert.equal(engine.snapshot().waiting_for_funds, true); assert.match(engine.message, /waiting for verified trading cash/);
+  assert.equal(engine.readiness().checks.find(c => c.key === 'trading_cash').ok, false);
+  for (const available of [{ cash: NaN, live_balance: 15000 }, { cash: 12000, live_balance: Infinity }, {}, { cash: 12000, live_balance: 15000, collateral: 20000 }]) {
+    broker.current.margins.equity.available = available; await engine._refresh_account_locked();
+    assert.equal(engine.capital, 0); assert.equal(engine.snapshot().waiting_for_funds, true);
+    assert.equal(await engine._enter_locked(22, signal()), 'invalid_capital_allocation');
+  }
+  const generation = engine._analysis_generation;
+  broker.current.margins.equity.available = { cash: 12000, live_balance: 15000, collateral: 5000 };
+  await engine._refresh_account_locked();
+  assert.equal(engine.running, true); assert.equal(engine.capital, 10000); assert.equal(engine.snapshot().waiting_for_funds, false);
+  assert.match(engine.message, /Strategies armed\. Entries wait/); assert.ok(engine._analysis_generation > generation);
+  assert.equal(await engine._enter_locked(22, signal()), 'quote_stale');
+  engine._on_ticks([{ instrument_token: 22, exchange_timestamp: NOW, last_price: 100, volume_traded: 100000, depth: { buy: [{ price: 99.95, quantity: 10000 }], sell: [{ price: 100.05, quantity: 10000 }] } }]);
+  engine._account_at = monotonic() - 46; assert.equal(await engine._enter_locked(22, signal()), 'account_data_stale');
+  engine._account_at = monotonic(); engine.realised = -101; assert.equal(await engine._enter_locked(22, signal()), 'daily_loss_limit');
+  engine.realised = 0;
+  let submits = 0; broker.buy_cover = async () => { submits++; return 'funded-order'; };
+  assert.equal(await engine._enter_locked(22, signal()), mode === 'paper' ? 'paper_buy_filled' : 'cover_order_pending');
+  assert.equal(submits, mode === 'paper' ? 0 : 1);
+});
+
+for (const mode of ['paper', 'live']) for (const stop of ['pause', 'risk halt', 'restart', 'day rollover']) test(`${mode} later verified funds cannot rearm after ${stop}`, async t => {
+  const broker = new RecoveryBroker(), store = new MemoryStore(); broker.current.margins.equity.available = { cash: 0, live_balance: 0 };
+  let engine = new TradingEngine(settings(temp(t), mode), store, options({ brokerFactory: () => broker }));
+  t.after(() => engine.shutdown()); await engine.connect('session', 'AB1234'); await engine.start();
+  if (stop === 'pause') await engine.pause();
+  else if (stop === 'risk halt') engine._halt('Synthetic risk halt; Start is required again.');
+  else if (stop === 'day rollover') { engine._now = () => new Date(+NOW + 86400000); engine._roll_day(); }
+  else { await engine.shutdown(); engine = new TradingEngine(engine.settings, store, options({ brokerFactory: () => broker })); await engine.connect('restart', 'AB1234'); }
+  const message = engine.message, status = engine.status;
+  broker.current.margins.equity.available = { cash: 20000, live_balance: 20000 }; await engine._refresh_account_locked();
+  assert.equal(engine.capital, 20000); assert.equal(engine.running, false); assert.equal(engine.snapshot().waiting_for_funds, false);
+  assert.equal(engine.message, message); assert.equal(engine.status, status); assert.equal(await engine._enter_locked(22, signal()), 'entries_paused');
 });
 test('live budget refreshes from cash while flat and rebasing never double counts prior realized P&L', async t => {
   const broker = new RecoveryBroker(), store = new MemoryStore(), engine = new TradingEngine(settings(temp(t), 'live'), store, options({ brokerFactory: () => broker }));
@@ -541,6 +977,75 @@ test('live budget remains stable with managed exposure; cash gate independently 
   const [engine] = ready(t, 'live'); engine.positions.TEST = { symbol: 'TEST', quantity: 10, entry: 100, last: 100, stop: 98, strategy: 'intraday' };
   engine.account.margins.equity.available = { cash: 99000, live_balance: 99500 }; engine._update_capital(true); assert.equal(engine.capital, 100000); assert.equal(engine._broker_available_cash, 99000);
   engine.account.margins.equity.available = { cash: 0, live_balance: 0 }; engine._update_capital(true); assert.equal(engine.capital, 100000); assert.equal(engine._available_cash(), 0);
+});
+
+test('running live account reconciles flat deposits and withdrawals without treating realised results as funding', async t => {
+  const broker = new RecoveryBroker(), store = new MemoryStore(), engine = new TradingEngine(settings(temp(t), 'live'), store, options({ brokerFactory: () => broker }));
+  t.after(() => engine.shutdown()); await engine.connect('session', 'AB1234'); await engine.start();
+  engine.realised = -500; engine._update_loss_control();
+  const baseline = engine.day_baseline, accounted = engine._capital_accounted_pnl, losses = clone(engine._loss_control);
+  broker.current.margins.equity.available = { cash: 109500, live_balance: 109500 }; await engine._refresh_account_locked();
+  assert.equal(engine.capital, 110000); assert.equal(engine.strategy_settings().intraday_capital, 110000); assert.equal(engine.snapshot().equity, 109500);
+  assert.equal(engine._capital_accounted_pnl, accounted); assert.equal(engine.day_baseline, baseline); assert.equal(engine._daily_pnl(), -500); assert.deepEqual(engine._loss_control, losses);
+  await engine._refresh_account_locked(); assert.equal(engine.capital, 110000);
+  broker.current.margins.equity.available = { cash: 99500, live_balance: 99500 }; await engine._refresh_account_locked();
+  assert.equal(engine.capital, 100000); assert.equal(engine.snapshot().equity, 99500); assert.equal(engine._daily_pnl(), -500);
+  engine.realised = 500; broker.current.margins.equity.available = { cash: 100500, live_balance: 100500 }; await engine._refresh_account_locked();
+  assert.equal(engine.capital, 100000); assert.equal(engine.snapshot().equity, 100500); assert.equal(engine._capital_accounted_pnl, accounted);
+});
+
+for (const cash of [0, 100, 500, 600]) test(`flat live profit withdrawal leaving ${cash} cash reconciles once without changing realised risk history`, async t => {
+  const broker = new RecoveryBroker(), store = new MemoryStore(); broker.current.margins.equity.available = { cash: 100000, live_balance: 100000 };
+  const engine = new TradingEngine(settings(temp(t), 'live'), store, options({ brokerFactory: () => broker }));
+  t.after(() => engine.shutdown()); await engine.connect('session', 'AB1234'); await engine.start();
+  engine.realised = 500; engine.day_baseline = 100; engine.day_open_unrealised = 25;
+  engine._loss_control = { day: engine.day, last_realised: 500, loss_events: 2, until: isoIST(new Date(+NOW + 60000)) };
+  const losses = clone(engine._loss_control), accounted = cash <= 500 ? 500 : 0, budget = cash <= 500 ? cash : cash - 500;
+  for (let repeat = 0; repeat < 2; repeat++) {
+    broker.current.margins.equity.available = { cash, live_balance: cash }; await engine._refresh_account_locked();
+    assert.equal(engine.snapshot().equity, cash); assert.equal(engine.capital, budget); assert.equal(engine._capital_accounted_pnl, accounted);
+    assert.equal(engine.snapshot().waiting_for_funds, cash === 0); assert.equal(engine.realised, 500); assert.equal(engine._daily_pnl(), 375);
+    assert.equal(engine.day_baseline, 100); assert.equal(engine.day_open_unrealised, 25); assert.deepEqual(engine._loss_control, losses);
+    assert.equal(store.get(engine.state_key).capital_accounted_pnl, accounted);
+  }
+  broker.current.margins.equity.available = { cash: cash + 10000, live_balance: cash + 10000 };
+  await engine._refresh_account_locked(); await engine._refresh_account_locked();
+  assert.equal(engine.snapshot().equity, cash + 10000); assert.equal(engine.capital, budget + 10000); assert.equal(engine._capital_accounted_pnl, accounted);
+  assert.equal(engine.running, true); assert.equal(engine.realised, 500); assert.equal(engine._daily_pnl(), 375); assert.deepEqual(engine._loss_control, losses);
+});
+
+test('profit withdrawal boundary cannot hide a daily loss or allow a later deposit to evade the reduced risk limit', async t => {
+  const broker = new RecoveryBroker(), engine = new TradingEngine(settings(temp(t), 'live'), new MemoryStore(), options({ brokerFactory: () => broker }));
+  t.after(() => engine.shutdown()); await engine.connect('session', 'AB1234'); await engine.start();
+  engine.realised = 500; engine.day_baseline = 600;
+  broker.current.margins.equity.available = { cash: 100, live_balance: 100 }; await engine._refresh_account_locked();
+  assert.equal(engine.capital, 100); assert.equal(engine._daily_pnl(), -100); assert.equal(await engine._enter_locked(22, signal()), 'daily_loss_limit');
+  broker.current.margins.equity.available = { cash: 100100, live_balance: 100100 }; await engine._refresh_account_locked();
+  assert.equal(engine.running, false); assert.match(engine.error, /Daily loss limit/); assert.equal(engine.capital, 100);
+  assert.equal(engine.realised, 500); assert.equal(engine.day_baseline, 600); assert.equal(engine._daily_pnl(), -100);
+});
+
+test('malformed live balances cannot replenish or erase funded risk capital', async t => {
+  const broker = new RecoveryBroker(), engine = new TradingEngine(settings(temp(t), 'live'), new MemoryStore(), options({ brokerFactory: () => broker }));
+  t.after(() => engine.shutdown()); await engine.connect('session', 'AB1234'); await engine.start(); engine.realised = -500;
+  for (const available of [{ cash: NaN, live_balance: 200000 }, { cash: 200000, live_balance: Infinity }, {}, { cash: '', live_balance: 200000 }, { cash: 200000, live_balance: 200000, collateral: -10000 }]) {
+    broker.current.margins.equity.available = available; await engine._refresh_account_locked();
+    assert.equal(engine.capital, 90000); assert.equal(engine._available_cash(), 0); assert.equal(engine._capital_accounted_pnl, 0);
+    assert.equal(engine.snapshot().waiting_for_funds, true); assert.equal(engine._daily_pnl(), -500);
+  }
+  broker.current.margins.equity.available = { cash: 99500, live_balance: 99500 }; await engine._refresh_account_locked();
+  assert.equal(engine.capital, 100000); assert.equal(engine.snapshot().equity, 99500); assert.equal(engine._daily_pnl(), -500);
+});
+
+test('verified deposits cannot enlarge an already-breached daily loss limit or rearm the resulting halt', async t => {
+  const broker = new RecoveryBroker(), engine = new TradingEngine(settings(temp(t), 'live'), new MemoryStore(), options({ brokerFactory: () => broker }));
+  t.after(() => engine.shutdown()); await engine.connect('session', 'AB1234'); await engine.start();
+  engine.realised = -901; broker.current.margins.equity.available = { cash: 200000, live_balance: 200000 };
+  await engine._refresh_account_locked();
+  assert.equal(engine.running, false); assert.equal(engine.status, 'error'); assert.match(engine.error, /Daily loss limit/);
+  assert.equal(engine.capital, 90000); assert.equal(engine._daily_pnl(), -901); assert.equal(engine._capital_accounted_pnl, 0);
+  await engine._refresh_account_locked(); assert.equal(engine.running, false); assert.equal(engine.capital, 90000);
+  assert.equal(await engine._enter_locked(22, signal()), 'entries_paused');
 });
 test('strategy percentages derive actual money and legacy amounts migrate to proportions', t => {
   const [engine, store] = ready(t); store.set('strategy_settings', { intraday_enabled: true, swing_enabled: true, intraday_allocation_pct: .6, swing_allocation_pct: .3 });
@@ -581,7 +1086,9 @@ test('zero-cash account cannot adopt unselected, pledged, T1-only or discrepant 
   const broker = new RecoveryBroker(), store = new MemoryStore(); broker.current.margins.equity.available = { cash: 0, live_balance: 0 };
   broker.current.holdings = [{ exchange: 'NSE', tradingsymbol: 'UNSELECTED', quantity: 10 }, { exchange: 'NSE', tradingsymbol: 'PLEDGED', quantity: 10, collateral_quantity: 10 }, { exchange: 'NSE', tradingsymbol: 'UNSETTLED', quantity: 0, t1_quantity: 10 }, { exchange: 'NSE', tradingsymbol: 'DISCREPANT', quantity: 10, discrepancy: true }];
   store.set('strategy_settings', { intraday_enabled: true, swing_enabled: false, intraday_allocation_pct: 1, swing_allocation_pct: 0, manage_existing_holdings: 'selected', managed_symbols: ['PLEDGED', 'UNSETTLED', 'DISCREPANT'] });
-  const engine = new TradingEngine(settings(temp(t)), store, options({ brokerFactory: () => broker })); await engine.connect('session', 'AB1234'); await assert.rejects(engine.start(), /no verified available cash/); assert.equal(engine.running, false); await engine.shutdown();
+  const engine = new TradingEngine(settings(temp(t)), store, options({ brokerFactory: () => broker })); await engine.connect('session', 'AB1234'); await engine.start();
+  assert.equal(engine.running, true); assert.equal(engine.snapshot().waiting_for_funds, true); assert.deepEqual(engine._authorized_holdings(), []); assert.deepEqual(engine._managed_recovery_symbols(), {});
+  assert.equal(await engine._enter_locked(22, signal()), 'invalid_capital_allocation'); await engine.shutdown();
 });
 test('zero-cash legacy paper exposure resumes exit management without replenishing funds', async t => {
   const broker = new RecoveryBroker(), store = new MemoryStore(); broker.current.margins.equity.available = { cash: 0, live_balance: 0 };

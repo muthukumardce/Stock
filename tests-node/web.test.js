@@ -13,7 +13,7 @@ import { Fernet } from '../src/security.js';
 const PASSWORD='a-long-test-password-only';
 const HASH='$argon2id$v=19$m=65536,t=3,p=4$VMU0lS4iHSmQ1iYO3vilQw$STATLHnZvG42lqShST2dJnmzbG52cNmgNoqnIzjGfiE';
 class Engine {
-  constructor(settings,store){this.settings=settings;this.store=store;this.connected=false;this.status='disconnected';this.positions=[];this.pending=[];this.starts=0;this.notifications=0;}
+  constructor(settings,store){this.settings=settings;this.store=store;this.connected=false;this.status='disconnected';this.universe={};this.positions=[];this.pending=[];this.starts=0;this.notifications=0;}
   async connect(token,user){this.token=token;this.user=user;this.connected=true;this.status='monitoring';}
   async start(){this.starts++;this.status='running';}
   async pause(){this.status='paused';}
@@ -51,6 +51,27 @@ test('login, origin, CSRF, static dashboard, logout and audit redaction',async t
   f.store.event('test','testapisecret test-access-token-private',{access_token:'hidden'});
   assert.doesNotMatch(await (await f.request('/api/events/export')).text(),/testapisecret|"access_token":"hidden"/);
   assert.equal((await f.request('/api/logout','POST',{})).status,200);assert.equal((await f.request('/api/session')).status,401);
+});
+
+test('state polling retains contiguous bounded activity pages and rejects malformed cursors',async t=>{
+  const f=await fixture(t);await f.login();
+  const initial=await (await f.request('/api/state')).json(),cursor=initial.event_cursor;
+  assert.equal(cursor,initial.events.at(-1).id);
+  const expected=Array.from({length:750},(_,i)=>f.store.event(i===125?'paper_fill':'synthetic',`Activity ${i}`));
+  const first=await (await f.request(`/api/state?after=${cursor}&limit=999999`)).json();
+  assert.deepEqual(first.events.map(event=>event.id),expected.slice(0,500));
+  assert.equal(first.event_cursor,expected[499]);
+  assert.equal(first.events.some(event=>event.kind==='paper_fill'),true);
+  const second=await (await f.request(`/api/state?after=${first.event_cursor}`)).json();
+  assert.deepEqual(second.events.map(event=>event.id),expected.slice(500));
+  const empty=await (await f.request(`/api/state?after=${second.event_cursor}`)).json();
+  assert.deepEqual(empty.events,[]);assert.equal(empty.event_cursor,second.event_cursor);
+  const latest=await (await f.request('/api/state')).json();
+  assert.deepEqual(latest.events.map(event=>event.id),expected.slice(-500));
+  for(const value of ['', '-1', '1.5', '1e3', 'NaN', 'Infinity', '9007199254740992', '1&after=2']){
+    assert.equal((await f.request(`/api/state?after=${value}`)).status,422,value);
+  }
+  assert.equal((await f.request('/api/state?after=0')).status,200);
 });
 
 test('research endpoints are authenticated read-only jobs with CSRF and no arbitrary dataset or credentials',async t=>{
@@ -145,9 +166,12 @@ test('strategy allocations use percentages without a configured rupee capital an
 });
 test('Settings persist defaults, reject old env-only fields and require restart without trading exposure',async t=>{
   const f=await fixture(t);await f.login();
+  const research=f.app.state.research;assert.equal(research.automatic,true);assert.equal(research.timer.hasRef(),false);
   for(const values of [{public_url:'https://example.org'},{paper_capital:1000},{port:0},{risk_per_trade_pct:2}])assert.ok((await f.request('/api/config','PUT',values)).status>=400);
   f.engine.status='running';assert.equal((await f.request('/api/config','PUT',{port:3100})).status,409);f.engine.status='paused';
   const result=await f.request('/api/config','PUT',{port:3100,analytics_workers:0});assert.equal(result.status,200,await result.clone().text());
+  assert.equal(research.closed,true);assert.equal(research.timer,null);assert.equal(research.status().automation.status,'stopped');
+  await research.maybeStart();assert.throws(()=>research.start(),/shutting down/);
   assert.equal((await f.request('/api/trading/start','POST',{})).status,409);assert.equal((await (await f.request('/api/config')).json()).values.port,3100);
   await f.close();const g=await fixture(t,{root:f.root});assert.equal(g.settings.port,3100);await g.close();
 });

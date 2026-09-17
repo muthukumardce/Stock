@@ -44,7 +44,7 @@ export async function createApp(options={}){
     store.event('server.started','Node.js server started. New entries remain paused until Start Trading.',{mode:cfg.trading_mode});
     const saved=store.get('kite_session');
     if(saved){try{const session=JSON.parse(state.cipher.decrypt(saved));if(session.expires>Date.now()/1000&&session.user_id.toUpperCase()===cfg.kite_user_id.toUpperCase()){store.add_secret(session.access_token);await engine.connect(session.access_token,session.user_id);store.event('session.restored','Zerodha monitoring restored. New entries are paused.');}else store.delete('kite_session');}catch{store.event('session.restore_failed','Reconnect to Zerodha. The saved session could not be restored.',{},'warning');}}
-    await research.maybeStart();
+    await research.startAutomatic({canRun:()=>!closing&&!state.restartRequired&&!fs.existsSync(path.join(cfg.data_dir,'maintenance.lock'))});
     sampler=setInterval(()=>{if(closing)return;const view=engine.snapshot();if(view.connected&&Number.isFinite(view.equity))store.sample(cfg.trading_mode,view.equity);},30000);sampler.unref();
     app.use((req,res,next)=>{
       res.set({'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','Permissions-Policy':'camera=(), microphone=(), geolocation=()','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self' https://kite.zerodha.com"});
@@ -74,7 +74,12 @@ export async function createApp(options={}){
     });
     app.get('/api/session',(req,res)=>{const session=authenticated(req);res.json({username:cfg.admin_username,csrf:session.csrf,expires:session.expires});});
     app.post('/api/logout',(req,res)=>{store.drop_session(authenticated(req,true).digest);store.event('auth.logout','Administrator signed out. Trading state is unchanged.');res.set('Set-Cookie',`${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${req.context.secure?'; Secure':''}`).json({ok:true});});
-    app.get('/api/state',(req,res)=>{authenticated(req);res.json({state:snapshot(),events:store.latest_events(),equity_history:store.samples(cfg.trading_mode)});});
+    app.get('/api/state',(req,res)=>{
+      authenticated(req);const after=req.query.after;
+      if(after!==undefined&&(typeof after!=='string'||!/^(0|[1-9]\d*)$/.test(after)||!Number.isSafeInteger(Number(after))))throw failure(422,'Invalid activity cursor');
+      const events=after===undefined?store.latest_events(500):store.events(Number(after),500);
+      res.json({state:snapshot(),events,event_cursor:events.at(-1)?.id??Number(after??0),equity_history:store.samples(cfg.trading_mode)});
+    });
     app.get('/api/events',(req,res)=>{authenticated(req);res.json(store.events(Math.max(0,Number(req.query.after)||0)));});
     app.get('/api/events/export',async(req,res)=>{const session=authenticated(req);res.type('application/x-ndjson').set('Content-Disposition','attachment; filename="stockpilot-audit.ndjson"');let after=0;while(!closing&&!res.destroyed&&store.session(session.digest)){const batch=store.events(after,500);if(!batch.length)break;for(const event of batch){if(res.destroyed)break;if(!res.write(JSON.stringify(event)+'\n'))await waitDrain(res);}after=batch.at(-1).id;await yieldIO();}res.end();});
     app.get('/api/stream',(req,res)=>{const session=authenticated(req);if(streams.size>=8)throw failure(429,'Too many live dashboard connections');res.set({'Content-Type':'text/event-stream','X-Accel-Buffering':'no'});res.flushHeaders();let cursor=Math.max(0,Number(req.query.after)||0);const update=()=>{if(closing||res.writableLength>262144)return res.end();if(!store.session(session.digest)){res.write('event: expired\ndata: {}\n\n');return res.end();}if(res.writableNeedDrain)return;const events=store.events(cursor);if(events.length)cursor=events.at(-1).id;res.write('event: update\ndata: '+JSON.stringify({state:snapshot(),events})+'\n\n');};const timer=setInterval(update,2000);streams.add(res);res.on('close',()=>{clearInterval(timer);streams.delete(res);});update();});
@@ -112,7 +117,7 @@ export async function createApp(options={}){
           store.add_secret(result.access_token);
           const expiry=parseTime(dateIST(new Date(Date.now()+86400000))+'T06:00:00').getTime()/1000;
           store.set('kite_session',state.cipher.encrypt(JSON.stringify({access_token:result.access_token,user_id:result.user_id,expires:expiry})));
-          await research.cancel();await engine.connect(result.access_token,result.user_id);store.event('session.connected','Zerodha monitoring is active.');await engine.start();await research.maybeStart();return '/';
+          await research.cancel({suppressAuto:false});await engine.connect(result.access_token,result.user_id);store.event('session.connected','Zerodha monitoring is active.');await engine.start();await research.maybeStart();return '/';
         }catch{
           store.event('session.start_failed','Zerodha session could not start trading. Check account recovery status.',{},'error');return '/?error=start';
         }
@@ -160,7 +165,7 @@ export async function createApp(options={}){
       const next=manager.candidate(req.body);
       await state.control.run(async()=>{const view=engine.snapshot();if(state.restartRequired)throw failure(409,'Restart the server before saving further application settings');if(view.status==='running'||view.positions?.length||view.pending_orders?.length||view.unmanaged_live_exposure)throw failure(409,'Pause entries and resolve managed exposure before changing application settings');
         const destination=path.join(next.data_dir,'stockpilot.sqlite3');if(next.data_dir!==cfg.data_dir&&fs.existsSync(destination))throw failure(409,'Choose a data directory without an existing StockPilot database');
-        state.restartRequired=true;await engine.shutdown();
+        state.restartRequired=true;await research.close();await engine.shutdown();
         if(next.data_dir!==cfg.data_dir){fs.mkdirSync(next.data_dir,{recursive:true,mode:0o700});store.db.prepare('VACUUM INTO ?').run(destination);}
         manager.save(req.body);store.event('config.changed','Application settings saved. Server restart required.',req.body);
       });res.json({ok:true,restart_required:true,message:'Saved. Stop the server with Ctrl+C, then run npm start to apply these settings.'});

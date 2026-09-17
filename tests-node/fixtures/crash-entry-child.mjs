@@ -19,6 +19,7 @@ export function settings(directory){return {
   entry_cutoff:'14:45',exit_time:'15:10',max_spread_pct:.003,min_daily_turnover:10000,
 };}
 export function options(broker){return {now:()=>NOW,backgroundLoops:false,brokerFactory:()=>broker,
+  equityUniverse:{resolve:async instruments=>({instruments:instruments.map(i=>({...i,entry_eligible:true})),summary:{status:'verified'}})},
   analyticsFactory:()=>({worker_limit:1,batch_size:1,snapshot:()=>({}),close:async()=>{},analyze:async()=>[]})};}
 export function entrySignal(side){const signal=new Signal('intraday',100,side==='SELL'?102:98,side==='SELL'?96:104,'Synthetic crash recovery setup',2);signal.side=side;return signal;}
 export function emptyAccount(){return {orders:[],trades:[],holdings:[],positions:{net:[]},margins:{equity:{available:{cash:100000,live_balance:100000}}}};}

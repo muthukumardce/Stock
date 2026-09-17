@@ -11,6 +11,7 @@
   <div class="authorization-actions"><button id="holdings-authorization-start" class="button primary" type="button">Authorize holdings</button><button id="holdings-authorization-check" class="button secondary" type="button">Check authorization</button><a id="holdings-authorization-link" class="authorization-link" target="_blank" rel="noopener noreferrer" hidden>Open Zerodha authorization page</a></div>
   <p id="holdings-authorization-feedback" class="authorization-feedback" role="status" aria-live="polite"></p>
 </section>
+<div id="clock-status" class="notice" role="status" hidden></div>
 <div id="notice" class="notice" role="status" hidden></div><div id="recovery-status" class="notice subtle" role="status" hidden></div><div id="toast" class="toast" role="status" hidden></div><section class="page" id="page-overview"><div class="page-heading"><div><div class="eyebrow">ACCOUNT OVERVIEW</div><h1>Trading workspace <span class="pill" id="mode-pill">Paper</span></h1><p id="session-message">Connect your Zerodha account to start monitoring.</p></div><div class="actions"><button id="pause" class="button secondary" disabled>Pause entries</button><button id="start" class="button primary"><span aria-hidden="true">▶</span> Start Trading</button></div></div>
 <div class="status-strip"><div><span class="dot" id="engine-dot"></span><strong id="engine-status">Disconnected</strong><span id="market-state">Market status unavailable</span></div><span id="account-ref">Zerodha account · —</span></div>
 <div class="metrics"><article class="metric"><span>Trading equity <span id="equity-mode" class="mini-tag">PAPER</span></span><strong id="metric-equity">—</strong><small>Allocated capital + strategy P&L</small></article><article class="metric"><span>Strategy P&L</span><strong id="metric-pnl">—</strong><small id="pnl-detail">Realised and unrealised</small></article><article class="metric"><span>Zerodha available cash</span><strong id="metric-cash">—</strong><small>Actual account · read from broker</small></article><article class="metric"><span>Managed positions</span><strong id="metric-positions">0 <em>positions</em></strong><small id="positions-detail">No strategy positions yet</small></article></div>
@@ -58,6 +59,10 @@
   </div>
 </section><section class="page" id="page-settings" hidden>
   <div class="page-heading"><div><div class="eyebrow">TRADING PREFERENCES</div><h1>Settings</h1><p>Choose strategies, allocate account funds and configure the application.</p></div></div>
+  <article class="panel paper-trading-panel" aria-labelledby="paper-trading-heading">
+    <div class="panel-heading"><div><h2 id="paper-trading-heading">Paper trading</h2><p id="paper-trading-description">Use live market data with simulated buys and sells.</p></div><label class="switch"><input id="paper-trading" type="checkbox" form="config-form" checked disabled aria-label="Enable paper trading" aria-describedby="paper-trading-description paper-trading-note"><span></span></label></div>
+    <div class="settings-content"><div class="paper-trading-actions"><div><div class="paper-trading-mode"><span id="paper-trading-state" class="badge blue">Loading trading mode</span><span id="paper-trading-current" class="field-hint">Checking current mode.</span></div><p id="paper-trading-note" class="field-hint" role="status">Loading your saved preferences.</p></div><button id="paper-trading-save" class="button primary" type="submit" form="config-form" disabled>Save settings</button></div><p id="paper-trading-error" class="form-error" role="alert"></p></div>
+  </article>
   <form id="settings-form">
     <div class="settings-grid">
       <article class="panel settings-panel">
@@ -80,7 +85,7 @@
     </div>
   </article>
   <article class="panel space-top">
-    <div class="panel-heading"><div><h2>Application settings</h2><p>Execution mode, risk limits, analytics capacity and local server preferences.</p></div></div>
+    <div class="panel-heading"><div><h2>Application settings</h2><p>Risk limits, analytics capacity and local server preferences.</p></div></div>
     <form id="config-form" class="settings-content">
       <div class="notice subtle">Pause trading and resolve all managed positions and pending orders before saving. Restart the program to apply changes.</div>
       <div id="config-fields" class="config-grid"><p class="muted">Loading application settings…</p></div>

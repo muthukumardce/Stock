@@ -71,7 +71,9 @@ async function fixture(t, { physical = false, selected = ['TEST'], falling = tru
   const settings = { trading_mode: 'live', live_trading_enabled: true, data_dir: directory, kite_api_key: 'test-app-key', kite_user_id: 'AB1234', max_position_pct: .1, risk_per_trade_pct: .0025, daily_loss_pct: .01, max_positions: 5, entry_cutoff: '14:45', exit_time: '15:10', max_spread_pct: .003, min_daily_turnover: 10000 };
   store.set('strategy_settings', { intraday_enabled: true, swing_enabled: false, intraday_allocation_pct: 1, swing_allocation_pct: 0, manage_existing_holdings: 'selected', managed_symbols: selected });
   const build = () => {
-    const engine = new TradingEngine(settings, store, { now: () => NOW, backgroundLoops: false, brokerFactory: () => broker, analyticsFactory: () => ({ worker_limit: 1, batch_size: 32, snapshot: () => ({}), close: async () => {} }) }); engines.add(engine); return engine;
+    const engine = new TradingEngine(settings, store, { now: () => NOW, backgroundLoops: false, brokerFactory: () => broker,
+      equityUniverse:{resolve:async instruments=>({instruments:instruments.map(i=>({...i,entry_eligible:true})),summary:{status:'verified'}})},
+      analyticsFactory: () => ({ worker_limit: 1, batch_size: 32, snapshot: () => ({}), close: async () => {} }) }); engines.add(engine); return engine;
   };
   const engine = build();
   t.after(async () => { try { for (const current of engines) await current.shutdown(); } finally { store.close(); assert.ok(directory.startsWith(path.join(os.tmpdir(), 'stockpilot-auth-engine-'))); fs.rmSync(directory, { recursive: true, force: true, maxRetries: 3 }); } });

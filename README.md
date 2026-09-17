@@ -9,7 +9,7 @@ A self-hosted Zerodha trading dashboard for **Windows, macOS and Linux**, runnin
 - Shows account cash, holdings, positions, orders, trades, strategy P&L, scanner coverage, CPU/RAM usage and a durable activity log.
 - Supports intraday and swing trading. Intraday starts enabled with 100% of the strategy allocation; swing starts disabled with 0%.
 - Analyzes existing holdings for exits. Automatic selling is limited to selected symbols by default; the initial selection is empty. You can select symbols or all eligible NSE holdings in Settings.
-- Scans the available NSE EQ universe, including any ETFs classified as EQ, using completed candles and fresh market data.
+- Scans NSE EQ-series stocks and listed ETFs verified against NSE's official security lists and matched to Kite, using completed candles and fresh market data. Bonds in Kite's broader `EQ` instrument type are excluded from new entries.
 - Runs CPU analytics in lazy Node worker threads while one coordinated execution service handles orders.
 - Evaluates 11 intraday setup families in both directions: breakout, pullback, range reversion, opening range/drive, gap continuation/reversal, VWAP reclaim/rejection, volatility squeeze and relative strength. Swing remains long-only.
 - Combines 42 contextual candle formations with causal prior-session candles, completed 15-minute trend alignment and verified benchmark/sector context.
@@ -54,22 +54,26 @@ Open **http://localhost:3000**, sign in, and open **Settings**. `npm run check` 
 
 The server listens on the local loopback interface. Keep the `npm start` terminal open. Run only one server for a given data directory; do not use a process manager's cluster mode. CPU analysis already uses its own workers.
 
+Keep the host's automatic time synchronization enabled. The app compares the system clock with ordinary authenticated Kite response timestamps; it does not change the clock. New entries wait if that comparison is missing, stale, uncertain or outside the ten-second tolerance. A confirmed mismatch appears prominently on the dashboard and rejects incoming quotes until a valid clock observation clears it. On Windows, `w32tm /query /status` shows synchronization status; an administrator can use `w32tm /resync` to request synchronization with the configured source. This changes time for all applications. [Microsoft Windows Time tools](https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings).
+
 ## Configure everything else in Settings
 
 All non-Kite configuration has defaults and is managed from the dashboard. No extra environment variables are needed for ports, admin credentials, risk limits, worker counts or security keys. The dashboard detects its public address from the current browser request through the local tunnel; there is no `PUBLIC_URL` or development/production mode to maintain.
+
+The **Paper trading** switch is at the top of Settings. On means simulated buys and sells; off selects real order execution. The card shows the current mode and labels unsaved changes separately. Choose the mode, click **Save settings**, then restart with `npm start` after stopping the server with **Ctrl+C**. Pause entries and resolve managed exposure and pending orders before saving. Paper trading is on by default.
 
 | Settings area | Controls and defaults |
 |---|---|
 | Strategies | Intraday enabled, 100% allocation; swing disabled, 0%. Allocations together must not exceed 100%. |
 | Existing holdings | Selected symbols, initially empty; optionally all eligible NSE holdings. |
-| Execution | Paper mode; real order execution disabled. Both live mode and live execution must be enabled for real orders. |
+| Execution | Paper trading on by default. The top Settings switch changes both the trading mode and real-order permission together. Save and restart to apply. |
 | Server | Local port `3000`; data directory `data`. |
 | Risk | Risk per trade `0.0025` (0.25%); maximum position allocation `0.10` (10%); daily loss limit `0.01` (1%); maximum five bot positions. |
 | Market filters | Maximum spread `0.003` (0.3%); minimum turnover estimate Rs 10,000,000. |
 | Enhanced rules | All 11 intraday families enabled, including protected shorts; completed higher timeframe alignment enabled. Minimum evidence score 60/100, which is not a profit probability. |
 | Market breadth | Enabled; at least 30 liquid stocks, 20% fresh quote coverage and 45% advancing shares for longs or declining shares for shorts. |
 | Announced events | Entries blocked one calendar day before through one day after an announced corporate event. Missing/stale official calendar coverage also blocks entries. |
-| Account exposure | Maximum 25% in one stock, 90% gross exposure and 3% estimated stress loss relative to reference assets. Existing/manual holdings count. |
+| Account exposure | Maximum 25% in one stock, 90% gross exposure and 3% estimated stress loss relative to reference assets. Existing/manual holdings and unfilled manual orders count. |
 | Correlation | Enabled; absolute daily-return correlation of at least 0.85 groups exposure, capped at 35% of reference assets. Missing history blocks an entry; opposite positions do not automatically earn hedge credit. |
 | Activity limits | At most 10 new symbols attempted per day; a 30-minute entry cooldown after three consecutive realized loss events. |
 | Research | Automatic after connection; 20 currently listed NSE instruments, 45 calendar days of five-minute history; estimated costs 0.1% and slippage 0.05% per side. |
@@ -82,7 +86,7 @@ Risk inputs labeled **fraction** use `0.01` for 1%. Strategy allocations labeled
 
 Trading capital comes from the connected account's cash information; there is no manually entered starting capital. Paper simulation retains its initialized capital and journal across restarts so signing in again does not reset simulated gains, losses or exposure. Existing share value and collateral are not automatically spendable cash. The guide explains capital and allocation calculations.
 
-An account with no available cash can still start management of authorized existing holdings or previously managed positions. New buys remain blocked until their funding and risk checks pass.
+An initially unfunded account can still start. The dashboard shows **Waiting for funds**, keeps monitoring, and uses subsequent verified balance updates without another Start click. Authorized existing holdings and previously managed positions can still be managed. New long and short entries wait for funding and all other checks. Adding funds never overrides Pause entries or a risk halt. Paper capital is seeded only once; later real deposits or withdrawals do not replace its existing simulated bankroll.
 
 Strategy/holding settings apply without a server restart after entries are paused and managed exposure and pending orders are resolved. Application settings require the same checks; saving them stops the engine and marks the server for restart. Stop with **Ctrl+C**, wait for shutdown, then run `npm start` again. The UI tells you when a restart is required. Administrator/password changes take effect immediately and require another dashboard login.
 
@@ -93,10 +97,12 @@ Settings are stored in `config/settings.json`; strategy permissions and journals
 With `npm start` running on its default port, open a second terminal:
 
 ```sh
-cloudflared tunnel --url http://localhost:3000
+npm run tunnel
 ```
 
-Open the printed HTTPS address, for example `https://your-tunnel.trycloudflare.com`, and sign in there. If localhost resolves to an unavailable IPv6 listener, use `--url http://127.0.0.1:3000` instead. Keep the original public Host header when configuring a tunnel; do not rewrite it to localhost.
+This runs `cloudflared tunnel --url http://localhost:3000` and requires `cloudflared` to be installed and available on your PATH.
+
+Open the printed HTTPS address, for example `https://your-tunnel.trycloudflare.com`, and sign in there. If localhost resolves to an unavailable IPv6 listener, run `cloudflared tunnel --url http://127.0.0.1:3000` instead. Keep the original public Host header when configuring a tunnel; do not rewrite it to localhost.
 
 In dashboard **Settings**, copy the detected callback URLs into your Kite app in the [developer console](https://developers.kite.trade/):
 
@@ -186,6 +192,8 @@ The report compares the original breakout rules with the enhanced rules on ident
 
 The default sample is the first 20 symbols alphabetically from the **current** NSE equity universe, over the preceding 45 calendar days, excluding today. It is a bounded diagnostic sample, not all NSE shares or a representative investment universe. Swing research uses daily candles over seven times the configured lookback (315 calendar days by default). When both modes are enabled, both comparisons run sequentially and are retained together. Available historical NIFTY 50 and verified sector-index series use the same requested window; missing context is reported.
 
+Only verified entry-eligible stocks and ETFs enter this research sample; instruments retained solely to recover an existing position are excluded. Empty or malformed history is not reused as a successful download. Automatic research checks readiness every 30 seconds, so funds or source data becoming available do not require another login. Fully failed runs retry after 1, 2, 4 and progressively more minutes, capped at 30 minutes between attempts; the retry time survives a server restart and appears on the Research page. A completed partial report is retained for the current day and configuration. **Run analysis** can retry its missing symbols or index history while retaining valid caches. **Cancel research** suppresses automatic retries for that comparison until an explicit run or a new day/configuration.
+
 Research uses completed-candle signals and subsequent-candle entries, with conservative assumptions when both stop and target are touched. Missing candles are detected causally: earlier trades remain in the result, later entries that session stop, and existing exposure exits at the first observed opening after a gap. Positions without an observed exit remain explicitly unresolved. Shorts reserve full notional and incur adverse fill adjustments and costs on both sides. Swing research, paper swing and live delivery share daily SMA/trailing calculations; research does not reproduce the broker GTT lifecycle.
 
 The simulation also omits historical live breadth, account holdings, correlation, broker execution/protection, demat authorization, corporate actions and market queues. Results cannot prove profitability, and **research never changes strategy settings or enables live trading automatically**. See [research methodology and limits](docs/LOGIC_AND_ANALYTICS.md#12-historical-research-and-its-limits).
@@ -206,6 +214,7 @@ Run `npm test` for unit/integration checks. For real browser checks, run `npx pl
 | Tunnel returns 502 | Check `http://127.0.0.1:3000/health`; server and tunnel must target the same configured port. |
 | Redirect login expires | Begin on the exact HTTPS origin registered in Kite, in the same browser. Try Start Trading again after updating the URLs. |
 | No buying after connection | Inspect recovery, market hours, warmup, allocation and activity reasons; connection does not imply a qualifying signal. |
+| System clock warning / near-zero fresh feed coverage | Synchronize the host clock. The app checks new broker responses automatically; it never shifts exchange timestamps or relaxes the freshness limit. |
 | Holdings authorization banner remains | Finish the official TPIN/OTP flow, then select Check authorization; insufficient or prior-day broker authorization keeps sales blocked. |
 | Settings say restart required | Stop the app and run `npm start`; update the tunnel target if the local port changed. |
 | Account mismatch or unresolved exposure | Restore the correct account's data/configuration and reconcile broker activity before resuming. |

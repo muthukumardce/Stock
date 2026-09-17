@@ -5,6 +5,7 @@ import {Mutex, monotonic, sleep, parseTime, isoIST} from './util.js';
 const SECRET_FIELDS = new Set(['access_token', 'api_key', 'api_secret', 'request_token', 'password', 'enctoken']);
 const REJECTION_STATUSES = new Set([400, 401, 403, 404, 405, 410, 422, 428, 429]);
 const REJECTION_KINDS = new Set(['InputException', 'PermissionException', 'TokenException']);
+const CLOCK_TOLERANCE_MS = 10000, CLOCK_DATE_PRECISION_MS = 1000, CLOCK_MAX_AGE_SECONDS = 60;
 
 export function jsonable(value) {
   if (value instanceof Date) return value.toISOString();
@@ -85,8 +86,57 @@ export class KiteBroker {
     this._generation = 0;
     this._fetch = options.fetch ?? globalThis.fetch;
     this._clock = options.clock ?? monotonic;
+    this._wallClock = options.wallClock ?? Date.now;
+    this._clock_observation = null; this._clock_skew = null; this._clock_observation_status = null;
     this._sleep = options.sleep ?? sleep;
     this._workerFactory = options.workerFactory ?? ((url, workerOptions) => new Worker(url, workerOptions));
+  }
+
+  _observe_clock(response, startedWall, startedMono) {
+    const receivedWall = Number(this._wallClock()), receivedMono = this._clock();
+    const duration = (receivedMono - startedMono) * 1000;
+    if (![startedWall, startedMono, receivedWall, receivedMono, duration, new Date(receivedWall).getTime()].every(Number.isFinite) || duration < 0 ||
+        Math.abs(receivedWall - startedWall - duration) > CLOCK_DATE_PRECISION_MS) {
+      this._clock_observation_status = 'wall_clock_changed'; return;
+    }
+    const header = response.headers?.get?.('date');
+    if (!header) { this._clock_observation_status = 'missing_date'; return; }
+    const server = typeof header === 'string' ? Date.parse(header) : NaN;
+    if (!Number.isFinite(server) || new Date(server).toUTCString() !== header) {
+      this._clock_observation_status = 'invalid_date'; return;
+    }
+    // The Date can have been generated anywhere during this request. Widen
+    // both ends for its one-second precision; never adjust the host clock.
+    const lower = server - receivedWall - CLOCK_DATE_PRECISION_MS;
+    const upper = server - startedWall + CLOCK_DATE_PRECISION_MS;
+    const status = lower > CLOCK_TOLERANCE_MS || upper < -CLOCK_TOLERANCE_MS ? 'skewed' :
+      lower >= -CLOCK_TOLERANCE_MS && upper <= CLOCK_TOLERANCE_MS ? 'aligned' : 'uncertain';
+    const observation = { status, offset_lower_ms: lower, offset_upper_ms: upper,
+      request_duration_ms: duration, received_wall: receivedWall, received_mono: receivedMono };
+    this._clock_observation = observation; this._clock_observation_status = 'valid';
+    if (status === 'skewed') this._clock_skew = observation;
+    // Missing headers, ambiguous latency and age cannot clear proven skew.
+    else if (status === 'aligned') this._clock_skew = null;
+  }
+
+  clock_health() {
+    const observation = this._clock_skew || this._clock_observation;
+    const elapsed = observation ? this._clock() - observation.received_mono : null;
+    const wall = Number(this._wallClock());
+    const age = elapsed !== null && Number.isFinite(elapsed) ? Math.max(0, elapsed) : null;
+    const stale = !!observation && (age === null || elapsed < 0 || age > CLOCK_MAX_AGE_SECONDS);
+    const wallChanged = !!observation && (!Number.isFinite(wall) || age === null ||
+      Math.abs(wall - observation.received_wall - elapsed * 1000) > CLOCK_DATE_PRECISION_MS);
+    const last = wallChanged ? 'wall_clock_changed' : this._clock_observation_status;
+    const blocked = !!this._clock_skew;
+    const status = blocked ? 'skewed' : !observation ? last === 'wall_clock_changed' ? 'uncertain' : 'unknown' :
+      stale || last !== 'valid' ? 'uncertain' : observation.status;
+    return { status, blocked, source: 'kite_https_date', offset_lower_ms: observation?.offset_lower_ms ?? null,
+      offset_upper_ms: observation?.offset_upper_ms ?? null, age_seconds: age, stale,
+      max_age_seconds: CLOCK_MAX_AGE_SECONDS, tolerance_ms: CLOCK_TOLERANCE_MS,
+      request_duration_ms: observation?.request_duration_ms ?? null,
+      observed_at: observation ? new Date(observation.received_wall).toISOString() : null,
+      last_observation_status: last };
   }
 
   async call(method, ...args) {
@@ -213,7 +263,9 @@ export class KiteBroker {
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
       request.body = formBody(payload).toString();
     }
+    const startedWall = Number(this._wallClock()), startedMono = this._clock();
     const response = await this._fetch(`https://api.kite.trade${path}`, request);
+    this._observe_clock(response, startedWall, startedMono);
     if (method === 'instruments' && response.ok) return transform(await response.text());
     let body;
     try { body = await response.json(); }

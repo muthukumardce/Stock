@@ -48,6 +48,19 @@ function quantityValue(value) {
   return value;
 }
 
+function brokerNumber(value) {
+  return typeof value === 'number' || typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
+}
+
+function validFill(order, maximum = Infinity) {
+  if (!order || typeof order !== 'object') return false;
+  const quantity = brokerNumber(order.quantity), filled = brokerNumber(order.filled_quantity);
+  return Number.isSafeInteger(quantity) && quantity > 0 && quantity <= maximum &&
+    Number.isSafeInteger(filled) && filled >= 0 && filled <= quantity &&
+    (order.status !== 'COMPLETE' || filled === quantity) &&
+    (filled === 0 || Number.isFinite(brokerNumber(order.average_price)) && brokerNumber(order.average_price) > 0);
+}
+
 export function _holding_available(row) {
   if (row.discrepancy || (row.product ?? 'CNC') !== 'CNC') return 0;
   // T1, pledged, used, discrepant and MTF shares cannot be automatically sold.
@@ -206,7 +219,15 @@ export class DeliveryManager {
   }
 
   async _order(intent, account) {
-    if (intent.state === 'terminal') return intent.order;
+    const valid = order => matchesSymbol(order ?? {}, intent.symbol) && order.product === 'CNC' &&
+      order.transaction_type === intent.payload.transaction_type &&
+      Number(order.quantity) === Number(intent.payload.quantity) && validFill(order, Number(intent.payload.quantity));
+    if (intent.state === 'terminal') {
+      if (valid(intent.order)) return intent.order;
+      // Older journals may have cached an incomplete terminal response. Keep
+      // its ownership ID and reservation, then require fresh broker evidence.
+      intent.state = 'unknown'; delete intent.order; this._save();
+    }
     let matches;
     if (intent.order_id) {
       matches = (account.orders ?? []).filter(o => String(o.order_id) === String(intent.order_id));
@@ -217,8 +238,7 @@ export class DeliveryManager {
     } else matches = (account.orders ?? []).filter(o => o.tag === intent.id);
     if (matches.length !== 1) return null;
     const order = matches[0];
-    const payload = intent.payload;
-    if (!matchesSymbol(order, intent.symbol) || order.product !== 'CNC' || order.transaction_type !== payload.transaction_type || Number(order.quantity ?? -1) !== Number(payload.quantity ?? -2)) return null;
+    if (!valid(order)) return null;
     Object.assign(intent, { order_id: String(order.order_id), order: clone(order), state: TERMINAL.has(order.status) ? 'terminal' : 'acknowledged' });
     this._save();
     return order;
@@ -386,7 +406,7 @@ export class DeliveryManager {
     for (const oid of p.gtt_order_ids ?? []) {
       const prior = (p.gtt_orders ??= {})[oid];
       let order;
-      if (prior && TERMINAL.has(prior.status)) order = prior;
+      if (prior && TERMINAL.has(prior.status) && validFill(prior, p.quantity)) order = prior;
       else {
         let matches = account.orders.filter(o => String(o.order_id) === oid);
         if (!matches.length) {
@@ -395,9 +415,10 @@ export class DeliveryManager {
         }
         if (!matches.length) return [false, 'Triggered GTT order is missing'];
         order = matches.at(-1);
-        if (!matchesSymbol(order, p.symbol) || order.product !== 'CNC' || order.transaction_type !== 'SELL') return [false, 'Triggered GTT order identity mismatch'];
-        p.gtt_orders[oid] = clone(order);
       }
+      if (!matchesSymbol(order, p.symbol) || order.product !== 'CNC' || order.transaction_type !== 'SELL') return [false, 'Triggered GTT order identity mismatch'];
+      if (!validFill(order, p.quantity)) return [false, 'Triggered GTT fill data is incomplete or invalid; remaining quantity is unresolved'];
+      p.gtt_orders[oid] = clone(order);
       fills += Number(order.filled_quantity ?? 0);
       pending ||= !TERMINAL.has(order.status);
     }
@@ -465,6 +486,8 @@ export class DeliveryManager {
 
   _realised(p) {
     const orders = [...Object.values(p.gtt_orders ?? {}), ...(p.exit_intents ?? []).map(iid => this.state.intents[iid].order ?? {})];
+    // Invalid legacy/cache rows cannot alter P&L before fresh reconciliation.
+    if (!orders.every(order => validFill(order, p.quantity))) return;
     const value = sum(orders.map(o => Number(o.average_price ?? 0) * Number(o.filled_quantity ?? 0)));
     const qty = sum(orders.map(o => Number(o.filled_quantity ?? 0)));
     // Explicit estimate; contract-note costs should replace this for accounting.

@@ -6,8 +6,9 @@ const escape = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'
 const clock = value => {if(!value) return '—'; const d = new Date(value); return Number.isNaN(d.getTime()) ? String(value).slice(-8) : d.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});};
 const positive = n => Number(n) < 0 ? 'negative' : Number(n) > 0 ? 'positive' : '';
 const empty = (n,text) => `<tr><td colspan="${n}" class="empty-cell">${escape(text)}</td></tr>`;
-let csrf='', state={}, events=[], equityHistory=[], liveView=null, liveAllowed=true, activePage='overview', settingsLoaded=false, settingsDirty=false, busy=false, lastChartAt=0, toastTimer;
+let csrf='', state={}, events=[], eventCursor=null, equityHistory=[], liveView=null, liveAllowed=true, activePage='overview', settingsLoaded=false, settingsDirty=false, busy=false, lastChartAt=0, toastTimer;
 let configLoaded=false, configLoading=null, configDirty=false, configFields=[];
+let paperModeDirty=false, savedExecution=null, configSaving=false, configRestartRequired=false;
 let authorizationBusy=false, authorizationPending=false, authorizationWasRequired=false, authorizationLastCheck=0;
 let researchState=null,researchLoading=null,researchBusy=false,researchTimer=null,researchRequest=null;
 let selectedResearchInterval='';
@@ -108,7 +109,7 @@ function showPage(name){
   $('breadcrumb').textContent={overview:'Overview',holdings:'Holdings',orders:'Orders & trades',research:'Strategy research',activity:'Activity log',settings:'Settings'}[name];
   history.replaceState(null,'',name==='settings'?'/settings':`/#${name}`);
   renderTables();
-  if(name==='settings'&&csrf)loadConfig().catch(e=>$('config-error').textContent=e.message);
+  if(name==='settings'&&csrf)loadConfig().catch(showConfigError);
   if(name==='research'&&csrf)loadResearch().catch(()=>{});else stopResearchPolling();
 }
 document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',()=>showPage(b.dataset.page)));
@@ -116,14 +117,22 @@ document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',(
 function addEvents(rows){
   const known = new Set(events.map(e=>e.id));
   for(const row of rows||[]) if(!known.has(row.id)){events.push(row);known.add(row.id);}
-  events.sort((a,b)=>a.id-b.id);events=events.slice(-500);renderActivity();
+  events.sort((a,b)=>a.id-b.id);events=events.slice(-500);
+  if(events.length)eventCursor=Math.max(eventCursor??0,events.at(-1).id);
+  renderActivity();
 }
 function badge(text, color=''){return `<span class="badge ${color}">${escape(text)}</span>`;}
 function entrySide(row){const side=row.side??'BUY';return side==='BUY'?badge('BUY · Long','blue'):side==='SELL'?badge('SELL · Short','amber'):badge('Unknown side','red');}
 function contextStatus(status){return ({fresh:'Fresh',stale:'Stale',partial:'Partial coverage',unavailable:'Unavailable',ready:'Sources ready',refreshing:'Refreshing',degraded:'Needs attention',closed:'Stopped'})[status]||String(status||'Unavailable').replaceAll('_',' ');}
 function sourceBadge(status){return badge(contextStatus(status),status==='fresh'||status==='ready'?'green':['stale','partial','degraded'].includes(status)?'amber':'');}
 function renderReadiness(){
-  const readiness=state.readiness||{},checks=readiness.checks||[],labels={broker_session:'Broker session',account_snapshot:'Account snapshot',reconciliation:'Account recovery',market_session:'Market session',live_feed:'Live market feed',machine_capacity:'Machine capacity',maintenance:'Maintenance lock',entry_armed:'Trading armed'};
+  const readiness=state.readiness||{},checks=readiness.checks||[],labels={broker_session:'Broker session',system_clock:'System clock',equity_universe:'Stock & ETF eligibility',account_snapshot:'Account snapshot',reconciliation:'Account recovery',trading_cash:'Trading funds',market_session:'Market session',live_feed:'Live market feed',machine_capacity:'Machine capacity',maintenance:'Maintenance lock',entry_armed:'Trading armed'};
+  const health=state.broker_clock;
+  $('clock-status').hidden=!health||health.status==='aligned'&&!health.stale&&!health.blocked;
+  if(health){
+    const lower=numeric(health.offset_lower_ms),upper=numeric(health.offset_upper_ms),offset=lower===null||upper===null?null:(lower+upper)/2000;
+    $('clock-status').textContent=health.blocked?`System clock needs synchronization${offset===null?'':`: approximately ${Math.round(Math.abs(offset))} seconds ${offset>0?'behind':'ahead of'} the broker`}. New entries wait. Synchronize this machine's operating-system clock; the program does not change it.`:'Waiting for a recent broker clock check. New entries wait; existing account monitoring continues.';
+  }
   $('readiness-status').textContent=!checks.length?'Waiting for checks':readiness.ready?'Operational checks passed':'Entry prerequisites pending';
   $('readiness-status').className=`badge ${readiness.ready?'green':checks.length?'amber':''}`;
   $('readiness-scope').textContent=readiness.scope||'These checks describe operational readiness. Each trade still needs its own signal, liquidity, event and risk checks.';
@@ -193,6 +202,8 @@ function renderResearchStatus(){
   $('research-status').textContent=researchState?({idle:'Ready',collecting:'Collecting data',running:'Simulating',complete:'Complete',failed:'Failed',cancelled:'Cancelled'})[status]||status:'Not loaded';
   $('research-status').className=`badge ${status==='complete'?'green':status==='failed'?'red':running?'blue':''}`;
   $('research-message').textContent=research.message||(running?'Historical analysis is in progress.':status==='complete'?'Historical analysis completed.':status==='failed'?'Research could not complete. Review the error and retry.':status==='cancelled'?'Research was cancelled.':state.connected?'Ready to collect historical data from the connected Zerodha account.':'Connect Zerodha to collect historical data.');
+  const automation=research.automation;
+  $('research-auto-note').textContent=automation?`${automation.reason||'Automatic research checks the connected account and available data.'}${automation.next_retry_at?` Next automatic check: ${dateLabel(automation.next_retry_at)}, ${clock(automation.next_retry_at)} IST.`:''}`:'When enabled in Settings, automatic research waits for account funds and market data, then retries temporary failures. No symbols or capital amounts need to be entered here.';
   const progress=numeric(research.progress);
   if(progress===null&&running)$('research-progress').removeAttribute('value');
   else $('research-progress').value=Math.max(0,Math.min(100,progress??0));
@@ -202,7 +213,8 @@ function renderResearchStatus(){
   $('research-completed').textContent=completed?`Finished ${dateLabel(completed)} · ${clock(completed)} IST`:'';
   $('research-start').disabled=researchBusy||running||!state.connected;
   $('research-start').textContent=researchBusy?'Please wait…':research.report||research.result?'Run again':'Run analysis';
-  $('research-cancel').disabled=researchBusy||!running;
+  const pendingRetry=['failed','cancelled'].includes(status)&&automation?.enabled&&['ready','waiting','retry_wait'].includes(automation.status);
+  $('research-cancel').disabled=researchBusy||!(running||pendingRetry);
   $('research-refresh').disabled=researchBusy||!!researchLoading;
 }
 function renderResearchReport(){
@@ -306,17 +318,19 @@ function render(next){
   renderMarketContext();
   renderDecisionControls();
   renderResearchStatus();
-  const paper=state.mode!=='live', connected=state.connected, running=state.status==='running', recovering=running&&state.recovery?.blocked;
+  const paper=state.mode!=='live', connected=state.connected, running=state.status==='running', recovering=running&&state.recovery?.blocked,waitingFunds=running&&state.waiting_for_funds,waitingClock=running&&state.broker_clock&&(state.broker_clock.status!=='aligned'||state.broker_clock.stale||state.broker_clock.blocked);
   $('mode-pill').textContent=paper?'Paper trading':'Live trading';$('mode-pill').classList.toggle('live',!paper);
+  if(state.restart_required)configRestartRequired=true;
+  renderPaperTrading();
   $('equity-mode').textContent=paper?'PAPER':'LIVE';
-  $('engine-status').textContent=recovering?'Recovering account':({disconnected:'Disconnected',monitoring:'Monitoring',running:'Trading active',paused:'Entries paused',error:'Attention needed'})[state.status]||state.status||'Disconnected';
-  $('engine-dot').className=`dot ${state.status==='error'?'red':recovering?'amber':running?'green':connected?'amber':''}`;
+  $('engine-status').textContent=waitingClock?'Waiting for clock verification':recovering?'Recovering account':waitingFunds?'Waiting for funds':({disconnected:'Disconnected',monitoring:'Monitoring',running:'Trading active',paused:'Entries paused',error:'Attention needed'})[state.status]||state.status||'Disconnected';
+  $('engine-dot').className=`dot ${state.status==='error'?'red':recovering||waitingFunds||waitingClock?'amber':running?'green':connected?'amber':''}`;
   $('broker-dot').className=`dot ${connected?'green':''}`;$('broker-sidebar').textContent=connected?(state.user_id||'Connected'):'Not connected';
   $('market-state').textContent=state.market_open?(state.feed_fresh?'Market open':'Awaiting fresh market data'):'Outside market hours';
   $('account-ref').textContent=`Zerodha account · ${state.user_id||'—'}`;
   $('session-message').textContent=state.message || (connected?'Your account is connected. Monitoring continues when you close this page.':'Connect your Zerodha account to start monitoring.');
   $('start').disabled=busy||running||state.maintenance;
-  $('start').innerHTML=recovering?'Checking account':running?'Trading active':`<span aria-hidden="true">▶</span> ${connected?'Resume trading':'Start Trading'}`;
+  $('start').innerHTML=waitingClock?'Checking system clock':recovering?'Checking account':waitingFunds?'Waiting for funds':running?'Trading active':`<span aria-hidden="true">▶</span> ${connected?'Resume trading':'Start Trading'}`;
   $('pause').disabled=busy||!connected||!running;
   $('flatten').disabled=busy||!connected||!(state.positions?.length||state.pending_orders?.length||state.delivery?.positions?.length);
   $('metric-equity').textContent=money(state.equity??state.capital,0);
@@ -370,9 +384,11 @@ function renderTables(){
     $('holdings-count').textContent=number(holdings.length);$('account-updated').textContent=`Account updated ${clock(state.account?.updated_at)}`;
     $('holdings-body').innerHTML=holdings.map(h=>{
       const q=Number(h.quantity||0)+Number(h.t1_quantity||0),pnl=(Number(h.last_price||0)-Number(h.average_price||0))*q;
-      const signal=Array.isArray(analysis)?analysis.find(x=>x.symbol===h.tradingsymbol):analysis[h.tradingsymbol];
-      const managed=signal?.managed; const label=signal?.action==='simulated_sell'?'Paper exit recorded':signal?.status==='exit_candidate'?'Exit candidate':signal?.status==='hold'?'Hold':'Analysing';
-      return `<tr><td>${escape(h.tradingsymbol)}<small> · ${escape(h.exchange)}</small></td><td>${number(q)}</td><td>${money(h.average_price)}</td><td>${money(h.last_price)}</td><td>${money(q*Number(h.last_price||0),0)}</td><td class="${positive(pnl)}">${money(pnl)}</td><td title="${escape(signal?.reason||'Awaiting analysis')}">${badge(managed?'Managed':'Observe only',managed?'blue':'')} ${badge(label,signal?.status==='exit_candidate'?'amber':'')}</td></tr>`;
+      const signal=Array.isArray(analysis)?analysis.find(x=>x.symbol===h.tradingsymbol&&(!x.exchange||x.exchange===h.exchange)):analysis[h.tradingsymbol];
+      const labels={exit_candidate:'Exit candidate',hold:'Hold',unsupported:'Unsupported',universe_unavailable:'Eligibility unavailable',history_unavailable:'No usable history',awaiting_market_data:'Waiting for market data',warming_up:'Waiting for daily history',analysing:'Analysing'};
+      const managed=signal?.managed,label=signal?.action==='simulated_sell'?'Paper exit recorded':labels[signal?.status]||'Awaiting status';
+      const reason=signal?.reason||(!state.connected?'Connect Zerodha to refresh holding analysis.':'Holding analysis status is not available yet.');
+      return `<tr><td>${escape(h.tradingsymbol)}<small> · ${escape(h.exchange)}</small></td><td>${number(q)}</td><td>${money(h.average_price)}</td><td>${money(h.last_price)}</td><td>${money(q*Number(h.last_price||0),0)}</td><td class="${positive(pnl)}">${money(pnl)}</td><td class="signal-explanation">${badge(managed?'Managed':'Observe only',managed?'blue':'')} ${signal?.scope==='recovery_only'?badge('Exit only','amber')+' ':''}${badge(label,['exit_candidate','unsupported','history_unavailable','universe_unavailable'].includes(signal?.status)?'amber':'')}<div><small>${escape(reason)}${signal?.scope_reason?' '+escape(signal.scope_reason):''}</small></div></td></tr>`;
     }).join('')||empty(7,'No delivery holdings available. Connect to refresh your account.');
     const accountPositions=state.account?.positions?.net||[];
     $('account-positions-body').innerHTML=accountPositions.map(p=>`<tr><td>${escape(p.tradingsymbol)}</td><td>${badge(p.product)}</td><td>${number(p.quantity)}</td><td>${money(p.average_price)}</td><td>${money(p.last_price)}</td><td class="${positive(p.pnl)}">${money(p.pnl)}</td></tr>`).join('')||empty(6,'No account positions to display.');
@@ -411,10 +427,23 @@ $('settings-form').addEventListener('submit',async event=>{
 
 // Configuration is deliberately separate from the live account render. Polls
 // and SSE updates must never overwrite an administrator's unsaved edits.
+function renderPaperTrading(){
+  const paper=$('paper-trading').checked,disabledLive=!paper&&!paperModeDirty&&!savedExecution?.live_trading_enabled;
+  $('paper-trading-current').textContent=state.mode?`Current mode: ${state.mode==='paper'?'Paper trading':'Live trading'}`:'Checking current mode.';
+  $('paper-trading-description').textContent=paper?'Use live market data with simulated buys and sells.':disabledLive?'Paper trading is off. Real order execution is also disabled in your saved settings.':'Off selects live trading. Real buy and sell orders use your Zerodha funds.';
+  $('paper-trading-state').textContent=configRestartRequired?(paperModeDirty?'Settings changed · restart required':'Saved · restart required'):paperModeDirty?`Unsaved · ${paper?'paper':'live'} trading`:disabledLive?'Live execution disabled':paper?'On · simulated orders':'Off · real orders';
+  $('paper-trading-state').className='badge '+(paper?'blue':'amber');
+  $('paper-trading-note').textContent=configRestartRequired?(paperModeDirty?'Your unsaved selection has not been saved. Restart the program to load the saved settings.':'Settings saved. Restart the program to apply the saved trading mode.'):disabledLive?'Your saved live mode has real execution disabled. Turn paper trading on to use simulation.':paperModeDirty?'Unsaved change. Save settings and restart the program to apply it.':'Save and restart to apply changes. Pause trading and resolve managed positions first.';
+  const disabled=!configLoaded||configSaving||configRestartRequired;
+  $('paper-trading').disabled=disabled;$('paper-trading-save').disabled=disabled;$('config-submit').disabled=disabled;
+  for(const field of configFields){const input=$('config-form').elements[field.key];if(input)input.disabled=configSaving||configRestartRequired;}
+}
 function renderConfig(data){
-  const automatic=new Set(['public_url','app_env','paper_capital','live_capital','admin_username']);
+  const automatic=new Set(['public_url','app_env','paper_capital','live_capital','admin_username','trading_mode','live_trading_enabled']);
   configFields=(data.fields||[]).filter(field=>!automatic.has(field.key));
   const values=data.values||{};
+  savedExecution={trading_mode:values.trading_mode,live_trading_enabled:values.live_trading_enabled===true};
+  $('paper-trading').checked=values.trading_mode==='paper';paperModeDirty=false;configRestartRequired=configRestartRequired||data.restart_required===true;
   $('config-fields').innerHTML=configFields.map(field=>{
     const id=`config-${field.key}`, value=values[field.key], label=escape(field.label||field.key);
     if(field.type==='checkbox')return `<div class="config-field config-checkbox"><label for="${escape(id)}">${label}</label><label class="switch"><input id="${escape(id)}" name="${escape(field.key)}" type="checkbox" ${value?'checked':''} aria-label="${label}"><span></span></label></div>`;
@@ -426,9 +455,10 @@ function renderConfig(data){
   for(const key of ['dashboard','redirect','postback'])$(`broker-url-${key}`).value=data.urls?.[key]||'';
   const admin=$('admin-form');
   if(!admin.dataset.dirty)admin.elements.username.value=data.admin_username||values.admin_username||'admin';
-  $('config-submit').disabled=false;
-  configLoaded=true;
+  configLoaded=true;$('paper-trading-error').textContent='';$('config-error').textContent='';
+  renderPaperTrading();
 }
+function showConfigError(error){$('config-error').textContent=error.message;$('paper-trading-error').textContent=error.message;}
 async function loadConfig(force=false){
   if(configLoading)return configLoading;
   if(configDirty||configLoaded&&!force)return;
@@ -436,15 +466,19 @@ async function loadConfig(force=false){
   try{await configLoading;}finally{configLoading=null;}
 }
 $('config-form').addEventListener('input',()=>configDirty=true);
+$('paper-trading').addEventListener('change',()=>{paperModeDirty=true;configDirty=true;$('paper-trading-error').textContent='';renderPaperTrading();});
 $('config-form').addEventListener('submit',async event=>{
-  event.preventDefault();const form=event.currentTarget,button=$('config-submit');button.disabled=true;$('config-error').textContent='';$('config-message').textContent='';
+  event.preventDefault();if(!configLoaded||configSaving||configRestartRequired)return;
+  const form=event.currentTarget;configSaving=true;renderPaperTrading();$('config-error').textContent='';$('paper-trading-error').textContent='';$('config-message').textContent='';
   const values=Object.fromEntries(configFields.map(field=>{const input=form.elements[field.key];return [field.key,field.type==='checkbox'?input.checked:field.type==='number'?Number(input.value):input.value];}));
+  // Unrelated edits must preserve an existing live-but-disabled configuration.
+  if(paperModeDirty){const paper=$('paper-trading').checked;values.trading_mode=paper?'paper':'live';values.live_trading_enabled=!paper;}
   try{
-    const result=await api('/api/config','PUT',values);configDirty=false;
+    const result=await api('/api/config','PUT',values);configDirty=false;configRestartRequired=result.restart_required===true;
     $('config-message').textContent=result.message||'Application settings saved. Restart the program to apply them.';
     toast('Application settings saved. Restart the program to apply them.');
     await loadConfig(true);
-  }catch(e){$('config-error').textContent=e.message;}finally{button.disabled=false;}
+  }catch(e){showConfigError(e);}finally{configSaving=false;renderPaperTrading();}
 });
 $('admin-form').addEventListener('input',event=>event.currentTarget.dataset.dirty='true');
 $('admin-form').addEventListener('submit',async event=>{
@@ -462,8 +496,9 @@ document.querySelectorAll('[data-copy-url]').forEach(button=>button.addEventList
   try{await navigator.clipboard.writeText(input.value);toast('URL copied.');}
   catch{input.focus();input.select();toast('URL selected. Copy it using your device’s copy command.');}
 }));
-function updateView(data){equityHistory=data.equity_history||equityHistory;render(data.state);addEvents(data.events);if(data.equity_history)drawChart();}
-async function refresh(){const request=new AbortController(),timer=setTimeout(()=>request.abort(),10000);try{updateView(await api('/api/state','GET',undefined,{signal:request.signal}));}finally{clearTimeout(timer);}}
+function updateView(data){equityHistory=data.equity_history||equityHistory;render(data.state);addEvents(data.events);if(Number.isSafeInteger(data.event_cursor)&&data.event_cursor>=0)eventCursor=Math.max(eventCursor??0,data.event_cursor);if(data.equity_history)drawChart();}
+function statePath(){return eventCursor===null?'/api/state':`/api/state?after=${eventCursor}`;}
+async function refresh(){const request=new AbortController(),timer=setTimeout(()=>request.abort(),10000);try{updateView(await api(statePath(),'GET',undefined,{signal:request.signal}));}finally{clearTimeout(timer);}}
 async function action(path){
   busy=true;render(state);
   try{const result=await api(path,'POST',{});if(result.redirect_url){location.assign(result.redirect_url);return;}await refresh();}catch(e){toast(e.message);}finally{busy=false;render(state);}
@@ -480,8 +515,8 @@ $('logout').addEventListener('click',async()=>{liveAllowed=false;liveView?.stop(
 liveView=createLiveView({
   hostname:location.hostname,
   EventSource:globalThis.EventSource,
-  after:()=>events.at(-1)?.id||0,
-  fetchState:options=>api('/api/state','GET',undefined,options),
+  after:()=>eventCursor??0,
+  fetchState:options=>api(statePath(),'GET',undefined,options),
   onUpdate:updateView,
   onStatus:({text,color})=>{$('feed-state').innerHTML=`<span class="dot ${escape(color)}"></span> ${escape(text)}`;},
   onExpired:()=>{liveAllowed=false;stopResearchPolling();researchRequest?.abort();location.assign('/login?error=expired');},
@@ -491,7 +526,7 @@ window.addEventListener('pageshow',event=>{liveAllowed=true;if(event.persisted&&
 (async()=>{
   try{
     const session=await api('/api/session');csrf=session.csrf;
-    loadConfig().catch(e=>$('config-error').textContent=e.message);
+    loadConfig().catch(showConfigError);
     const error=new URLSearchParams(location.search).get('error');
     showPage(location.pathname==='/settings'?'settings':location.hash.slice(1)||'overview');
     try{await refresh();}finally{if(liveAllowed)liveView.start();}

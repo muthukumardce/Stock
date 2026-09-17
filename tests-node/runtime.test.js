@@ -11,6 +11,7 @@ import { ConfigManager, DEFAULTS, Settings } from '../src/config.js';
 import { TradingEngine } from '../src/trading.js';
 import { AnalyticsPool } from '../src/analytics.js';
 import { Store } from '../src/storage.js';
+import { ResourceMonitor } from '../src/resources.js';
 
 const source = path.resolve(import.meta.dirname, '..');
 const PASSWORD = 'Runtime-test-password-only!';
@@ -94,6 +95,20 @@ test('resource defaults support one-, two-, and four-CPU machines without zero-w
     assert.equal(pool.worker_limit, Math.max(1, logical_cpus - 4)); assert.equal(pool.workers.size, 0); await pool.close();
   }
   const explicit = new AnalyticsPool(100, 4, 32, { logical_cpus: 2 }); assert.equal(explicit.worker_limit, 2); await explicit.close();
+});
+
+test('machine-health refresh survives backward and forward wall-clock corrections',t=>{
+  let wall=Date.parse('2026-09-17T12:00:00Z'),elapsed=100,free=1024*2**20;
+  t.mock.method(Date,'now',()=>wall);
+  t.mock.method(process.hrtime,'bigint',()=>BigInt(elapsed*1e9));
+  t.mock.method(os,'freemem',()=>free);
+  const monitor=new ResourceMonitor(temporary(t));t.after(()=>monitor.close());
+  const healthy=monitor.snapshot();assert.equal(healthy.memory_free_mib,1024);
+  wall-=3600000;elapsed+=3;free=128*2**20;
+  const low=monitor.snapshot();assert.equal(low.memory_free_mib,128,'Backward clock correction must not hide low memory');
+  wall+=7200000;elapsed+=1;free=512*2**20;
+  assert.equal(monitor.snapshot(),low,'Wall-clock jumps must not alter the sampling interval');
+  elapsed+=1;assert.equal(monitor.snapshot().memory_free_mib,512);
 });
 
 test('copied Node CLI setup/check/start and SIGTERM shutdown work with no Python or broker connectivity', { timeout: 30000 }, async t => {

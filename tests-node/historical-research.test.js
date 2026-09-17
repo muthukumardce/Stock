@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { HistoricalResearch } from '../src/historical-research.js';
+import { ResearchService } from '../src/research.js';
 import { Store } from '../src/storage.js';
 import { STRATEGY_VERSION } from '../src/strategy.js';
 
@@ -17,6 +18,10 @@ function candles(date = '2026-09-16') {
       low: i === 20 ? 100.1 : price - .1, close: price, volume: i === 20 ? 3000 : 1000 };
   });
 }
+function dailyCandles() {
+  return Array.from({length:56},(_,i)=>({date:new Date(+new Date('2026-09-16T00:00:00+05:30')-(55-i)*86400000),
+    open:100,high:101,low:99,close:100,volume:1000}));
+}
 const report = () => ({ strategy_version: STRATEGY_VERSION, baseline: { metrics: { trade_count: 1 }, trades: [], equity: [] }, enhanced: { metrics: { trade_count: 2 }, trades: [], equity: [] }, dataset: {}, caveats: [] });
 class FakeWorker {
   constructor(complete = true) { this.complete = complete; this.inputs = []; this.cancelled = 0; this.job = { status: 'idle', progress: 0 }; }
@@ -25,20 +30,28 @@ class FakeWorker {
   async cancel() { this.cancelled++; this.job = { status: 'cancelled', progress: 0 }; }
   async close() { await this.cancel(); }
 }
-function context(t, { worker = new FakeWorker(), settings: changed = {}, broker: supplied } = {}) {
+function context(t, { worker = new FakeWorker(), settings: changed = {}, broker: supplied, options = {} } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'stock-research-')), store = new Store(join(dir, 'state.sqlite'));
-  const calls = [], broker = supplied ?? { async call(...args) { calls.push(args); return candles(); } };
+  const calls = [], broker = supplied ?? { async call(...args) { calls.push(args); return args[4]==='day'?dailyCandles():candles(); } };
   const settings = { auto_research: true, research_symbols: 2, research_days: 10, research_fee_rate: .001, research_slippage_rate: .0005,
     risk_per_trade_pct: .0025, max_position_pct: .1, max_positions: 5, entry_cutoff: '14:45', exit_time: '15:10', ...changed };
   const engine = { connected: true, broker, capital: 120000,
     universe: { 99: { tradingsymbol: 'TCS' }, 12: { tradingsymbol: 'INFY' }, 1: { tradingsymbol: 'ABC' } },
     strategy_settings: () => ({ intraday_enabled: true, swing_enabled: false }), _strategy_options: () => ({ enhanced_signals: true, min_signal_score: 60 }) };
-  const research = new HistoricalResearch(engine, store, settings, { worker, now: () => NOW, delay: 0 });
+  const research = new HistoricalResearch(engine, store, settings, { worker, now: () => NOW, delay: 0, ...options });
   t.after(async () => { await research.close(); store.close(); rmSync(dir, { recursive: true, force: true }); });
   return { research, worker, engine, store, settings, calls };
 }
 async function until(predicate) { for (let i = 0; i < 100 && !predicate(); i++) await delay(5); assert.ok(predicate(), 'Expected asynchronous stage was reached'); }
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
+class FakeClock {
+  constructor(){this.time=+NOW;this.timers=new Set();}
+  now=()=>new Date(this.time);
+  setTimer=(fn,ms)=>{const timer={fn,at:this.time+ms,unref(){}};this.timers.add(timer);return timer;};
+  clearTimer=timer=>this.timers.delete(timer);
+  options(){return {now:this.now,setTimer:this.setTimer,clearTimer:this.clearTimer,pollInterval:1000,retryBase:2000,retryMax:8000};}
+  async advance(ms){this.time+=ms;for(const timer of [...this.timers].filter(timer=>timer.at<=this.time)){this.timers.delete(timer);await timer.fn();}}
+}
 
 test('historical collection samples bounded alphabetical universe and cannot submit broker orders', async t => {
   const { research, worker, calls, store } = context(t);
@@ -56,6 +69,22 @@ test('historical collection samples bounded alphabetical universe and cannot sub
   assert.equal(Object.hasOwn(worker.inputs[0], 'broker'), false);
 });
 
+test('research excludes recovery-only instruments before sampling without removing account exposure',async t=>{
+  const {research,engine,worker,calls}=context(t);
+  engine.universe={
+    20:{tradingsymbol:'AAA',entry_eligible:false},
+    21:{tradingsymbol:'BBB',entry_eligible:true},
+    22:{tradingsymbol:'CCC'},
+    23:{tradingsymbol:'DDD',entry_eligible:true},
+  };
+  research.start();await research.task;
+  assert.equal(research.status().status,'complete');
+  assert.deepEqual(calls.map(call=>call[1]),[21,22]);
+  assert.deepEqual(Object.keys(worker.inputs[0].dataset.symbols),['BBB','CCC']);
+  assert.deepEqual(research.status().report.metadata.requested_symbols,['BBB','CCC']);
+  assert.equal(engine.universe[20].entry_eligible,false,'Recovery-only account instrument remains in engine state');
+});
+
 test('collection excludes current-day and out-of-window bars and reuses only same-day range cache', async t => {
   let calls = 0;
   const broker = { async call() { calls++; return [...candles('2026-09-01'), ...candles(), ...candles('2026-09-17')]; } };
@@ -65,6 +94,95 @@ test('collection excludes current-day and out-of-window bars and reuses only sam
   assert.ok(worker.inputs[0].dataset.symbols.ABC.every(row => row.time.startsWith('2026-09-16')));
   research.start(); await research.task; assert.equal(calls, 1);
   settings.research_days = 11; research.start(); await research.task; assert.equal(calls, 2);
+});
+
+for(const symbol of [undefined,'OLD'])test(`${symbol?'foreign-symbol':'unbound legacy'} research history must refetch before reuse`,async t=>{
+  const {research,worker,store,calls}=context(t,{settings:{research_symbols:1}});
+  store.set('research_history:1:5minute',{date:'2026-09-17',from:'2026-09-07T00:00:00+05:30',symbol,rows:candles().map(row=>({...row,open:80,high:81,low:79,close:80}))});
+  research.start();await research.task;
+  assert.equal(research.status().status,'complete');assert.equal(calls.length,1);
+  assert.equal(worker.inputs[0].dataset.symbols.ABC[0].close,100);
+  assert.equal(store.get('research_history:1:5minute').symbol,'ABC');
+  research.start();await research.task;assert.equal(calls.length,1);
+});
+
+test('changed stock identity invalidates automatic deduplication and cannot reuse another symbol history',async t=>{
+  const {research,engine,worker,store,calls}=context(t,{settings:{research_symbols:1}});
+  await research.maybeStart();await research.task;assert.equal(calls.length,1);
+  engine.universe[1]={tradingsymbol:'AAB',entry_eligible:true};
+  await research.maybeStart();await research.task;
+  assert.equal(calls.length,2);assert.deepEqual(Object.keys(worker.inputs[1].dataset.symbols),['AAB']);
+  assert.equal(store.get('research_history:1:5minute').symbol,'AAB');
+  assert.deepEqual(research.status().report.metadata.requested_symbols,['AAB']);
+});
+
+for(const [label,firstRows] of [
+  ['empty',()=>[]],
+  ['malformed',()=>candles().map((row,i)=>i===3?{...row,low:row.high+1}:row)],
+])test(`${label} history recovers on retry without poisoning the cache or valid peers`,async t=>{
+  const requests=new Map(),broker={async call(_method,token){const n=(requests.get(token)||0)+1;requests.set(token,n);return token===1&&n===1?firstRows():candles();}};
+  const {research,worker,store}=context(t,{broker});
+  research.start();await research.task;
+  assert.equal(research.status().status,'complete');assert.deepEqual(research.status().report.dataset.errors,['ABC']);
+  assert.equal(store.get('research_history:1:5minute'),null);
+  research.start();await research.task;
+  assert.equal(research.status().status,'complete');assert.deepEqual(research.status().report.dataset.errors,[]);
+  assert.deepEqual(Object.keys(worker.inputs.at(-1).dataset.symbols),['ABC','INFY']);
+  assert.equal(requests.get(1),2);assert.equal(requests.get(12),1);
+});
+
+test('an empty first run preserves its retry delay and recovers after service restart',async t=>{
+  let calls=0;const broker={async call(){return ++calls===1?[]:candles();}};
+  const {research,store,engine,settings}=context(t,{broker,settings:{research_symbols:1}});
+  await research.maybeStart();await research.task;assert.equal(research.status().status,'failed');
+  assert.equal(store.get('research_auto_signature'),null);assert.equal(store.get('research_history:1:5minute'),null);
+  await research.close();
+  let now=NOW;const restored=new HistoricalResearch(engine,store,settings,{worker:new FakeWorker(),now:()=>now,delay:0});
+  t.after(()=>restored.close());await restored.maybeStart();assert.equal(calls,1);assert.equal(restored.status().automation.status,'retry_wait');
+  now=new Date(+NOW+60000);await restored.maybeStart();await restored.task;
+  assert.equal(restored.status().status,'complete');assert.equal(calls,2);
+});
+
+const invalidHistoryCaches=[
+  ['empty',()=>[]],
+  ['non-array',()=>({bad:true})],
+  ['invalid OHLCV',()=>candles().map((row,i)=>i===3?{...row,close:null}:row)],
+  ['duplicate timestamp',()=>[candles()[0],...candles()]],
+  ['invalid calendar date',()=>[{...candles()[0],date:'2026-09-31T09:15:00+05:30'}]],
+  ['off-grid candle',()=>[{...candles()[0],date:'2026-09-16T09:16:00+05:30'}]],
+  ['outside the regular session',()=>[{...candles()[0],date:'2026-09-16T15:30:00+05:30'}]],
+  ['outside the requested interval',()=>candles('2026-09-01')],
+  ['unfinished current day',()=>candles('2026-09-17')],
+  ['oversized',()=>Array(5001).fill(candles()[0])],
+];
+for(const [label,rows] of invalidHistoryCaches)test(`legacy ${label} same-day cache is bypassed and replaced`,async t=>{
+  const {research,worker,store,calls}=context(t,{settings:{research_symbols:1}});
+  store.set('research_history:1:5minute',{date:'2026-09-17',from:'2026-09-07T00:00:00+05:30',symbol:'ABC',rows:rows()});
+  research.start();await research.task;
+  assert.equal(research.status().status,'complete');assert.equal(calls.length,1);
+  assert.equal(worker.inputs[0].dataset.symbols.ABC.length,75);
+  assert.equal(store.get('research_history:1:5minute').rows.length,75);
+  research.start();await research.task;assert.equal(calls.length,1,'Valid replacement stays cached');
+});
+
+test('valid sparse history remains cached for causal missing-candle reporting',async t=>{
+  let calls=0;const sparse=candles().filter((_,i)=>i!==20),broker={async call(){calls++;return sparse;}};
+  const {research,worker}=context(t,{broker,settings:{research_symbols:1}});
+  research.start();await research.task;research.start();await research.task;
+  assert.equal(calls,1);assert.equal(worker.inputs[0].dataset.symbols.ABC.length,74);
+  assert.deepEqual(worker.inputs[1].dataset.symbols,worker.inputs[0].dataset.symbols);
+});
+
+test('duplicate daily dates cannot persist a worker-invalid cache',async t=>{
+  const {research,engine,store,calls}=context(t,{settings:{research_symbols:1}});
+  engine.strategy_settings=()=>({intraday_enabled:false,swing_enabled:true});
+  store.set('research_history:1:day',{date:'2026-09-17',from:'2026-07-09T00:00:00+05:30',symbol:'ABC',rows:[
+    {...candles()[0],date:'2026-09-16T00:00:00+05:30'},
+    {...candles()[0],date:'2026-09-16T09:15:00+05:30'},
+  ]});
+  research.start();await research.task;
+  assert.equal(research.status().status,'complete');assert.equal(calls.length,1);
+  assert.equal(store.get('research_history:1:day').rows.length,56);
 });
 
 test('daily-only scope requests completed daily candles with a sufficient calendar window', async t => {
@@ -92,10 +210,63 @@ test('historical relative context uses verified index identity, matching range a
   assert.equal(research.status().report.metadata.context.benchmark,'NIFTY 50');
 });
 
+test('research index caches are bound to verified index names rather than recycled numeric tokens',async t=>{
+  const calls=[],broker={async call(method,token){calls.push([method,token]);return method==='quote'?{'NSE:NIFTY 50':{instrument_token:500},'NSE:NIFTY IT':{instrument_token:501}}:candles();}};
+  const {research,engine,worker,store}=context(t,{broker,settings:{research_symbols:1}});
+  engine.market_context={forSymbol:()=>({index_membership:[{index:'NIFTY IT',status:'fresh'}]})};
+  store.set('research_index:500:5minute',{date:'2026-09-17',from:'2026-09-07T00:00:00+05:30',symbol:'NIFTY BANK',rows:candles()});
+  store.set('research_index:501:5minute',{date:'2026-09-17',from:'2026-09-07T00:00:00+05:30',rows:candles()});
+  research.start();await research.task;
+  assert.equal(research.status().status,'complete');assert.equal(worker.inputs[0].dataset.benchmark_bars.length,75);
+  assert.deepEqual(calls.filter(([method])=>method==='historical_data').map(([,token])=>token),[1,500,501]);
+  assert.equal(store.get('research_index:500:5minute').symbol,'NIFTY 50');assert.equal(store.get('research_index:501:5minute').symbol,'NIFTY IT');
+  research.start();await research.task;assert.equal(calls.filter(([method])=>method==='historical_data').length,3);
+});
+
 test('missing benchmark history is visible and cannot fabricate relative-strength context',async t=>{
   const broker={async call(method){return method==='quote'?{}:candles();}};
   const {research,engine,worker}=context(t,{broker,settings:{research_symbols:1}});engine.market_context={forSymbol:()=>({index_membership:[]})};
   research.start();await research.task;assert.deepEqual(worker.inputs[0].dataset.benchmark_bars,[]);assert.deepEqual(research.status().report.metadata.context.unavailable,['NIFTY 50']);
+});
+
+test('empty and malformed index responses recover while valid symbol history remains cached',async t=>{
+  const requests=new Map(),broker={async call(method,token){
+    if(method==='quote')return {'NSE:NIFTY 50':{instrument_token:500},'NSE:NIFTY IT':{instrument_token:501}};
+    const n=(requests.get(token)||0)+1;requests.set(token,n);
+    if(token===500&&n===1)return [];
+    if(token===501&&n===1)return [{...candles()[0],volume:-1}];
+    return candles();
+  }};
+  const {research,engine,worker,store}=context(t,{broker,settings:{research_symbols:1}});
+  engine.market_context={forSymbol:()=>({index_membership:[{index:'NIFTY IT',status:'fresh'}]})};
+  research.start();await research.task;
+  assert.equal(research.status().status,'complete');assert.deepEqual(research.status().report.metadata.context.unavailable,['NIFTY 50','NIFTY IT']);
+  assert.equal(store.get('research_index:500:5minute'),null);assert.equal(store.get('research_index:501:5minute'),null);
+  // An older version may already have persisted the unusable result. A manual
+  // rerun must bypass that cache as well as avoiding new negative cache entries.
+  store.set('research_index:500:5minute',{date:'2026-09-17',from:'2026-09-07T00:00:00+05:30',symbol:'NIFTY 50',rows:[]});
+  store.set('research_index:501:5minute',{date:'2026-09-17',from:'2026-09-07T00:00:00+05:30',symbol:'NIFTY IT',rows:[{...candles()[0],volume:-1}]});
+  research.start();await research.task;
+  const input=worker.inputs.at(-1).dataset;
+  assert.equal(input.benchmark_bars.length,75);assert.equal(input.sector_bars['NIFTY IT'].length,75);
+  assert.deepEqual(research.status().report.metadata.context.unavailable,[]);
+  assert.equal(requests.get(1),1);assert.equal(requests.get(500),2);assert.equal(requests.get(501),2);
+  research.start();await research.task;assert.equal(requests.get(500),2);assert.equal(requests.get(501),2);
+});
+
+test('real worker accepts unavailable sector history as absent context rather than an invalid symbol mapping',async t=>{
+  const broker={async call(method,token){
+    if(method==='quote')return {'NSE:NIFTY 50':{instrument_token:500},'NSE:NIFTY IT':{instrument_token:501}};
+    if(token===501)throw new Error('Sector history temporarily unavailable');
+    return candles();
+  }};
+  const {research,engine}=context(t,{broker,worker:new ResearchService(),settings:{research_symbols:1}});
+  engine.market_context={forSymbol:()=>({index_membership:[{index:'NIFTY IT',status:'fresh'}]})};
+  research.start();await research.task;
+  assert.equal(research.status().status,'complete');
+  assert.deepEqual(research.status().report.metadata.context.unavailable,['NIFTY IT']);
+  assert.equal(research.status().report.metadata.context.benchmark,'NIFTY 50');
+  assert.equal(research.status().report.dataset.bar_count,75);
 });
 
 test('one unavailable symbol is recorded without hiding available dataset coverage', async t => {
@@ -181,6 +352,36 @@ test('reconnected account generation cannot publish the previous broker response
   assert.equal(worker.inputs.length, 1);
 });
 
+for(const change of ['token reuse','universe generation','entry eligibility','date rollover'])test(`research drops late history after ${change}`,async t=>{
+  const pending=deferred(),broker={call:()=>pending.promise};
+  const {research,engine,worker,store}=context(t,{broker,settings:{research_symbols:1}});
+  research.state.report={marker:'previous'};research.start();
+  if(change==='token reuse')engine.universe[1].tradingsymbol='AAB';
+  else if(change==='universe generation')engine._universe_generation=1;
+  else if(change==='entry eligibility')engine.universe[1].entry_eligible=false;
+  else research.now=()=>new Date(+NOW+86400000);
+  pending.resolve(candles());await research.task;
+  assert.equal(research.status().status,'cancelled');assert.equal(worker.inputs.length,0);
+  assert.equal(store.get('research_history:1:5minute'),null);assert.equal(store.get('research_auto_signature'),null);
+  assert.deepEqual(research.status().report,{marker:'previous'});
+});
+
+test('late index history cannot populate a cache after the universe refreshes',async t=>{
+  const pending=deferred();let indexRequested=false;
+  const broker={async call(method,token){if(method==='quote')return {'NSE:NIFTY 50':{instrument_token:500}};if(token===500){indexRequested=true;return pending.promise;}return candles();}};
+  const {research,engine,worker,store}=context(t,{broker,settings:{research_symbols:1}});
+  engine.market_context={forSymbol:()=>({index_membership:[]})};research.start();await until(()=>indexRequested);
+  engine._universe_generation=1;pending.resolve(candles());await research.task;
+  assert.equal(research.status().status,'cancelled');assert.equal(worker.inputs.length,0);assert.equal(store.get('research_index:500:5minute'),null);
+});
+
+test('a completed worker result from an older universe cannot become the current report',async t=>{
+  const worker=new FakeWorker(false),{research,engine,store}=context(t,{worker,settings:{research_symbols:1}});
+  research.start();await until(()=>research.status().status==='running');
+  engine._universe_generation=1;worker.job={status:'complete',result:report()};await research.task;
+  assert.equal(research.status().status,'cancelled');assert.equal(store.get('research_report'),null);assert.equal(store.get('research_auto_signature'),null);
+});
+
 test('broker replacement during collection cancels rather than sending a stale dataset to worker', async t => {
   const pending = deferred(), broker = { call: () => pending.promise };
   const { research, engine, worker } = context(t, { broker }); research.start();
@@ -237,4 +438,84 @@ test('real worker consumes fixture candles from read-only collector and persists
   assert.equal(research.status().report.dataset.bar_count, 75);
   assert.ok(store.get('research_report').caveats.length > 0);
   assert.deepEqual(calls.map(c => c[0]), ['historical_data']);
+});
+
+test('automatic scheduler observes connected funds, eligible instruments and next-day comparisons without manual starts',async t=>{
+  const clock=new FakeClock(),{research,engine,worker,calls}=context(t,{options:clock.options(),settings:{research_symbols:1}});
+  engine.connected=false;engine.capital=0;engine.universe={1:{tradingsymbol:'ABC',entry_eligible:false}};
+  await research.startAutomatic();await research.startAutomatic();assert.equal(clock.timers.size,1);
+  assert.match(research.status().automation.reason,/Connect Zerodha/);assert.equal(calls.length,0);
+  engine.connected=true;await clock.advance(1000);assert.match(research.status().automation.reason,/balance/);
+  engine.capital=50000;await clock.advance(1000);assert.match(research.status().automation.reason,/instruments/);
+  engine.universe[1].entry_eligible=true;await clock.advance(1000);await research.task;
+  assert.equal(worker.inputs.length,1);assert.equal(worker.inputs[0].options.initial_capital,50000);
+  const signature=research.signature();engine.strategy_settings=()=>({intraday_enabled:true,swing_enabled:false,intraday_capital:engine.capital,swing_capital:0});
+  assert.equal(research.signature(),signature);engine.capital=65000;await clock.advance(1000);assert.equal(worker.inputs.length,1);
+  await clock.advance(86400000);await research.task;assert.equal(worker.inputs.length,2);
+  assert.deepEqual(calls.map(call=>call[0]),['historical_data','historical_data']);
+  await research.close();assert.equal(clock.timers.size,0);await clock.advance(86400000);assert.equal(calls.length,2);
+});
+
+test('automatic history retries use persistent capped backoff and continue after a long outage',async t=>{
+  const clock=new FakeClock();let calls=0,recovered=false;
+  const {research,worker,store}=context(t,{options:clock.options(),settings:{research_symbols:1},broker:{async call(){calls++;return recovered?candles():[];}}});
+  await research.startAutomatic();await research.task;
+  for(const backoff of [2000,4000,8000,8000,8000]){
+    const before=calls,status=research.status();assert.equal(status.status,'failed');assert.equal(status.automation.status,'retry_wait');
+    assert.equal(+new Date(status.automation.next_retry_at)-clock.time,backoff);
+    await clock.advance(backoff-1000);assert.equal(calls,before);
+    await clock.advance(1000);await research.task;assert.equal(calls,before+1);
+  }
+  assert.equal(store.get('research_history:1:5minute'),null);recovered=true;
+  await clock.advance(8000);await research.task;assert.equal(research.status().status,'complete');assert.equal(worker.inputs.length,1);
+  const count=calls;await clock.advance(8000);assert.equal(calls,count);assert.equal(store.get('research_auto_retry'),null);
+});
+
+test('automatic partial reports remain complete and do not repeatedly retry missing peers',async t=>{
+  const clock=new FakeClock(),requests=[];
+  const {research,worker}=context(t,{options:clock.options(),broker:{async call(_method,token){requests.push(token);return token===1?[]:candles();}}});
+  await research.startAutomatic();await research.task;
+  assert.deepEqual(research.status().report.dataset.errors,['ABC']);assert.equal(research.status().automation.status,'complete');
+  for(let i=0;i<5;i++)await clock.advance(8000);
+  assert.deepEqual(requests,[1,12]);assert.equal(worker.inputs.length,1);
+});
+
+test('automatic cancellation suppresses pending retries across restarts until a manual run',async t=>{
+  const clock=new FakeClock();let calls=0;
+  const {research,store,engine,settings}=context(t,{options:clock.options(),settings:{research_symbols:1},broker:{async call(){return ++calls===1?[]:candles();}}});
+  await research.startAutomatic();await research.task;await research.cancel();
+  assert.equal(research.status().automation.status,'cancelled');await clock.advance(8000);assert.equal(calls,1);
+  await research.close();const restored=new HistoricalResearch(engine,store,settings,{worker:new FakeWorker(),delay:0,...clock.options()});t.after(()=>restored.close());
+  await restored.startAutomatic();await clock.advance(8000);assert.equal(calls,1);assert.equal(restored.status().automation.status,'cancelled');
+  restored.start();await restored.task;assert.equal(calls,2);assert.equal(restored.status().status,'complete');
+});
+
+test('scheduler never overlaps pending requests and stale responses cannot publish after an automatic reconnect',async t=>{
+  const clock=new FakeClock(),pending=deferred();let calls=0;
+  const {research,engine,worker,store}=context(t,{options:clock.options(),settings:{research_symbols:1},broker:{call(){calls++;return pending.promise;}}});
+  await research.startAutomatic();const oldTask=research.task;
+  await clock.advance(8000);assert.equal(calls,1);assert.equal(clock.timers.size,1);
+  await research.cancel({suppressAuto:false});engine.broker={async call(){calls++;return candles();}};engine.universe[1].tradingsymbol='AAB';engine._universe_generation=1;
+  await clock.advance(8000);assert.equal(calls,1);assert.equal(research.status().automation.status,'waiting');
+  pending.resolve(candles());await oldTask;assert.equal(store.get('research_history:1:5minute'),null);
+  await clock.advance(1000);await research.task;assert.equal(calls,2);assert.deepEqual(Object.keys(worker.inputs[0].dataset.symbols),['AAB']);
+  assert.deepEqual(research.status().report.metadata.requested_symbols,['AAB']);
+});
+
+test('scheduler gate and close prevent retries during restart and pending shutdown',async t=>{
+  const clock=new FakeClock(),pending=deferred();let allowed=false,calls=0;
+  const {research,worker}=context(t,{options:clock.options(),settings:{research_symbols:1},broker:{call(){calls++;return pending.promise;}}});
+  await research.startAutomatic({canRun:()=>allowed});await clock.advance(8000);assert.equal(calls,0);assert.match(research.status().automation.reason,/restart/);
+  allowed=true;await clock.advance(1000);assert.equal(calls,1);
+  const closing=research.close();assert.equal(clock.timers.size,0);await clock.advance(8000);assert.equal(calls,1);
+  pending.resolve(candles());await closing;assert.equal(worker.inputs.length,0);
+  await research.close();await research.startAutomatic();assert.equal(clock.timers.size,0);assert.equal(research.status().automation.status,'stopped');
+});
+
+test('a restored pending retry can be cancelled before its first scheduler tick',async t=>{
+  const clock=new FakeClock(),{research,store,engine,settings,calls}=context(t,{options:clock.options()});
+  store.set('research_auto_retry',{signature:research.signature(),failures:2,next_retry_at:new Date(clock.time+8000).toISOString(),cancelled:false});
+  await research.close();const restored=new HistoricalResearch(engine,store,settings,{worker:new FakeWorker(),delay:0,...clock.options()});t.after(()=>restored.close());
+  assert.equal(restored.status().status,'idle');assert.equal(restored.status().automation.status,'retry_wait');await restored.cancel();
+  await restored.startAutomatic();await clock.advance(8000);assert.equal(restored.status().automation.status,'cancelled');assert.equal(calls.length,0);
 });

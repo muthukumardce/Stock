@@ -50,6 +50,10 @@ export class CandleBook {
     at = instant(at);
     if (!Number.isFinite(+at) || !Number.isFinite(price) || !Number.isFinite(cumulative_volume) || price <= 0 || cumulative_volume < 0) return null;
     if (this.last_time && at < this.last_time) return null;
+    // Intraday cumulative volume cannot move backwards. Reject the whole tick
+    // before changing timing or the baseline, otherwise recovery double counts
+    // trades. A new trading date resets the baseline below.
+    if (this.last_time && day(at) === day(this.last_time) && this.last_volume !== null && cumulative_volume < this.last_volume) return null;
     const bucket = new Date(Math.floor(+at / FIVE_MINUTES) * FIVE_MINUTES);
     if (this.last_time && day(at) !== day(this.last_time)) {
       this.bars.length = 0;

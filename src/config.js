@@ -51,7 +51,7 @@ export const FIELDS = [
   ['max_account_gross_pct','Maximum gross exposure fraction of reference assets','number'],['max_account_risk_pct','Maximum estimated account stress loss fraction','number'],['unprotected_stress_pct','Stress move for exposure without a verified stop','number'],
   ['correlation_filter','Limit historically correlated exposure','checkbox'],['max_correlation','Daily return correlation threshold','number'],['max_correlated_exposure_pct','Maximum correlated group fraction of reference assets','number'],
   ['max_trades_per_day','Maximum new symbols attempted per day','number'],['loss_streak_limit','Consecutive realized loss events before cooldown','number'],['loss_cooldown_minutes','Loss cooldown (minutes)','number'],
-  ['auto_research','Automatically refresh research after Zerodha connection','checkbox'],['research_symbols','Historical research sample size','number'],['research_days','Historical research lookback (calendar days)','number'],
+  ['auto_research','Automatically refresh daily research when account data is ready','checkbox'],['research_symbols','Historical research sample size','number'],['research_days','Historical research lookback (calendar days)','number'],
   ['research_fee_rate','Research estimated costs per side (fraction)','number'],['research_slippage_rate','Research adverse slippage per side (fraction)','number'],
 ].map(([key,label,type,choices])=>({key,label,type,choices}));
 /** Resolve existing parents as well as the final path, including directory links. */

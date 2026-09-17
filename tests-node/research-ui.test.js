@@ -113,3 +113,49 @@ test('failed status refresh preserves existing research results and displays the
   h.customGet(()=>{throw new Error('Research transport unavailable');});await assert.rejects(h.run('loadResearch()'),/Research transport unavailable/);
   assert.equal(h.elements.get('research-metrics-body').innerHTML,previous);assert.equal(h.elements.get('research-error').textContent,'Research transport unavailable');assert.equal(h.elements.get('research-refresh').disabled,false);
 });
+
+test('automatic research exposes retry time and cancellation without losing the previous report',async()=>{
+  const h=await harness();
+  h.setResearch({status:'failed',report:report(),automation:{enabled:true,status:'retry_wait',reason:'Historical data unavailable. Automatic retry scheduled.',next_retry_at:'2026-09-17T10:15:00+05:30'}});
+  await h.run('loadResearch()');
+  assert.equal(h.elements.get('research-report').hidden,false);
+  assert.match(h.elements.get('research-auto-note').textContent,/Automatic retry scheduled/);
+  assert.match(h.elements.get('research-auto-note').textContent,/10:15.*IST/);
+  assert.equal(h.elements.get('research-cancel').disabled,false);
+  h.setResearch({status:'cancelled',report:report(),automation:{enabled:true,status:'cancelled',reason:'Automatic research paused for this configuration. Run analysis to resume.',next_retry_at:null}});
+  await h.run('loadResearch()');
+  assert.match(h.elements.get('research-auto-note').textContent,/Run analysis to resume/);
+  assert.doesNotMatch(h.elements.get('research-auto-note').textContent,/Next automatic check/);
+  assert.equal(h.elements.get('research-report').hidden,false);
+  assert.equal(h.elements.get('research-cancel').disabled,true);
+});
+
+test('armed engine waiting for funds remains pausable and does not display active trading',async()=>{
+  const h=await harness();
+  h.setState({...current(),waiting_for_funds:true,message:'Add funds in Zerodha. The program checks balances automatically.'});
+  assert.equal(h.elements.get('engine-status').textContent,'Waiting for funds');
+  assert.match(h.elements.get('engine-dot').className,/amber/);
+  assert.equal(h.elements.get('start').disabled,true);
+  assert.equal(h.elements.get('pause').disabled,false);
+  h.setState({...current(),waiting_for_funds:false});
+  assert.equal(h.elements.get('engine-status').textContent,'Trading active');
+  h.setState({...current(),status:'paused',maintenance:false,waiting_for_funds:true});
+  assert.equal(h.elements.get('engine-status').textContent,'Entries paused');
+  assert.equal(h.elements.get('start').disabled,false);
+  assert.equal(h.elements.get('pause').disabled,true);
+});
+
+test('clock mismatch is visible with synchronization guidance and clears after a fresh aligned observation',async()=>{
+  const h=await harness();
+  h.setState({...current(),broker_clock:{status:'skewed',blocked:true,stale:false,offset_lower_ms:222000,offset_upper_ms:224000}});
+  assert.equal(h.elements.get('clock-status').hidden,false);
+  assert.match(h.elements.get('clock-status').textContent,/223 seconds behind/);
+  assert.match(h.elements.get('clock-status').textContent,/New entries wait/);
+  assert.equal(h.elements.get('engine-status').textContent,'Waiting for clock verification');
+  assert.equal(h.elements.get('pause').disabled,false);
+  h.setState({...current(),broker_clock:{status:'aligned',blocked:false,stale:false}});
+  assert.equal(h.elements.get('clock-status').hidden,true);
+  h.setState({...current(),broker_clock:{status:'uncertain',blocked:false,stale:true}});
+  assert.equal(h.elements.get('clock-status').hidden,false);
+  assert.match(h.elements.get('clock-status').textContent,/recent broker clock check/);
+});

@@ -12,6 +12,16 @@ test('breadth excludes stale and illiquid data and fails closed on insufficient 
   quotes[1].received_at=99;quotes[1].last_price=80;assert.equal(marketBreadth(universe,quotes,settings,100).status,'defensive');
 });
 
+test('exit-only recovered instruments neither contribute to equity breadth nor dilute its coverage',()=>{
+  const settings={...DEFAULTS,min_market_samples:1,min_market_coverage:1,min_daily_turnover:0};
+  const universe={1:{entry_eligible:true},2:{entry_eligible:false},3:{entry_eligible:false}};
+  const quotes={1:{received_at:99,last_price:90,ohlc:{open:100},volume_traded:100},2:{received_at:99,last_price:150,ohlc:{open:100},volume_traded:100}};
+  const report=marketBreadth(universe,quotes,settings,100);
+  assert.equal(report.coverage,1);assert.equal(report.total,1);assert.equal(report.advancing,0);assert.equal(report.breadth,0);assert.equal(report.status,'defensive');
+  universe[1].entry_eligible=false;const empty=marketBreadth(universe,quotes,settings,100);
+  assert.equal(empty.coverage,0);assert.equal(empty.total,0);assert.equal(empty.status,'warming_up');
+});
+
 test('portfolio accounts for manual, pledged, T1 and journal risk without duplicating broker cover exposure',()=>{
   const result=portfolioExposure({settings:DEFAULTS,cash:10000,capital:10000,
     account:{holdings:[{tradingsymbol:'MANUAL',exchange:'NSE',quantity:50,t1_quantity:10,collateral_quantity:40,used_quantity:5,last_price:100}],positions:{net:[{tradingsymbol:'BOT',exchange:'NSE',product:'MIS',quantity:10,last_price:100}]}},
@@ -101,4 +111,108 @@ test('terminal delivery IOC entries release canceled quantity while unresolved e
     assert.equal(pendingDeliveryQuantity(position,delivery),6,JSON.stringify(intent));
     assert.equal(portfolioExposure({...args,delivery}).gross_exposure,1000,JSON.stringify(intent));
   }
+});
+
+function pendingOrder(overrides={}){return {order_id:'manual-one',exchange:'NSE',tradingsymbol:'MANUAL',product:'MIS',variety:'regular',
+  transaction_type:'BUY',order_type:'LIMIT',status:'OPEN',quantity:1000,filled_quantity:0,pending_quantity:1000,price:100,...overrides};}
+function pendingPortfolio(orders,overrides={}){return portfolioExposure({settings:DEFAULTS,cash:80000,capital:100000,mode:'live',
+  account:{holdings:[],positions:{net:[]},orders},...overrides});}
+
+test('pending manual buys and shorts reserve full unleveraged notional before another symbol can enter',()=>{
+  for(const transaction_type of ['BUY','SELL']){
+    const report=pendingPortfolio([pendingOrder({transaction_type})],{clock:100,universe:{1:{tradingsymbol:'MANUAL'}},quotes:{1:{last_price:100,received_at:99}}});
+    assert.equal(report.gross_exposure,100000);assert.equal(report.rows[0].symbol,'MANUAL');
+    assert.equal(report.estimated_stress_loss,5000);assert.equal(report.reference_assets,80000);
+    assert.equal(portfolioEntryGate(report,{symbol:'OTHER',entry:100,stop:98,quantity:80},DEFAULTS),'account_gross_exposure');
+    assert.match(report.message,/pending orders/);
+  }
+});
+
+test('pending partial fills add only remaining quantity to the current broker position',()=>{
+  const order=pendingOrder({quantity:10,filled_quantity:4,pending_quantity:6});
+  const report=pendingPortfolio([order],{account:{orders:[order],holdings:[],positions:{net:[{exchange:'NSE',tradingsymbol:'MANUAL',product:'MIS',quantity:4,last_price:100}]}}});
+  assert.equal(report.gross_exposure,1000);assert.equal(report.rows[0].exposure,1000);
+  assert.equal(report.estimated_stress_loss,50);
+  for(const status of ['CANCEL PENDING','MODIFY PENDING'])assert.equal(pendingPortfolio([{...order,status,pending_quantity:0}]).gross_exposure,600,'Unconfirmed cancellation does not release the remainder');
+  for(const status of ['CANCELLED','REJECTED','COMPLETE'])assert.equal(pendingPortfolio([{...order,status}]).gross_exposure,0,'Terminal orders have no outstanding reservation');
+});
+
+test('manual market orders need a current price and malformed order risk fails closed',()=>{
+  const market=pendingOrder({order_type:'MARKET',price:0});
+  let report=pendingPortfolio([market]);assert.deepEqual(report.unpriced_symbols,['MANUAL']);
+  assert.equal(portfolioEntryGate(report,{symbol:'OTHER',entry:100,stop:98,quantity:1},DEFAULTS),'account_exposure_unverified');
+  const context={clock:100,universe:{1:{tradingsymbol:'MANUAL'}},quotes:{1:{last_price:101,received_at:99}}};
+  assert.equal(pendingPortfolio([market],context).gross_exposure,101000);
+  assert.deepEqual(pendingPortfolio([pendingOrder({transaction_type:'SELL'})]).unpriced_symbols,['MANUAL'],'A sell limit is not an upper bound on short notional');
+  assert.deepEqual(pendingPortfolio([market],{...context,quotes:{1:{last_price:101,received_at:0}}}).unpriced_symbols,['MANUAL']);
+  const bad=[null,{},pendingOrder({order_id:''}),pendingOrder({transaction_type:'UNKNOWN'}),pendingOrder({product:'NRML'}),pendingOrder({exchange:'NFO'}),
+    pendingOrder({filled_quantity:null}),pendingOrder({pending_quantity:null}),pendingOrder({quantity:true}),pendingOrder({quantity:[1000]}),pendingOrder({quantity:NaN}),pendingOrder({quantity:1.5}),
+    pendingOrder({filled_quantity:1001}),pendingOrder({pending_quantity:1001}),pendingOrder({price:-100}),pendingOrder({order_type:'SL-M',trigger_price:0})];
+  for(const order of bad){report=pendingPortfolio([order]);assert.equal(portfolioEntryGate(report,{symbol:'OTHER',entry:100,stop:98,quantity:1},DEFAULTS),'account_exposure_unverified',JSON.stringify(order));}
+  assert.equal(portfolioEntryGate(pendingPortfolio({unexpected:true}),{symbol:'OTHER',entry:100,stop:98,quantity:1},DEFAULTS),'account_exposure_unverified');
+  assert.equal(portfolioEntryGate(pendingPortfolio([pendingOrder(),pendingOrder()]),{symbol:'OTHER',entry:100,stop:98,quantity:1},DEFAULTS),'account_exposure_unverified');
+});
+
+test('a pending-only journal reservation has finite stress before any position exists',()=>{
+  const report=pendingPortfolio([],{intents:{queued:{symbol:'BOT',quantity:10,filled:0,entry:100,state:'submitting'}}});
+  assert.equal(report.gross_exposure,1000);assert.equal(report.estimated_stress_loss,50);
+});
+
+test('managed pending cover entries and recognized protective children are not counted twice',()=>{
+  for(const side of ['BUY','SELL']){
+    const parent=pendingOrder({order_id:'owned-parent',tag:'owned-tag',tradingsymbol:'OWNED',variety:'co',transaction_type:side,quantity:10,filled_quantity:4,pending_quantity:6});
+    const child=pendingOrder({order_id:'owned-stop',parent_order_id:'owned-parent',tradingsymbol:'OWNED',variety:'co',transaction_type:side==='BUY'?'SELL':'BUY',
+      order_type:'SL-M',price:0,trigger_price:side==='BUY'?98:102,status:'TRIGGER PENDING',quantity:4,filled_quantity:0,pending_quantity:4});
+    const intents={['owned-tag']:{tag:'owned-tag',symbol:'OWNED',side,order_id:'owned-parent',quantity:10,filled:4,entry:100,state:'pending',broker_children:[child]}};
+    const positions={OWNED:{symbol:'OWNED',side,tag:'owned-tag',quantity:4,entry:100,last:100,stop:side==='BUY'?98:102,protection:'broker_cover'}};
+    const input={intents,positions,account:{holdings:[],orders:[parent,child],positions:{net:[{exchange:'NSE',tradingsymbol:'OWNED',product:'MIS',quantity:side==='BUY'?4:-4,last_price:100}]}}};
+    const report=pendingPortfolio([],input);assert.equal(report.gross_exposure,1000);assert.deepEqual(report.unsupported_symbols,[]);assert.deepEqual(report.unpriced_symbols,[]);
+    assert.equal(report.estimated_stress_loss,38);
+    const changed={...parent,price:110};assert.equal(pendingPortfolio([],{...input,account:{...input.account,orders:[changed,child]}}).gross_exposure,1060,'A higher broker limit increases the existing reservation');
+    const unrelated={...parent,order_id:'unowned',tag:'unowned-tag'};
+    assert.equal(pendingPortfolio([],{...input,account:{...input.account,orders:[parent,child,unrelated]}}).gross_exposure,1600,'Same symbol does not establish journal ownership');
+    const excessive={...child,order_id:'other-stop'};intents['owned-tag'].broker_children.push(excessive);
+    const tooMany=pendingPortfolio([],{...input,account:{...input.account,orders:[parent,child,excessive]}});
+    assert.equal(portfolioEntryGate(tooMany,{symbol:'OTHER',entry:100,stop:98,quantity:1},DEFAULTS),'account_exposure_unverified','Two independently executable exits cannot both consume the same owned shares');
+  }
+});
+
+test('a confirmed broker order ID cannot be replaced by a matching tag on another order',()=>{
+  for(const side of ['BUY','SELL']){
+    const order=pendingOrder({order_id:'different-order',tag:'owned-tag',tradingsymbol:'OWNED',variety:'co',transaction_type:side,quantity:10,pending_quantity:10});
+    const intent={tag:'owned-tag',symbol:'OWNED',side,order_id:'confirmed-order',quantity:10,filled:0,entry:100,state:'pending'};
+    const input={intents:{'owned-tag':intent},clock:100,universe:{1:{tradingsymbol:'OWNED'}},quotes:{1:{last_price:100,received_at:99}}};
+    assert.equal(pendingPortfolio([order],input).gross_exposure,2000,'A distinct order retains its own exposure even when the confirmed order is absent from the snapshot');
+    assert.equal(pendingPortfolio([{...order,order_id:'confirmed-order'}],input).gross_exposure,1000,'The confirmed order is deduplicated');
+    delete intent.order_id;intent.state='unknown';
+    assert.equal(pendingPortfolio([order],input).gross_exposure,1000,'Tag recovery remains available before acknowledgement');
+  }
+  const entry=pendingOrder({order_id:'different-entry',tag:'entry-tag',tradingsymbol:'DELIVERY',product:'CNC',quantity:10,pending_quantity:10});
+  const p={symbol:'DELIVERY',source:'swing',status:'entry_pending',requested_quantity:10,quantity:0,remaining_quantity:0,entry_price:100,entry_intent:'entry-tag'};
+  const delivery={positions:{DELIVERY:p},intents:{'entry-tag':{id:'entry-tag',order_id:'confirmed-entry',state:'acknowledged',payload:{quantity:10}}}};
+  assert.equal(pendingPortfolio([entry],{delivery}).gross_exposure,2000,'CNC reservations also require the confirmed ID');
+  delete delivery.intents['entry-tag'].order_id;delivery.intents['entry-tag'].state='unknown';
+  assert.equal(pendingPortfolio([entry],{delivery}).gross_exposure,1000);
+  delivery.intents['entry-tag'].state='terminal';Object.assign(p,{status:'exit_pending',quantity:4,remaining_quantity:4,exit_intents:['exit-tag']});
+  delivery.intents['exit-tag']={id:'exit-tag',order_id:'confirmed-exit',state:'acknowledged',payload:{quantity:4}};
+  const exit=pendingOrder({order_id:'different-exit',tag:'exit-tag',tradingsymbol:'DELIVERY',product:'CNC',transaction_type:'SELL',quantity:4,pending_quantity:4});
+  const account={holdings:[],orders:[exit],positions:{net:[{exchange:'NSE',tradingsymbol:'DELIVERY',product:'CNC',quantity:4,last_price:100}]}};
+  assert.equal(pendingPortfolio([],{account,delivery}).gross_exposure,800,'A distinct tagged exit cannot consume the managed exit exemption');
+  exit.order_id='confirmed-exit';assert.equal(pendingPortfolio([],{account,delivery}).gross_exposure,400);
+  exit.order_id='different-exit';delete delivery.intents['exit-tag'].order_id;delivery.intents['exit-tag'].state='unknown';
+  assert.equal(pendingPortfolio([],{account,delivery}).gross_exposure,400,'An unacknowledged exit retains tag recovery');
+});
+
+test('managed CNC entry reservations and associated IOC/GTT exits preserve their existing exposure',()=>{
+  const entry=pendingOrder({order_id:'cnc-entry',tag:'entry-tag',tradingsymbol:'DELIVERY',product:'CNC',quantity:10,filled_quantity:4,pending_quantity:6});
+  const p={symbol:'DELIVERY',source:'swing',status:'entry_pending',requested_quantity:10,quantity:4,remaining_quantity:4,entry_price:100,entry_intent:'entry-tag'};
+  const delivery={positions:{DELIVERY:p},intents:{'entry-tag':{id:'entry-tag',order_id:'cnc-entry',state:'acknowledged',payload:{quantity:10}}}};
+  const account={orders:[entry],holdings:[],positions:{net:[{exchange:'NSE',tradingsymbol:'DELIVERY',product:'CNC',quantity:4,last_price:100}]}};
+  assert.equal(pendingPortfolio([],{account,delivery}).gross_exposure,1000);
+  Object.assign(delivery.intents['entry-tag'],{state:'terminal',order:{status:'CANCELLED'}});account.orders=[];p.status='exit_pending';
+  const exit=pendingOrder({order_id:'cnc-exit',tag:'exit-tag',tradingsymbol:'DELIVERY',product:'CNC',transaction_type:'SELL',quantity:4,pending_quantity:4});
+  p.exit_intents=['exit-tag'];delivery.intents['exit-tag']={id:'exit-tag',order_id:'cnc-exit',state:'acknowledged',payload:{quantity:4}};account.orders=[exit];
+  assert.equal(pendingPortfolio([],{account,delivery}).gross_exposure,400);
+  p.exit_intents=[];p.gtt_order_ids=['cnc-exit'];p.gtt_orders={'cnc-exit':exit};assert.equal(pendingPortfolio([],{account,delivery}).gross_exposure,400);
+  p.gtt_order_ids=[];p.gtt_orders={};assert.equal(pendingPortfolio([],{account,delivery}).gross_exposure,800,'Unassociated manual sells are conservatively treated as potential additional exposure');
 });
