@@ -8,6 +8,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 data/
+config/
 node_modules/
 dist/
 *.tar.gz

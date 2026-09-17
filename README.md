@@ -1,238 +1,177 @@
 # StockPilot
 
-A self-hosted Zerodha trading workstation for Windows. Sign in to the private dashboard, select **Start Trading**, complete the official Zerodha login, and return to continuous account monitoring and the enabled strategies. Closing the browser or signing out does not stop the trading process.
+A self-hosted Zerodha trading dashboard for **Windows, macOS and Linux**, running on **Node.js 24.9 or newer**. Sign in as the administrator, select **Start Trading**, complete Zerodha's official login, and monitor account activity and the enabled strategies. No Python runtime is required.
 
-**The default is paper trading.** Prices and account information come from Zerodha; paper orders are simulated. Real order execution is implemented but requires explicit server configuration, your whitelisted outbound static IP, capital allocation, valid Kite access and the relevant account permissions. These are research strategies, not validated profitable models.
+**Paper trading is the default.** It reads your actual Zerodha account and market data but simulates orders. Live execution requires changing Settings, valid broker permissions and the required outbound static IP. The strategies are deterministic research rules; they have not been established as profitable.
 
-## What is included
+## What the application does
 
-- Responsive dashboard: account cash, delivery holdings, all account positions, orders, trades, strategy equity, scanner progress, CPU/RAM usage and an activity timeline.
-- Intraday and swing strategies with separate allocations. Intraday is enabled by default; swing starts disabled.
-- Existing-holdings exit analysis, with automatic management limited to selected symbols by default. Settings also supports all existing NSE holdings. Unselected holdings are observed only.
-- Full available NSE EQ instrument scan, up to three Kite WebSocket connections, completed-candle analysis and rate-limited historical warmup.
-- Parallel CPU analysis with lazy worker pools. Automatic capacity uses available logical CPUs minus four; this machine reports 192 logical CPUs and 128 GB RAM, so the ceiling is 188 workers. Workloads activate workers as needed. Only one execution process can use a data directory.
-- Live intraday cover orders with broker-held protection; live delivery IOC limit entries and confirmed-fill GTT protection. Unresolved order outcomes block new entries.
-- Durable SQLite audit history, encrypted broker sessions, Argon2 admin passwords, server-side sessions, CSRF protection and login rate limiting.
-- Runs directly from this checkout with Python. No Node build or `node_modules` is required.
+- Shows account cash, holdings, positions, orders, trades, strategy P&L, scanner coverage, CPU/RAM usage and a durable activity log.
+- Supports intraday and swing trading. Intraday starts enabled with 100% of the strategy allocation; swing starts disabled with 0%.
+- Analyzes existing holdings for exits. Automatic selling is limited to selected symbols by default; the initial selection is empty. You can select symbols or all eligible NSE holdings in Settings.
+- Scans the available NSE EQ universe, including any ETFs classified as EQ, using completed candles and fresh market data.
+- Runs CPU analytics in lazy Node worker threads while one coordinated execution service handles orders.
+- Journals order intentions before broker mutations, reconciles actual fills and protection, and re-evaluates exposure after a restart.
 
-For the exact signal formulas, buy/sell decisions, position sizing and worked examples, read the [logic and analytics guide](docs/LOGIC_AND_ANALYTICS.md).
+Read the [logic and analytics guide](docs/LOGIC_AND_ANALYTICS.md) for formulas, order lifecycles, risk checks, recovery behavior and worked examples.
 
-## Set up Windows and Python
+## Install and start
 
-Use 64-bit Python 3.12 or newer; this project has been tested on Python 3.13. Install `cloudflared` using [Cloudflare's Windows downloads](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/) and make it available on your PATH. Node.js is optional and used only for JavaScript checks, not to run the app.
+Install [Node.js](https://nodejs.org/en/download) version **24.9 or newer** and, for remote access, [Cloudflare's `cloudflared`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/). Open a terminal in this project directory. On the current Windows machine that directory is `D:\Projects\Stock`; on macOS or Linux use the directory where you copied the source.
 
-In PowerShell:
+Run these commands on all three platforms:
 
-```powershell
-Set-Location D:\Projects\Stock
-python --version
-cloudflared --version
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m app.cli init
+```sh
+node --version
+npm ci
+npm run setup
 ```
 
-`init` asks for an administrator username and a password of at least 14 characters, with confirmation. It creates `.env` with the password hash and random security/encryption keys. This is your StockPilot administrator login, separate from your Zerodha login. If `.env` already exists, edit that file instead; `init` refuses to overwrite it. The commands use the virtual environment directly, so PowerShell activation is unnecessary.
+Setup creates `config/settings.json` with defaults, a password hash and random security keys, and copies `.env.example` to `.env` if that file is absent. For a new installation, it prints the initial administrator password in the terminal; save it before closing that terminal. The default username is **admin**. Existing configuration is retained. These are dashboard credentials, separate from your Zerodha credentials.
 
-## Configure `.env`
-
-Open `D:\Projects\Stock\.env` in your editor. Keep the generated `ADMIN_PASSWORD_HASH`, `SESSION_SECRET`, and `TOKEN_ENCRYPTION_KEY` values. Fill in the three Kite fields, using your app's credentials from the [Kite developer console](https://developers.kite.trade/) and your own Zerodha client ID:
+Create or edit `.env` in the project directory using these **three fields only**:
 
 ```dotenv
 KITE_API_KEY='your-app-api-key'
 KITE_API_SECRET='your-app-api-secret'
 KITE_USER_ID='AB1234'
-TRADING_MODE=paper
-LIVE_TRADING_ENABLED=false
-PAPER_CAPITAL=100000
-LIVE_CAPITAL=0
 ```
 
-Replace the example credentials with your own. All three Kite fields can remain empty to inspect the disconnected dashboard, but **Start Trading** needs valid credentials and account access to historical/streaming market data. The application obtains the access token after the official login; do not add your Zerodha password or a manually copied access token to `.env`.
+Use the credentials from your [Kite developer account](https://developers.kite.trade/) and your Zerodha client ID. The same keys are shown in [.env.example](.env.example). Do not put a Zerodha password, request token or access token in this file. Empty Kite fields allow inspection of the disconnected dashboard; connecting requires all three credentials and the relevant data access.
 
-| Setting | What to configure |
+Then run:
+
+```sh
+npm run check
+npm start
+```
+
+Open **http://localhost:3000**, sign in, and open **Settings**. `npm run check` validates local configuration without contacting Zerodha; it cannot prove that broker credentials or subscriptions work. Restart after changing the three `.env` credentials. Process environment values for those credentials take precedence over `.env`.
+
+The server listens on the local loopback interface. Keep the `npm start` terminal open. Run only one server for a given data directory; do not use a process manager's cluster mode. CPU analysis already uses its own workers.
+
+## Configure everything else in Settings
+
+All non-Kite configuration has defaults and is managed from the dashboard. No extra environment variables are needed for ports, admin credentials, risk limits, worker counts or security keys. The dashboard detects its public address from the current browser request through the local tunnel; there is no `PUBLIC_URL` or development/production mode to maintain.
+
+| Settings area | Controls and defaults |
 |---|---|
-| `APP_ENV` | `development` for local HTTP; `production` for the public HTTPS tunnel. |
-| `PUBLIC_URL` | The exact browser origin, such as `http://localhost:3000` or `https://your-tunnel.trycloudflare.com`. No callback path, query, or credentials. This does not set Uvicorn's listening port. |
-| `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH` | Created by `init`. The hash is not a plaintext password. To change the password later, run `.\.venv\Scripts\python.exe -m app.cli hash-password`, then replace the hash in `.env` inside single quotes. |
-| `SESSION_SECRET`, `TOKEN_ENCRYPTION_KEY` | Generated by `init`. Keep these stable across restarts. Changing them invalidates dashboard sessions or prevents saved broker sessions from being decrypted. |
-| `DATA_DIR` | Defaults to `data`, relative to the working directory. Contains the database and process lock; keep it across restarts and source changes. |
-| `TRADING_MODE`, `LIVE_TRADING_ENABLED`, `LIVE_CAPITAL` | Defaults are `paper`, `false`, and `0`. Real orders require `live`, `true`, and an explicit positive allocation in rupees. |
-| `PAPER_CAPITAL` | Simulated starting capital in rupees; default `100000`. |
+| Strategies | Intraday enabled, 100% allocation; swing disabled, 0%. Allocations together must not exceed 100%. |
+| Existing holdings | Selected symbols, initially empty; optionally all eligible NSE holdings. |
+| Execution | Paper mode; real order execution disabled. Both live mode and live execution must be enabled for real orders. |
+| Server | Local port `3000`; data directory `data`. |
+| Risk | Risk per trade `0.0025` (0.25%); maximum position allocation `0.10` (10%); daily loss limit `0.01` (1%); maximum five bot positions. |
+| Market filters | Maximum spread `0.003` (0.3%); minimum turnover estimate Rs 10,000,000. |
+| Intraday times | Entry cutoff `14:45`; exit target `15:10`, both India Standard Time. |
+| Analytics | Workers `0` means automatic; reserve four logical CPUs; batch size 32. |
+| Administrator/security | Change admin username/password and rotate generated security keys. Current password is required; dashboard sessions are revoked after a change. |
 
-Risk and analytics settings may initially keep their defaults:
+Risk inputs labeled **fraction** use `0.01` for 1%. Strategy allocations labeled **percent** use `100` for 100%.
 
-| Setting | Default | Meaning |
-|---|---|---|
-| `MAX_POSITION_PCT` | `0.10` | Maximum capital allocation per stock: 10%. |
-| `RISK_PER_TRADE_PCT` | `0.0025` | Planned risk per trade: 0.25% of allocated capital. |
-| `DAILY_LOSS_PCT` | `0.01` | Daily strategy loss threshold: 1%. |
-| `MAX_POSITIONS` | `5` | Maximum simultaneous managed strategy positions. |
-| `ENTRY_CUTOFF`, `EXIT_TIME` | `14:45`, `15:10` | Intraday entry cutoff and close target, in India Standard Time. |
-| `MAX_SPREAD_PCT` | `0.003` | Maximum bid/ask spread fraction: 0.3%. |
-| `MIN_DAILY_TURNOVER` | `10000000` | Minimum daily turnover filter in rupees. |
-| `ANALYTICS_WORKERS` | `0` | Automatic CPU worker capacity. A positive number requests a fixed ceiling, capped at the detected logical CPU count. |
-| `ANALYTICS_RESERVE_CPUS` | `4` | CPUs left available when worker capacity is automatic. |
-| `ANALYTICS_BATCH_SIZE` | `32` | Instruments grouped in each analysis task. |
+Trading capital comes from the connected account's cash information; there is no manually entered starting capital. Paper simulation retains its initialized capital and journal across restarts so signing in again does not reset simulated gains, losses or exposure. Existing share value and collateral are not automatically spendable cash. The guide explains capital and allocation calculations.
 
-Intraday/swing enablement, their capital allocations, and permission to sell existing holdings are configured in the dashboard's **Settings** page and saved in the database. Their allocations must fit the configured trading capital. Intraday starts enabled; swing starts disabled; existing holdings start with an empty selected-symbol list.
+An account with no available cash can still start management of authorized existing holdings or previously managed positions. New buys remain blocked until their funding and risk checks pass.
 
-Keep `.env` private and restrict its Windows file permissions to your account. Never commit it or print it in logs. Run the app from this project directory so `.env` and relative data paths are consistent. Existing Windows/process environment variables take precedence over `.env`; clear stale overrides if an edit appears ineffective. Restart the Python server after changing `.env`.
+Strategy/holding settings apply without a server restart after entries are paused and managed exposure and pending orders are resolved. Application settings require the same checks; saving them stops the engine and marks the server for restart. Stop with **Ctrl+C**, wait for shutdown, then run `npm start` again. The UI tells you when a restart is required. Administrator/password changes take effect immediately and require another dashboard login.
 
-Check configuration syntax without printing credentials or contacting Zerodha:
+Settings are stored in `config/settings.json`; strategy permissions and journals are in the SQLite database under the selected data directory. Keep both directories and `.env` private and backed up. Generated encryption keys are necessary to read saved broker sessions; rotate them using Settings instead of replacing them by hand.
 
-```powershell
-.\.venv\Scripts\python.exe -c "from app.config import Settings; Settings.from_env(); print('Configuration is valid')"
-```
+## Connect through Cloudflare Tunnel
 
-This checks configuration format, not whether Kite credentials or subscriptions are valid.
+With `npm start` running on its default port, open a second terminal:
 
-## Run with Cloudflare Tunnel on port 3000
-
-**1. Start the app locally.** For the first run, leave these values in `.env`:
-
-```dotenv
-APP_ENV=development
-PUBLIC_URL=http://localhost:3000
-```
-
-In the first PowerShell window, from `D:\Projects\Stock`, run:
-
-```powershell
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 3000 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-access-log
-```
-
-Open `http://localhost:3000` to check the administrator login. Leave trading paused while completing the tunnel setup. Use **one** Uvicorn worker; analytics uses its own process pools. Do not use `--reload` with a trading session. Access logging is disabled so the login callback's request token is not written to the terminal.
-
-**2. Start the tunnel.** In a second PowerShell window:
-
-```powershell
+```sh
 cloudflared tunnel --url http://localhost:3000
 ```
 
-Copy the HTTPS address printed by `cloudflared`, for example `https://your-tunnel.trycloudflare.com`. Keep the tunnel window open. If the tunnel cannot connect to localhost because of IPv6 resolution, use `--url http://127.0.0.1:3000` instead.
+Open the printed HTTPS address, for example `https://your-tunnel.trycloudflare.com`, and sign in there. If localhost resolves to an unavailable IPv6 listener, use `--url http://127.0.0.1:3000` instead. Keep the original public Host header when configuring a tunnel; do not rewrite it to localhost.
 
-**3. Set the public origin and restart the app.** Edit these values in `.env`, using the actual tunnel address:
+In dashboard **Settings**, copy the detected callback URLs into your Kite app in the [developer console](https://developers.kite.trade/):
 
-```dotenv
-APP_ENV=production
-PUBLIC_URL=https://your-tunnel.trycloudflare.com
-```
-
-In the app window, press **Ctrl+C** once, wait for shutdown, then run the same Uvicorn command again. Leave `cloudflared` running during this restart. Browse and sign in through the **HTTPS tunnel address**, including when using this same PC. Sessions are tied to that browser host, and HTTPS enables secure cookies; a localhost login cannot complete a callback on a different domain. Keep Cloudflare's original public Host header; do not override it to `localhost`.
-
-**4. Configure the Kite app URLs.** In the Kite developer console, set these two different fields using your actual tunnel hostname:
-
-| Kite app field | Value |
+| Kite field | Example |
 |---|---|
 | Redirect URL | `https://your-tunnel.trycloudflare.com/auth/kite/callback` |
 | Postback URL | `https://your-tunnel.trycloudflare.com/api/kite/postback` |
 
-The redirect returns your browser after Zerodha login. The postback receives server-to-server JSON order notifications; it is not a login URL and opening it in a browser is not a valid test. The app validates the postback checksum and account, logs the receipt, and obtains order state separately from the broker before acting. HTTP postbacks cover orders placed through this API app; WebSocket updates and account reconciliation continue to monitor other account activity. [Kite documents authentication](https://kite.trade/docs/connect/v3/user/) and [postback validation and scope](https://kite.trade/docs/connect/v3/postbacks/).
+The redirect returns your browser after broker login. The postback receives signed broker order notifications; opening it in a browser is not a valid test. The server validates notifications and separately reconciles broker state before treating an order as filled. Postbacks cover orders placed through this API app; streaming and account reconciliation also observe other account activity. [Kite authentication](https://kite.trade/docs/connect/v3/user/), [postback documentation](https://kite.trade/docs/connect/v3/postbacks/).
 
-If you later put Cloudflare Access or browser challenges in front of the site, allow Zerodha's server to reach the exact postback path without an interactive sign-in; the endpoint performs its own checksum validation. Browser admin routes still require StockPilot authentication.
+Select **Start Trading** from that HTTPS dashboard and complete Zerodha's login in the same browser. Dashboard sessions and the pending broker login are bound to their origin: starting on localhost and returning to the tunnel will not complete the same session.
 
-**5. Sign in and connect.** On the HTTPS dashboard, check **Settings**, select **Start Trading**, sign in to Zerodha, and return to the dashboard. The mode badge should remain **PAPER** during initial validation. No real orders are sent in this mode, though data and account information come from your actual account.
+Quick Tunnels use temporary random hostnames, have no uptime guarantee, and do not support Server-Sent Events. StockPilot uses periodic HTTP polling on `trycloudflare.com` and falls back to polling when streaming fails elsewhere. For continued use, configure a managed tunnel with a stable hostname. [Cloudflare Quick Tunnel documentation](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/).
 
-### Tunnel lifecycle and live updates
+When a Quick Tunnel's hostname changes, visit the new address, sign in, and update **both Kite URL fields** using Settings. You do not need to edit `.env` or restart the app just because the hostname changed. If Cloudflare Access or browser challenges protect the site, Zerodha must still be able to POST to the exact postback path without interactive authentication; that path has its own checksum validation.
 
-Cloudflare Quick Tunnels generate a temporary random hostname and do not support Server-Sent Events (SSE). StockPilot automatically uses periodic HTTP polling on `*.trycloudflare.com` to keep the dashboard updating, and falls back to polling if streaming fails on other hosts. Polling refreshes roughly every two seconds plus request time. Broker market-data connections run separately on the server. [Cloudflare Quick Tunnel documentation](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/).
+The tunnel exposes incoming dashboard/callback traffic. It does **not** route outgoing broker requests through a fixed public IP. Zerodha requires a whitelisted static IP for API order placement, effective 1 April 2026; market-data streams and other read APIs can use other IPs. Whitelist this machine's actual static public outbound IP in your Kite developer account. A tunnel hostname does not replace this requirement. [Zerodha static-IP requirements](https://support.zerodha.com/category/trading-and-markets/general-kite/kite-api/articles/static-ip).
 
-After restarting a Quick Tunnel, check its printed hostname. If it changes, update `PUBLIC_URL` and both Kite URL fields, restart the app, and sign in at the new address. Cloudflare describes Quick Tunnels as development/testing tools with no uptime guarantee; use a managed tunnel with a stable hostname for ongoing operation. Its local service target is still `http://localhost:3000`.
+For local-only use, visit `http://localhost:3000` and register the corresponding local Redirect URL if connecting locally. Internet postbacks cannot reach localhost, so omit the Postback URL and rely on broker streaming/reconciliation. Remote mobile and desktop access use the HTTPS tunnel address.
 
-This tunnel provides inbound dashboard/callback access. It does not change the public outbound IP used by the Python program to contact Kite. Live order placement still needs that outbound static IP whitelisted in your Kite developer account. [Zerodha's static IP requirements](https://support.zerodha.com/category/trading-and-markets/general-kite/kite-api/articles/static-ip).
+## When Zerodha asks for holdings authorization
 
-### Stop and restart
+In live mode, selected existing holdings can be managed with DDPI/POA or sufficient current-day electronic authorization. When authorization is missing, the dashboard shows **Zerodha holdings authorization needed**, with the affected symbols and quantities. Existing-holding selection in Settings still controls which shares the program may manage.
 
-Keep both windows open while using the tunnel. Press **Ctrl+C** once in the app window and wait for shutdown to stop the program; stopping does not liquidate positions, and monitoring and application-managed exits stop with it. Stop the tunnel separately with **Ctrl+C** in its window. Stopping only the tunnel does not pause the trading engine. To restart the app, run the same Uvicorn command after confirming `PUBLIC_URL` still matches your tunnel.
+1. Select **Authorize holdings**. The app requests an authorization page from Kite and opens it on the official Zerodha site in a new tab.
+2. Complete the TPIN/OTP steps on Zerodha/CDSL. StockPilot never asks for, receives or stores your TPIN or OTP.
+3. Return to the dashboard and select **Check authorization**. Returning to the tab also requests a background check, but a broker rejection requires an explicit Check. The server reads current broker authorization dates and remaining quantities; a successful browser page alone does not authorize a sale.
+4. Once verified, the running engine re-evaluates current holdings, prices and exit conditions. Authorization itself submits no sell order and does not resume a paused engine.
 
-For local-only use, restore `APP_ENV=development` and `PUBLIC_URL=http://localhost:3000`, restart, and use the local origin. If connecting to Kite locally, update its Redirect URL to `http://localhost:3000/auth/kite/callback`; an internet postback cannot reach localhost, so leave the Postback URL unset and rely on broker streaming/reconciliation.
+Each request includes up to 100 holdings. If more need authorization, complete one batch, check it, then authorize the remaining batch. If a popup is blocked, use **Open Zerodha authorization page** in the banner. If Kite cannot create the page, open **Kite → Holdings → Authorise** manually, then return and select **Check authorization**. [Kite holdings authorization API](https://kite.trade/docs/connect/v3/portfolio/#holdings-authorisation), [Zerodha authorization instructions](https://support.zerodha.com/category/trading-and-markets/trading-faqs/general/articles/tpin-preauthorisation).
 
-### Troubleshooting
+Electronic authorization lasts for the trading day and needs renewal on a later day. An existing GTT does not remove this requirement; without DDPI/POA its future sale can be rejected while the app is offline. **New automated swing buys still require verified DDPI/POA**, because today's consent cannot ensure an unattended exit on another day. Normal intraday cover orders and paper trading do not use this demat authorization flow. [Zerodha authorization validity](https://support.zerodha.com/category/trading-and-markets/trading-faqs/general/articles/validity-of-cdsl-tpin-authorisation), [sell GTT authorization](https://support.zerodha.com/category/trading-and-markets/charts-and-orders/gtt/articles/why-was-my-sell-gtt-order-rejected).
+
+## Controls, shutdown and restart
+
+| Action | Result |
+|---|---|
+| Start/Resume Trading | Connects if needed, refreshes account state and enables entry decisions only after recovery and risk checks pass. |
+| Pause entries | Stops new buys and requests cancellation of known pending entries. Monitoring and exits for managed positions continue. |
+| Close managed positions | Requests exits for bot positions and already adopted existing holdings. It does not sell unselected/unadopted holdings or guarantee immediate fills. |
+| Holdings authorization needed | Blocks new entries while existing positions remain monitored. The affected delivery sale/protection waits for verified authorization. |
+| Close browser / sign out | Ends dashboard access; server trading continues. |
+| Stop only `cloudflared` | Removes remote dashboard/callback access; the local trading engine continues. |
+| Ctrl+C in the app terminal | Requests orderly engine shutdown, including pending-entry cancellation attempts. It does not liquidate positions. Wait until shutdown completes. |
+
+To restart, run `npm start`, reconnect the tunnel if necessary, sign in, and select **Start/Resume Trading**. A valid saved broker session can restore monitoring automatically; new entries remain paused until Start. Expired sessions require official Zerodha login again. Kite normally expires an access token at 06:00 the following day and can invalidate it earlier. [Kite token lifecycle](https://kite.trade/docs/connect/v3/user/).
+
+Recovery verifies balances, holdings, orders, positions, fills and protection against the saved journal. It discards stale decisions, prioritizes existing risk, loads recent completed candles and waits for fresh executable prices. Decisions use the current time: intraday entries stop at 14:45 IST; managed intraday positions past 15:10 or carried from an earlier day become exit candidates during an open session. Swing has a separate 15:15 entry cutoff.
+
+During shutdown, local targets, trailing rules and scheduled exits cannot run. Broker-held protection can remain active but cannot guarantee execution. Uncertain order acknowledgements or conflicting ownership remain blocked for review; repeated restarting does not authorize duplicate orders. See the dashboard's recovery status and [detailed recovery rules](docs/LOGIC_AND_ANALYTICS.md#10-controls-recovery-and-logs).
+
+## Moving from the previous Python version
+
+1. Stop the Python server and confirm it has exited. Never run both versions against the same account/journal simultaneously, even on different ports.
+2. With the old server stopped, back up its complete data directory and `.env`. Also back up `config/` if present. Do not copy only a live SQLite file while leaving its WAL files behind.
+3. Keep the same data directory and legacy `.env` for the first `npm run setup`. The loader imports recognized legacy settings, admin hash and encryption keys once when creating `config/settings.json`; an existing settings file is retained.
+4. Run `npm run check`, then `npm start`. Review Settings and verify recovery before resuming. Existing SQLite trading/audit journals and encrypted sessions use compatible formats. Old rupee allocations are normalized into percentages of their combined allocation; review them because formerly unallocated cash can now become allocated. Legacy paper journals without a saved starting baseline initialize it from current verified cash; old manually entered capital is no longer used.
+5. After setup preserves the legacy configuration, `.env` only needs the three Kite fields. Keep the private backup until migration and recovery have been verified.
+
+When moving to another operating system, copy source, `.env`, `config/` and the complete stopped data directory, then run `npm ci` on the destination. Do not copy `node_modules`; native dependencies must match the new platform. An absolute data directory from Windows must be changed to the correct destination path while the application is stopped. Do not delete the journal to make startup appear clean while real account exposure remains.
+
+## Resources, data and validation
+
+Automatic analytics capacity is logical CPUs minus four, with at least one worker. This machine reports **192 logical CPUs**, so its automatic ceiling is **188 worker threads**. Workers start as batches arrive and retire after being idle; they do not consume every core constantly. Broker rate limits and cold historical downloads often dominate startup time. Only one coordinated execution service sends orders.
+
+Intraday needs 21 contiguous completed five-minute candles and cannot qualify before approximately 11:00 IST. Swing needs 55 completed daily candles. Full-universe historical warmup can take tens of minutes. Missing or stale information prevents entries. Rules use breakouts, volume, candle shape, moving averages and ATR; RSI and regression diagnostics are explanatory metrics, not an AI prediction model.
+
+Run automated checks with:
+
+```sh
+npm test
+```
+
+Tests exercise application security, strategy calculations, real analytics workers, broker adapters, order recovery and UI polling with local fixtures. They do not establish profitability or prove real broker/tunnel operation. Paper fills omit order-queue dynamics; paper swing does not fully simulate the live GTT/trailing lifecycle. The [analytics guide](docs/LOGIC_AND_ANALYTICS.md) documents these differences.
+
+The dependency lock includes a patched `serialize-javascript` override because the Kite SDK includes an older Mocha test dependency in its published runtime dependencies. StockPilot uses Node's built-in test runner.
 
 | Symptom | Check |
 |---|---|
-| `cloudflared` is not recognized | Install the Windows executable, add its directory to PATH, and reopen PowerShell. |
-| Tunnel returns 502 | The app must be running on port 3000; check `http://127.0.0.1:3000/health`. Confirm both commands use the same port. |
-| `Unrecognized host` or `Invalid request origin` | `PUBLIC_URL` must match the HTTPS hostname you are visiting. Restart after edits and preserve the public Host header. |
-| Login expires during the Zerodha redirect | Begin the login from the configured HTTPS dashboard in the same browser. Check the registered Redirect URL, then use Start Trading again. |
-| Postback fails | Verify the exact Postback URL, matching Kite app secret/client ID, and that Cloudflare is not presenting an interactive challenge to Zerodha. |
-| Port 3000 is already in use | Choose another free port in both Uvicorn and `cloudflared`. The public HTTPS origin has no local port suffix. |
+| `node:sqlite` or engine-version error | Use Node.js 24.9 or newer, then run `npm ci`. |
+| PowerShell blocks `npm.ps1` | Use the corresponding `npm.cmd` command in that terminal. |
+| `cloudflared` not found | Install it and make its directory available on PATH. |
+| Tunnel returns 502 | Check `http://127.0.0.1:3000/health`; server and tunnel must target the same configured port. |
+| Redirect login expires | Begin on the exact HTTPS origin registered in Kite, in the same browser. Try Start Trading again after updating the URLs. |
+| No buying after connection | Inspect recovery, market hours, warmup, allocation and activity reasons; connection does not imply a qualifying signal. |
+| Holdings authorization banner remains | Finish the official TPIN/OTP flow, then select Check authorization; insufficient or prior-day broker authorization keeps sales blocked. |
+| Settings say restart required | Stop the app and run `npm start`; update the tunnel target if the local port changed. |
+| Account mismatch or unresolved exposure | Restore the correct account's data/configuration and reconcile broker activity before resuming. |
 
-## Session and controls
-
-1. Sign in using the administrator username and password created during setup.
-2. Set strategy allocations and existing-holdings permissions in **Settings**.
-3. Select **Start Trading**. If needed, the browser redirects to Zerodha. The server exchanges the returned request token and checks the account ID before enabling trading.
-4. Monitor the live dashboard. Market quotes stream continuously; account reconciliation runs roughly every 15 seconds, subject to broker response times. The dashboard streams updates about every two seconds, or polls on Quick Tunnels and when streaming is unavailable.
-5. **Pause entries** stops new buys and cancels pending entries where their status is known, while continuing account monitoring and management of existing positions. It does not liquidate the account.
-6. **Close managed positions** requests exits only for managed positions. Broker acknowledgement does not guarantee a fill; inspect the order and activity views.
-
-Kite access tokens expire daily. Reconnect through the official login as required. After a server restart, a still-valid encrypted broker session restores monitoring and position reconciliation, but new entries remain paused. Daily rollover also pauses new entries. Broker-held cover stops and GTTs can remain active when the program is offline; GTTs and stop orders cannot guarantee execution.
-
-## Restart after stopping or losing power
-
-Keep the same `.env`, encryption key, and `DATA_DIR` when restarting. Start Uvicorn and the tunnel using the commands above, sign in to the dashboard, and select **Start Trading** or **Resume trading**. Complete Zerodha login if the saved broker session has expired. Administrator sign-in by itself does not enable new trades; a successful Zerodha login initiated by Start Trading proceeds into account recovery automatically.
-
-Recovery reads the current broker account and compares it with the saved order journal. It verifies the account identity, balances, holdings, positions, orders and protection; clears queued decisions from the previous session; refreshes candles and prices; and re-evaluates managed holdings before permitting new buys. Existing positions and authorized holdings take priority over warming the rest of the market. The dashboard's **Account recovery** message explains whether account verification, market prices, history or an unresolved order is holding up new entries.
-
-The program uses the clock and prices at restart. It does not replay missed entry signals or pretend that it executed trades while offline:
-
-| Restart time or condition | Behavior |
-|---|---|
-| Before the regular session or when the market is closed | Reconcile available account state; wait for the session and fresh executable prices before trading. |
-| During the session | Review managed exposure first, then consider new qualifying signals once recovery and risk checks pass. |
-| At/after 14:45 IST | No new intraday buys; enabled swing entries still have their separate 15:15 cutoff. |
-| At/after 15:10 IST, or an intraday position is left from an earlier date | Request exits for managed intraday positions during an open session with fresh data and verified broker state. An exit request is not a guaranteed fill. |
-| Broker orders filled or shares changed while offline | Reconcile actual fills/quantities and existing protection before further action. Unknown or conflicting ownership stays blocked for review. |
-
-Pausing new entries continues management of already adopted positions. Graceful shutdown attempts to cancel pending entry orders before stopping; sudden power loss cannot perform that cleanup. During downtime, local stops, targets, trailing rules and scheduled exits cannot run. Only orders/protection already accepted and retained by Zerodha can operate independently. Missing broker history or an ambiguous order acknowledgement can require intervention; repeated restarts do not safely resolve that uncertainty.
-
-Recovery applies the same documented strategy rules to current information. It does not retrain a model, automatically enable swing, or expand permission to sell unselected holdings. See the [logic and analytics guide](docs/LOGIC_AND_ANALYTICS.md) for the detailed calculations and recovery behavior.
-
-## Strategies and data limitations
-
-Intraday uses 21 contiguous completed five-minute candles: a 20-bar breakout, rising short-term trend, strong candle body/close and at least 1.5 times baseline volume. ATR defines the planned stop and target. Current-session history is downloaded to warm the scanner; this rule naturally cannot produce a qualified signal before about 11:00 IST.
-
-Swing uses completed daily candles: a 20-day breakout, SMA20 above SMA50, strong close and elevated volume, with ATR-based exits. Existing-holdings analysis uses a weakening daily trend and a trailing ATR reference. The parallel workers also calculate RSI, volatility, trend slope, trend fit and candle metrics for diagnostics. These diagnostics do not imply a trained machine-learning model or a proven edge.
-
-Data is cached locally and in memory. Cold-start history across the full universe can take tens of minutes under Kite's limits. Missing, stale or incomplete data blocks entries. Large daily discontinuities are rejected, but this is not a complete corporate-action adjustment or point-in-time research dataset. NSE EQ includes instruments such as ETFs as well as company shares; eligibility is further constrained by liquidity and risk checks.
-
-The initial implementation does not include a statistically validated backtest, a news/fundamental data subscription, tax-aware disposal of existing holdings, or a sector classification/correlation risk model. Validate strategies and execution using paper trading before allocating real money. Paper fills apply an adverse price adjustment and estimated costs; they are not a full exchange queue or liquidity simulator.
-
-## Risk and execution
-
-Server settings define capital, maximum allocation per stock, risk per trade, daily loss halt, maximum position count, spread/turnover filters and intraday cutoffs. Strategy allocations cannot exceed the configured capital. Changes are blocked while entries run or managed exposure remains. Daily strategy risk/P&L is separate from pre-existing holdings; the dashboard shows actual account figures separately.
-
-Live mode needs both `TRADING_MODE=live` and `LIVE_TRADING_ENABLED=true`, plus `LIVE_CAPITAL>0`. These settings cannot be silently changed by the dashboard. The application does not place any real order during installation or verification.
-
-Live delivery management requires the broker profile to report the supported DDPI/POA authorisation state. Daily TPIN/OTP authorisation is not assumed sufficient for unattended overnight exits. CNC entry and GTT creation are not atomic: a failure can leave confirmed shares without verified protection; the application records this, blocks new entries, and exposes it for intervention. Partial fills, trigger/cancel races, manual quantity changes, duplicate GTTs and ambiguous responses are reconciled conservatively. Do not place competing manual orders for a managed symbol without reviewing its existing protection.
-
-The system deliberately does not resend an ambiguous order. It can remain blocked when broker history no longer proves what happened. Resolve such cases in the broker account and reconcile the durable journal before restarting; do not delete the database to clear a warning.
-
-## Audit and recovery
-
-The **Activity log** includes sign-ins, configuration changes, connection state, strategy signals/decisions, scan summaries, fills, account changes, failures and recovery events. The live view shows the latest 500 events; **Export full history** downloads the complete durable history as NDJSON. Raw every-tick logging is avoided; activity is recorded at decision and account-change boundaries. Passwords, API credentials and session tokens are redacted.
-
-Back up the persistent SQLite database together with the protected configuration and encryption key. Use a SQLite online backup or stop the application safely before copying its database; a standalone copy of an active WAL database is not a reliable backup. An audit log is append-only through the application, not tamper-proof against a local administrator. Keep the machine awake, its time synchronized and its network stable.
-
-## Checks
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe -m pytest tests -q
-node --check app/static/app.js
-node --check app/static/login.js
-node --check app/static/live-view.js
-node --test tests/live-view.test.cjs
-```
-
-Tests use deterministic fake brokers and synthetic candles, including actual Windows process-pool execution. They never contact a real trading account. They cover authentication, CSRF, account binding, settings guards, rate limiting, order ambiguity, partial fills, protective order races and persistence.
-
-## Official references
-
-- [Kite authentication](https://kite.trade/docs/connect/v3/user/)
-- [Orders](https://kite.trade/docs/connect/v3/orders/) and [GTT](https://kite.trade/docs/connect/v3/gtt/)
-- [Streaming](https://kite.trade/docs/connect/v3/websocket/) and [API limits](https://kite.trade/docs/connect/v3/exceptions/)
-- [Holdings authorisation](https://kite.trade/docs/connect/v3/portfolio/#holdings-authorisation)
-- [Static IP requirements](https://support.zerodha.com/category/trading-and-markets/general-kite/kite-api/articles/static-ip)
+Keep system time synchronized. Trading uses India Standard Time regardless of host timezone; there is no authoritative holiday/special-session calendar, so fresh exchange data is also required.

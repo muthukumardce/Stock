@@ -1,0 +1,22 @@
+{
+  "name": "stockpilot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.9.0" },
+  "scripts": {
+    "setup": "node src/cli.js setup",
+    "start": "node src/index.js",
+    "check": "node src/cli.js check",
+    "test": "node --test tests-node/*.test.js tests/live-view.test.cjs"
+  },
+  "dependencies": {
+    "@node-rs/argon2": "2.2.1",
+    "dotenv": "17.4.2",
+    "express": "5.2.1",
+    "kiteconnect": "5.3.0"
+  },
+  "overrides": {
+    "serialize-javascript": "7.0.5"
+  }
+}

@@ -1,7 +1,12 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const createLiveView = require('../app/static/live-view.js');
+const { readFileSync } = require('node:fs');
+const { join } = require('node:path');
+const { runInThisContext } = require('node:vm');
+const transportModule = { exports: {} };
+runInThisContext(`(function(module) { ${readFileSync(join(__dirname, '../public/live-view.js'), 'utf8')}\n})`, { filename: 'public/live-view.js' })(transportModule);
+const createLiveView = transportModule.exports;
 
 const flush = async () => { for (let i = 0; i < 6; i++) await Promise.resolve(); };
 function deferred() {
