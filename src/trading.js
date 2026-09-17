@@ -9,7 +9,11 @@ import { KiteBroker, BrokerError, jsonable } from './broker.js';
 import { AnalyticsPool } from './analytics.js';
 import { DeliveryManager } from './delivery.js';
 import { HoldingsAuthorization } from './holdings-authorization.js';
-import { Candle, CandleBook, Signal, position_size } from './strategy.js';
+import { Candle, CandleBook, Signal, position_size, STRATEGY_VERSION, technical_exit, daily_holding_exit, swing_entry_gate } from './strategy.js';
+import { marketBreadth, portfolioExposure, portfolioEntryGate, returnCorrelation, pendingDeliveryQuantity } from './decision-controls.js';
+import { sideOf, directionOf, exitSideOf, plannedRisk, markedProfit } from './direction.js';
+import { MarketContext } from './market-context.js';
+import { validate_bars } from './indicators.js';
 import { Mutex, sleep, monotonic, nowIST, parseTime, dateIST, timeIST, isoIST, marketHours } from './util.js';
 
 const TERMINAL = new Set(['COMPLETE', 'CANCELLED', 'REJECTED']);
@@ -21,6 +25,7 @@ const sum = list => list.reduce((a, b) => a + b, 0);
 const round = (value, digits = 2) => Number(value.toFixed(digits));
 const keyFor = (strategy, token) => `${strategy}:${token}`;
 const bidOf = quote => Number(quote?.depth?.buy?.[0]?.price || 0);
+const askOf = quote => Number(quote?.depth?.sell?.[0]?.price || 0);
 const unresolved = new Set(['submitting', 'unknown', 'conflict', 'unprotected', 'exit_unknown', 'exit_pending']);
 
 export class TradingEngine {
@@ -61,12 +66,17 @@ export class TradingEngine {
     this._wakeMonitor = null; this._controller = null;
     this._order_seen = {}; this._trade_seen = new Set(); this._position_seen = null;
     this._holdings_seen = null; this._balance_seen = null; this._balance_logged_at = 0;
-    this.daily = {}; this._daily_checked = new Set(); this._history_date = ''; this._history_failures = 0;
+    this.daily = {}; this._daily_checked = new Set(); this._history_date = ''; this._history_failures = 0; this._daily_history_retry = {};
     this._shutdown = false; this._last_tick_received = -Infinity; this._risk_halted = false;
     this.holdings_signals = []; this._paper_holding_actions = store.get('paper_holding_actions', {});
-    this._last_holdings_scan = 0; this._intraday_history_loaded = new Set(); this._intraday_history_failed = 0;
+    this._last_holdings_scan = 0; this._intraday_history_loaded = new Set(); this._intraday_history_failed = 0; this._intraday_history_retry={};
     this.analytics = options.analyticsFactory ? options.analyticsFactory(settings) : new AnalyticsPool(settings.analytics_workers || 0, settings.analytics_reserve_cpus ?? 4, settings.analytics_batch_size || 32);
     this._analysis_pending = new Map(); this._analysis_tasks = new Set(); this._analysis_cache = new Map(); this._analysis_generation = 0;
+    this._analysis_requested = new Map(); this._analysis_sequence = 0;
+    this._correlation_wanted = new Set(); this._candidate_batch_at = null;
+    this.previous_intraday={};
+    this.market_context=options.marketContextFactory?options.marketContextFactory(store,settings):new MarketContext(store,settings,{now:()=>this._now()});
+    this._loss_control = saved.loss_control || {day:this.day,last_realised:this.realised,loss_events:0,until:null};
     this._profile_verified = false; this._recovery_account_verified = false; this._recovery_holdings_checked = false;
     this.recovery = { phase: 'awaiting_session', message: 'Sign in to Zerodha to verify the current account before trading.', started_at: null, completed_at: null, blocked: true };
   }
@@ -88,7 +98,7 @@ export class TradingEngine {
   _persist() {
     this.store.set(this.state_key, jsonable({ positions: this.positions, intents: this.intents, realised: this.realised, day: this.day,
       day_baseline: this.day_baseline, day_open_unrealised: this.day_open_unrealised, traded: [...this.traded].sort(), user_id: this.user_id, delivery_accounted: this._delivery_accounted,
-      capital: this.capital, capital_accounted_pnl: this._capital_accounted_pnl }));
+      capital: this.capital, capital_accounted_pnl: this._capital_accounted_pnl, loss_control:this._loss_control }));
   }
   _halt(message, kind = 'risk_halt') {
     if (this.error !== message) this._event(kind, message, null, 'error');
@@ -102,7 +112,8 @@ export class TradingEngine {
     return Boolean(count(saved.positions || {}) || values(saved.intents || {}).some(i => !['closed', 'rejected'].includes(i.state)) || values(delivery.positions || {}).some(p => p.status !== 'closed'));
   }
   _invalidate_decisions() {
-    this._analysis_generation++; this._analysis_pending.clear(); this._analysis_cache.clear(); this._daily_checked.clear(); this._candidates = [];
+    this._analysis_generation++; this._analysis_pending.clear(); this._analysis_requested.clear(); this._analysis_cache.clear(); this._daily_checked.clear(); this._candidates = [];
+    this._candidate_batch_at = null;
   }
   _begin_recovery() {
     this._invalidate_decisions(); this._recovery_account_verified = false; this._recovery_holdings_checked = false; this._last_holdings_scan = 0;
@@ -150,7 +161,7 @@ export class TradingEngine {
       if (this.settings.kite_user_id && this.settings.kite_user_id !== user_id) throw new Error('The Zerodha account does not match KITE_USER_ID.');
       await this._stop_tasks();
       this.running = false; this.connected = false; this._profile_verified = false; this._account_at = -Infinity;
-      this._begin_recovery(); this._roll_day(); this.daily = {}; this._history_date = ''; this.books = {}; this.quotes = {}; this.streams = {};
+      this._begin_recovery(); this._roll_day(); this.daily = {}; this._history_date = ''; this._daily_history_retry = {}; this.books = {}; this.quotes = {}; this.streams = {};
       this._last_tick_received = -Infinity; this._heartbeat = null;
       if (this.broker) await this.broker.close();
       this.broker = this._brokerFactory(this.settings.kite_api_key, access_token);
@@ -168,8 +179,8 @@ export class TradingEngine {
         for (const intent of values(this.intents)) intent.token = tokens[intent.symbol] || 0;
         if (this.delivery) this.delivery.remap_tokens(tokens);
         this.books = Object.fromEntries(Object.keys(this.universe).map(t => [t, new CandleBook()]));
-        this.quotes = {}; this.streams = {}; this._intraday_history_loaded.clear(); this._candidates = []; this.connected = true;
-        if (!this._unresolved_intents()) { this.status = 'monitoring'; this.error = null; this.message = 'Monitoring Zerodha. Intraday warms from 21 complete five-minute candles.'; }
+        this.quotes = {}; this.streams = {}; this._intraday_history_loaded.clear(); this._intraday_history_retry={};this._candidates = []; this.connected = true;
+        if (!this._unresolved_intents()) { this.status = 'monitoring'; this.error = null; this.message = 'Monitoring Zerodha. Entries wait for completed strategy candles, prior-session context and fresh risk checks.'; }
         this._advance_recovery();
         const activeBroker = this.broker;
         await this.broker.stream(Object.keys(this.universe).map(Number), ticks => { if (this.broker === activeBroker) this._on_ticks(ticks); }, order => { if (this.broker === activeBroker) this._on_order(order); }, (...args) => { if (this.broker === activeBroker) this._on_stream(...args); });
@@ -275,7 +286,7 @@ export class TradingEngine {
   _start_tasks() {
     this._controller = new AbortController();
     const signal = this._controller.signal;
-    this._tasks = ['_run', '_monitor', '_history', '_intraday_history', '_analysis_loop'].map(method => this[method](signal).catch(error => {
+    this._tasks = ['_run', '_monitor', '_history', '_intraday_history', '_analysis_loop', '_market_context_loop'].map(method => this[method](signal).catch(error => {
       if (!signal.aborted && !this._shutdown) this._halt(`Background task failed (${error.name || 'Error'}); entries paused.`, 'engine_error');
     }));
   }
@@ -293,6 +304,7 @@ export class TradingEngine {
     try { await this.pause(); }
     finally {
       if (this.broker) await this.broker.close();
+      await this.market_context.close();
       await this.analytics.close();
       await Promise.allSettled([...this._retiringTasks, ...this._analysis_tasks]);
       this.connected = false; this._persist();
@@ -322,8 +334,8 @@ export class TradingEngine {
     const now = this._now(); if (!marketHours(now)) return;
     for (let tick of ticks) {
       const token = Number(tick.instrument_token || 0); if (!(token in this.universe)) continue;
-      const at = parseTime(tick.exchange_timestamp), price = Number(tick.last_price || 0);
-      if (!at || Math.abs(now - at) > 10000 || !Number.isFinite(price) || price <= 0) continue;
+      const at = parseTime(tick.exchange_timestamp), price = Number(tick.last_price || 0),volume=Number(tick.volume_traded);
+      if (!at || Math.abs(now - at) > 10000 || !Number.isFinite(price) || price <= 0||!Number.isFinite(volume)||volume<0) continue;
       tick = { ...tick, received_at: monotonic() }; this.quotes[token] = tick; this._last_tick_received = monotonic(); this._heartbeat = isoIST(now);
       const symbol = this.universe[token].tradingsymbol; if (this.positions[symbol]) this.positions[symbol].last = price;
       const previous = this.books[token].bars.length, closed = this.books[token].update(at, price, Number(tick.volume_traded || 0));
@@ -332,15 +344,44 @@ export class TradingEngine {
       if (this.daily[token] && !this._daily_checked.has(token)) { this._daily_checked.add(token); this._queue_analysis(token, 'swing', this.daily[token]); }
     }
   }
-  _queue_analysis(token, strategy, bars) {
+  _queue_analysis(token, strategy, bars, context = this._strategy_context(token,strategy)) {
     if (!bars.length) return;
-    this._analysis_pending.set(keyFor(strategy, token), { token: Number(token), strategy, bars: [...bars], bar_time: isoIST(bars.at(-1).time), generation: this._analysis_generation, queued_at: monotonic() });
+    const key=keyFor(strategy,token),job={token:Number(token),strategy,bars:[...bars],context,strategy_options:this._strategy_options(),bar_time:isoIST(bars.at(-1).time),generation:this._analysis_generation,queued_at:monotonic(),analysis_id:++this._analysis_sequence};
+    this._discard_candidates(token,strategy);
+    this._analysis_requested.set(key,{analysis_id:job.analysis_id,bar_time:job.bar_time,context_key:this._context_key(context)});
+    this._analysis_pending.set(key,job);
+  }
+  _context_key(context){return JSON.stringify([context.previous_bars,context.benchmark_bars,context.sector_bars]);}
+  _strategy_context(token,strategy='intraday'){
+    const source=this.market_context.contextForSymbol?.(this.universe[token]?.tradingsymbol,this._now())||{};
+    return {as_of:isoIST(this._now()),previous_bars:strategy==='intraday'?(this.previous_intraday[token]||[]):[],
+      benchmark_bars:strategy==='intraday'?(source.benchmark_bars||[]):(source.benchmark_daily_bars||source.daily_bars||[]),
+      sector_bars:strategy==='intraday'?(source.sector_bars||[]):(source.sector_daily_bars||[])};
+  }
+  async _market_context_loop(signal){
+    while(!signal?.aborted&&!this._shutdown){
+      if(this.connected){await this.market_context.refresh(this);if(!signal?.aborted&&!this._shutdown&&this.connected)this._refresh_context_analyses();}
+      await sleep(60000,signal);
+    }
+  }
+  _refresh_context_analyses(){
+    const now=this._now();
+    for(const [token] of entries(this.universe)){
+      if(monotonic()-(this.quotes[token]?.received_at??-Infinity)>10)continue;
+      for(const strategy of ['intraday','swing']){
+        const bars=strategy==='intraday'?this.books[token]?.bars:this.daily[token],last=bars?.at(-1);
+        if(!last||strategy==='intraday'&&(dateIST(last.time)!==dateIST(now)||now-last.time-300000<0||now-last.time-300000>=300000))continue;
+        const previous=this._analysis_requested.get(keyFor(strategy,token)),context=this._strategy_context(token,strategy);
+        if(!previous||previous.bar_time!==isoIST(last.time)||previous.context_key!==this._context_key(context))this._queue_analysis(Number(token),strategy,bars,context);
+      }
+    }
   }
   _queue_current_analysis(token) {
     const now = this._now(), bars = this.books[token]?.bars || [], last = bars.at(-1);
     if (last && dateIST(last.time) === dateIST(now) && now - last.time - 300000 >= 0 && now - last.time - 300000 < 300000) this._queue_analysis(token, 'intraday', bars);
     if (this.daily[token]) { this._daily_checked.add(Number(token)); this._queue_analysis(token, 'swing', this.daily[token]); }
   }
+  _intraday_warmed(token,book){return this.settings.enhanced_signals?book.bars.length>=2&&book.bars.length+(this.previous_intraday[token]?.length||0)>=34:book.bars.length>=21;}
   async _analysis_loop(signal = this._controller?.signal) {
     while (!signal?.aborted && !this._shutdown) {
       while (this._analysis_pending.size && this._analysis_tasks.size < this.analytics.worker_limit) {
@@ -361,20 +402,90 @@ export class TradingEngine {
       const bars = strategy === 'intraday' && this.books[token] ? this.books[token].bars : (this.daily[token] || []);
       if (!bars.length || isoIST(bars.at(-1).time) !== result.bar_time) continue;
       if (monotonic() - result.queued_at > 30) { this._stats.stale_analysis_dropped = (this._stats.stale_analysis_dropped || 0) + 1; if (strategy === 'swing') this._daily_checked.delete(Number(token)); continue; }
+      if(result.analysis_id!==this._analysis_requested.get(keyFor(strategy,token))?.analysis_id)continue;
+      this._discard_candidates(token,strategy);
       this._analysis_cache.set(keyFor(strategy, token), result);
       const stat = `${strategy}:${result.reason}`; this._stats[stat] = (this._stats[stat] || 0) + 1;
-      if (result.signal) this._candidate(token, new Signal(result.signal.strategy, result.signal.reference, result.signal.stop, result.signal.target, result.signal.reason, result.signal.score), result.metrics);
+      if (result.signal) this._candidate(token, new Signal(result.signal), result.metrics,{generation:result.generation,analysis_id:result.analysis_id,bar_time:result.bar_time,queued_at:result.queued_at});
     }
   }
-  _candidate(token, signal, metrics = {}) {
-    const record = { time: isoIST(this._now()), symbol: this.universe[token].tradingsymbol, ...signal, status: 'candidate', analytics: metrics || {} };
+  _discard_candidates(token,strategy){
+    this._candidates=this._candidates.filter(([t,s,,record])=>{if(t!==Number(token)||s.strategy!==strategy)return true;record.status='superseded_analysis';return false;});
+    if(!this._candidates.length)this._candidate_batch_at=null;
+  }
+  _candidate(token, signal, metrics = {}, source = null) {
+    const record = { time: isoIST(this._now()), symbol: this.universe[token].tradingsymbol, ...signal, source, status: 'candidate', analytics: metrics || {} };
     this.signals.unshift(record); this.signals.length = Math.min(60, this.signals.length);
     this._event('signal', `${record.symbol}: ${signal.reason}`, record);
-    this._candidates.push([Number(token), signal, monotonic(), record]); if (this._candidates.length > 200) this._candidates.shift();
+    this._discard_candidates(token,signal.strategy);
+    this._candidates.push([Number(token), signal, monotonic(), record]);
+    this._rank_candidates();
+    if(this._candidates.length>200){const dropped=this._candidates.pop();dropped[3].status='lower_ranked_overflow';}
+    this._candidate_batch_at??=monotonic();
+  }
+
+  _strategy_options(){return Object.fromEntries(['enhanced_signals','enable_breakout','enable_pullback','enable_reversion','candlestick_patterns_enabled','technical_exit_enabled','min_signal_score','min_adx','min_rsi','max_rsi','max_atr_extension',
+    'enable_opening_range','enable_opening_drive','enable_gap_continuation','enable_gap_reversal','enable_vwap_reclaim','enable_vwap_rejection','enable_volatility_squeeze','enable_relative_strength','intraday_short_enabled','higher_timeframe_filter','opening_range_minutes','min_setup_volume','min_gap_pct','max_gap_pct','relative_strength_min','squeeze_width_max','squeeze_lookback'].filter(k=>this.settings[k]!==undefined).map(k=>[k,this.settings[k]]));}
+  _rank_candidates(){this._candidates.sort((a,b)=>(Number.isFinite(b[1].score)?b[1].score:0)-(Number.isFinite(a[1].score)?a[1].score:0)||a[3].symbol.localeCompare(b[3].symbol)||a[1].strategy.localeCompare(b[1].strategy));}
+  _portfolio(){return portfolioExposure({account:this.account,positions:this.positions,intents:this.intents,delivery:this.delivery?.snapshot()||{},quotes:this.quotes,universe:this.universe,cash:this._available_cash(),capital:this.capital,mode:this.mode,settings:this.settings,clock:monotonic()});}
+  _runtime_block(){
+    const r=this.runtime_health?.();if(!r)return null;
+    if(!Number.isFinite(r.disk_free_mib)||r.disk_free_mib<this.settings.min_free_disk_mib)return 'journal_disk_capacity';
+    if(!Number.isFinite(r.memory_free_mib)||r.memory_free_mib<this.settings.min_free_memory_mib)return 'system_memory_pressure';
+    if(!Number.isFinite(r.event_loop_delay_ms)||r.event_loop_delay_ms>this.settings.max_event_loop_delay_ms)return 'event_loop_pressure';
+    return null;
+  }
+  readiness(){
+    const clock=monotonic(),runtime=this._runtime_block(),context=this.market_context.snapshot();
+    const checks=[
+      {key:'broker_session',ok:this.connected&&this._profile_verified,detail:'Authenticated account identity verified.'},
+      {key:'account_snapshot',ok:this.connected&&clock-this._account_at<=45,detail:'Orders, positions, holdings and cash observed within 45 seconds.'},
+      {key:'reconciliation',ok:this.recovery.phase==='ready'&&!this._unresolved_intents(),detail:this.recovery.message},
+      {key:'market_session',ok:marketHours(this._now()),detail:'Regular NSE session hours; individual fresh quotes are still required.'},
+      {key:'live_feed',ok:clock-this._last_tick_received<=10,detail:'An exchange-timestamped tick arrived within 10 seconds.'},
+      {key:'machine_capacity',ok:!runtime,detail:runtime||'Journal disk, available RAM and event loop checks pass.'},
+      {key:'maintenance',ok:!this._maintenance(),detail:'No maintenance lock.'},
+      {key:'entry_armed',ok:this.running,detail:'Start Trading is armed.'},
+    ];
+    return {ready:checks.every(c=>c.ok),checks,market_context:context,scope:'Operational prerequisites only. Each candidate must also pass strategy, calendar, liquidity, cash and account risk checks.'};
+  }
+  _update_loss_control(){
+    const state=this._loss_control;
+    if(state.day!==this.day){Object.assign(state,{day:this.day,last_realised:this.realised,loss_events:0,until:null});return;}
+    const delta=this.realised-state.last_realised;if(Math.abs(delta)<0.005)return;
+    state.last_realised=this.realised;state.loss_events=delta<0?state.loss_events+1:0;
+    if(this.settings.loss_streak_limit&&state.loss_events>=this.settings.loss_streak_limit){
+      state.until=isoIST(new Date(+this._now()+this.settings.loss_cooldown_minutes*60000));state.loss_events=0;
+      this._event('risk_cooldown','New entries cooling down after consecutive realized loss events. Existing exits remain active.',{until:state.until},'warning');
+    }
+    this._persist();
+  }
+  _decision_controls(){
+    const regime=marketBreadth(this.universe,this.quotes,this.settings,monotonic()),portfolio=this._portfolio(),blocked_reasons=[];
+    const until=parseTime(this._loss_control.until),cooling=until&&until>this._now();
+    if(['warming_up','defensive'].includes(regime.status))blocked_reasons.push(regime.message);
+    if(cooling)blocked_reasons.push('New entries are in a loss cooldown.');
+    if(this.settings.portfolio_risk_enabled&&(portfolio.unpriced_symbols.length||portfolio.unsupported_symbols.length))blocked_reasons.push('Some account exposure cannot be valued safely.');
+    if(this.settings.max_trades_per_day&&this.traded.size>=this.settings.max_trades_per_day)blocked_reasons.push('Daily new-symbol limit reached.');
+    return {strategy_version:STRATEGY_VERSION,regime,portfolio,blocked_reasons,cooldown:{until:cooling?this._loss_control.until:null,loss_events:this._loss_control.loss_events,message:cooling?'Cooling down new entries.':'No loss cooldown active.'},candidate_count:this._candidates.length,
+      market_context:this.market_context.snapshot(),ranked_candidates:this._candidates.slice(0,10).map(([,s,,r])=>({symbol:r.symbol,strategy:s.strategy,side:sideOf(s),setup:s.setup,score:s.score,reason:s.reason}))};
+  }
+  _correlation_gate(token,notional,portfolio){
+    if(this.settings.correlation_filter!==true||!portfolio.rows.length)return null;
+    const symbol=this.universe[token].tradingsymbol,tokens=Object.fromEntries(entries(this.universe).map(([t,i])=>[i.tradingsymbol,Number(t)]));
+    let exposure=notional;const missing=[];
+    for(const row of portfolio.rows){
+      if(row.symbol===symbol){exposure+=row.exposure;continue;}
+      const other=tokens[row.symbol],correlation=returnCorrelation(this.daily[token]||[],this.daily[other]||[]);
+      if(correlation===null){missing.push(row.symbol);if(other)this._correlation_wanted.add(other);continue;}
+      if(Math.abs(correlation)>=this.settings.max_correlation)exposure+=row.exposure;
+    }
+    if(missing.length){this._correlation_wanted.add(Number(token));return 'correlation_history_unavailable';}
+    return exposure>portfolio.reference_assets*this.settings.max_correlated_exposure_pct?'correlated_exposure_limit':null;
   }
 
   async _run_once() {
-    this._roll_day(); const now = this._now();
+    this._roll_day(); this._update_loss_control(); const now = this._now();
     if (this.connected && marketHours(now)) {
       for (const [symbol, position] of entries(this.positions)) {
         const quote = this.quotes[position.token] || {}, fresh = monotonic() - (quote.received_at ?? -Infinity) <= 10, opened = parseTime(position.opened_at);
@@ -382,8 +493,22 @@ export class TradingEngine {
         if (position.strategy === 'intraday' && (timeIST(now) >= this.settings.exit_time || overdue)) await this._exit_locked(symbol, overdue ? 'overdue_intraday_exit' : 'intraday_session_exit');
         else if (fresh) {
           const last = Number(quote.last_price);
-          if (last <= position.stop) await this._exit_locked(symbol, 'stop_loss');
-          else if (last >= position.target) await this._exit_locked(symbol, 'profit_target');
+          if(this.mode==='paper'&&position.strategy==='swing'){
+            const daily=this.daily[position.token]||[],lastDaily=daily.at(-1);
+            const usable=lastDaily&&dateIST(lastDaily.time)<dateIST(now)&&now-lastDaily.time<7*86400000;
+            const holdingExit=usable?daily_holding_exit(daily,position):null;
+            if(holdingExit){
+              if(position.trailing_stop!==holdingExit.trailing_stop){position.trailing_stop=holdingExit.trailing_stop;this._persist();}
+              if(holdingExit.trend_exit||last<=position.trailing_stop){await this._exit_locked(symbol,holdingExit.trend_exit?'Daily trend loss':'Daily ATR trailing exit');continue;}
+            }
+          }
+          if (directionOf(position) * (last - position.stop) <= 0) await this._exit_locked(symbol, 'stop_loss');
+          else if (directionOf(position) * (last - position.target) >= 0) await this._exit_locked(symbol, 'profit_target');
+          else if(this.settings.enhanced_signals&&this.settings.technical_exit_enabled){
+            const bars=position.strategy==='intraday'?(this.books[position.token]?.bars||[]):(this.daily[position.token]||[]),lastBar=bars.at(-1);
+            const current=lastBar&&(position.strategy==='intraday'?dateIST(lastBar.time)===dateIST(now)&&now-lastBar.time>=300000&&now-lastBar.time<600000:now-lastBar.time<7*86400000);
+            if(current){const exit=technical_exit(bars,position,this._strategy_options(),this._strategy_context(position.token,position.strategy));if(exit?.exit)await this._exit_locked(symbol,exit.reason);}
+          }
         }
       }
       if (this._daily_pnl() <= -this.capital * this.settings.daily_loss_pct && this.capital > 0) {
@@ -408,13 +533,16 @@ export class TradingEngine {
       Object.assign(this.recovery,{phase:'awaiting_authorization',blocked:true,completed_at:null,message:'Complete the required holdings authorization on Zerodha/CDSL.'});
     }
     this._advance_recovery();
-    for (let left = Math.min(10, this._candidates.length); left > 0; left--) {
+    this._update_loss_control();this._rank_candidates();
+    const batchReady=this._candidate_batch_at===null||monotonic()-this._candidate_batch_at>=(this.settings.candidate_wait_ms||0)/1000;
+    for (let left = batchReady?Math.min(10, this._candidates.length):0; left > 0; left--) {
       const [token, signal, received, record] = this._candidates.shift();
       if (monotonic() - received <= 30) {
-        const reason = await this._enter_locked(token, signal); record.status = reason;
-        this._event('decision', `${record.symbol}: ${reason}`, { symbol: record.symbol, strategy: signal.strategy, decision: reason });
+        const reason = record.source ? await this._enter_locked(token, signal,record.source) : 'signal_source_missing'; record.status = reason;
+        this._event('decision', `${record.symbol}: ${reason}`, { symbol: record.symbol, strategy: signal.strategy,side:sideOf(signal),setup:signal.setup,score:signal.score, decision: reason });
       }
     }
+    if(!this._candidates.length)this._candidate_batch_at=null;
     if (monotonic() - this._last_summary >= 300 && count(this._stats)) { this._event('scan_summary', 'Closed-candle scan summary.', { ...this._stats }); this._stats = {}; this._last_summary = monotonic(); }
     if (monotonic() - this._last_persist >= 15) { this._persist(); this._last_persist = monotonic(); }
   }
@@ -517,24 +645,35 @@ export class TradingEngine {
   _roll_day() {
     const today = dateIST(this._now()); if (today === this.day) return;
     this.day = today; this.day_baseline = this.realised; this.day_open_unrealised = this._unrealised(); this.traded.clear(); this._daily_checked.clear(); this._intraday_history_loaded.clear(); this._invalidate_decisions();
-    this.books = Object.fromEntries(Object.keys(this.universe).map(t => [t, new CandleBook()])); this.quotes = {}; this.daily = {}; this._history_date = ''; this._recovery_holdings_checked = false;
+    this.books = Object.fromEntries(Object.keys(this.universe).map(t => [t, new CandleBook()])); this.quotes = {}; this.daily = {}; this.previous_intraday={};this._intraday_history_retry={}; this._history_date = ''; this._daily_history_retry = {}; this._recovery_holdings_checked = false;
     Object.assign(this.recovery, { phase: 'warming_up', message: 'New session: refresh market data and select Start Trading after Zerodha authentication.', blocked: true, completed_at: null });
     this._order_seen = {}; this._trade_seen.clear(); this.running = false;
+    this._correlation_wanted.clear();this._loss_control={day:today,last_realised:this.realised,loss_events:0,until:null};
     this._event('day_rollover', 'New trading day. Daily risk baseline reset; Start Trading is required again.'); this.status = this.connected ? 'paused' : 'disconnected'; this._persist();
   }
-  _unrealised() { return sum(values(this.positions).map(p => ((p.last ?? p.entry) - p.entry) * p.quantity - (p.entry_fee || 0))); }
+  _unrealised() { return sum(values(this.positions).map(markedProfit)); }
   _daily_pnl() { return this.realised - this.day_baseline + this._unrealised() - this.day_open_unrealised; }
   _exposure(strategy = null) {
     const positions = sum(values(this.positions).filter(p => strategy === null || p.strategy === strategy).map(p => p.entry * p.quantity));
     const pending = sum(values(this.intents).filter(i => ['submitting', 'unknown', 'pending'].includes(i.state) && (strategy === null || i.strategy === strategy)).map(i => i.entry * Math.max(0, i.quantity - (i.filled || 0))));
-    const delivery = this.delivery && (strategy === null || strategy === 'swing') ? sum(values(this.delivery.snapshot().positions || {}).filter(p => p.source === 'swing' && p.status !== 'closed').map(p => Number(p.entry_price || 0) * Math.max(0, Number(p.requested_quantity || 0) - Number(p.quantity || 0)))) : 0;
+    const deliveryState=this.delivery?.snapshot()||{};
+    const delivery = this.delivery && (strategy === null || strategy === 'swing') ? sum(values(deliveryState.positions || {}).map(p => Number(p.entry_price || 0) * pendingDeliveryQuantity(p,deliveryState))) : 0;
     return positions + pending + delivery;
   }
 
-  async _enter_locked(token, signal) {
+  async _enter_locked(token, signal, source = null) {
     if (!this.running) return 'entries_paused';
+    const runtimeBlock=this._runtime_block();if(runtimeBlock)return runtimeBlock;
+    const side=sideOf(signal),direction=directionOf(signal);
+    if(!['BUY','SELL'].includes(side))return 'invalid_signal_side';
+    if(side==='SELL'&&(signal.strategy!=='intraday'||this.settings.intraday_short_enabled!==true))return 'short_strategy_disabled';
     if (this._maintenance()) { this.running = false; return 'maintenance_active'; }
     const now = this._now();
+    if(source){
+      const bars=signal.strategy==='intraday'?this.books[token]?.bars:this.daily[token],last=bars?.at(-1),request=this._analysis_requested.get(keyFor(signal.strategy,token));
+      if(source.generation!==this._analysis_generation||source.analysis_id!==request?.analysis_id||!last||isoIST(last.time)!==source.bar_time||monotonic()-source.queued_at>30)return 'signal_superseded';
+      if(signal.strategy==='intraday'?(dateIST(last.time)!==dateIST(now)||now-last.time-300000<0||now-last.time-300000>=300000):(dateIST(last.time)>=dateIST(now)||now-last.time>7*86400000))return 'signal_candle_stale';
+    }
     if (!marketHours(now)) return 'market_closed';
     if (signal.strategy === 'intraday' && timeIST(now) >= this.settings.entry_cutoff) return 'entry_cutoff';
     if (signal.strategy === 'swing' && timeIST(now) >= '15:15') return 'swing_entry_cutoff';
@@ -546,7 +685,14 @@ export class TradingEngine {
     if (this.recovery.phase !== 'ready') return 'recovery_incomplete';
     if (monotonic() - this._account_at > 45 || !this.connected) return 'account_data_stale';
     if (this._daily_pnl() <= -this.capital * this.settings.daily_loss_pct) return 'daily_loss_limit';
+    this._update_loss_control();
+    if(parseTime(this._loss_control.until)>now)return 'loss_cooldown';
+    if(this.settings.max_trades_per_day&&this.traded.size>=this.settings.max_trades_per_day)return 'daily_trade_limit';
+    const regime=marketBreadth(this.universe,this.quotes,this.settings,monotonic());
+    if(regime.status==='warming_up')return 'market_breadth_unavailable';
+    if(this.settings.market_regime_filter===true&&(side==='SELL'?regime.declining_fraction:regime.breadth)<this.settings.min_market_breadth)return 'market_breadth_defensive';
     const symbol = this.universe[token].tradingsymbol;
+    if(this.settings.event_risk_enabled===true){const event=this.market_context.forSymbol(symbol);if(event.entry_blocked)return event.blackout?'scheduled_event_blackout':'event_calendar_unavailable';}
     if (this.positions[symbol] || this.traded.has(symbol) || values(this.intents).some(i => i.symbol === symbol && !['closed', 'rejected'].includes(i.state))) return 'already_owned_or_traded_today';
     const pendingCount = values(this.intents).filter(i => ['submitting', 'unknown', 'pending'].includes(i.state) && !this.positions[i.symbol]).length;
     if (count(this.positions) + pendingCount >= this.settings.max_positions) return 'maximum_positions';
@@ -555,38 +701,49 @@ export class TradingEngine {
     if (!buys.length || !sells.length || !(buys[0].price > 0) || !(sells[0].price > 0)) return 'market_depth_missing';
     const bid = Number(buys[0].price), ask = Number(sells[0].price);
     if (!Number.isFinite(bid) || !Number.isFinite(ask) || ask < bid || (ask - bid) / ask > this.settings.max_spread_pct) return 'spread_too_wide';
-    if (Number(quote.volume_traded || 0) * Number(quote.last_price || 0) < this.settings.min_daily_turnover) return 'turnover_too_low';
-    if (Math.abs(ask / signal.reference - 1) > (signal.strategy === 'intraday' ? .005 : .02)) return 'price_moved_from_signal';
-    const tick_size = Number(this.universe[token].tick_size || .05), entry = round(Math.ceil(ask * 1.0005 / tick_size) * tick_size, 4), stop = round(Math.floor(signal.stop / tick_size) * tick_size, 4);
+    const turnover=Number(quote.volume_traded)*Number(quote.last_price);
+    if (!Number.isFinite(turnover)||turnover < this.settings.min_daily_turnover) return 'turnover_too_low';
+    const marketPrice=side==='SELL'?bid:ask;
+    if (!Number.isFinite(signal.reference)||signal.reference<=0||Math.abs(marketPrice / signal.reference - 1) > (signal.strategy === 'intraday' ? .005 : .02)) return 'price_moved_from_signal';
+    const tick_size = Number(this.universe[token].tick_size || .05);
+    if(!Number.isFinite(tick_size)||tick_size<=0)return 'invalid_tick_size';
+    const entry=round((direction===1?Math.ceil(ask*1.0005/tick_size):Math.floor(bid*.9995/tick_size))*tick_size,4);
+    const stop=round((direction===1?Math.floor(signal.stop/tick_size):Math.ceil(signal.stop/tick_size))*tick_size,4);
+    if(![entry,stop,signal.target].every(Number.isFinite)||Math.min(entry,stop,signal.target)<=0||direction*(entry-stop)<=0||direction*(signal.target-entry)<=0)return 'invalid_executable_reward';
+    if(signal.strategy==='swing'){const gate=swing_entry_gate(this.daily[token]||[],{...signal,tick_size},entry);if(gate)return gate;}
     let remaining = Math.min(allocation - this._exposure(signal.strategy), this.capital + Math.min(0, this.realised - this._capital_accounted_pnl) - this._exposure());
     if (this.mode === 'live') {
       if (!this.settings.live_trading_enabled) return 'live_execution_disabled';
       if (this._account_symbol_busy(symbol)) return 'existing_account_exposure';
       remaining = Math.min(remaining, Math.max(0, this._available_cash() - this._exposure()));
     }
-    const quantity = position_size(allocation, remaining, entry, stop, this.settings.risk_per_trade_pct, this.settings.max_position_pct);
+    const quantity = position_size(allocation, remaining, entry, stop, this.settings.risk_per_trade_pct, this.settings.max_position_pct,side);
     if (quantity < 1) return 'insufficient_risk_or_cash_budget';
-    if (Number(sells[0].quantity || 0) < quantity) return 'insufficient_visible_liquidity';
-    let riskUsed = sum(values(this.positions).map(p => Math.max(0, p.entry - p.stop) * p.quantity));
-    riskUsed += sum(values(this.intents).filter(i => ['submitting', 'pending', 'unknown'].includes(i.state)).map(i => (i.entry - i.stop) * Math.max(0, i.quantity - (i.filled || 0))));
-    if (riskUsed + (entry - stop) * quantity > this.capital * this.settings.daily_loss_pct) return 'aggregate_risk_limit';
+    const portfolio=this._portfolio(),portfolioGate=portfolioEntryGate(portfolio,{symbol,entry,stop,quantity,side},this.settings);
+    if(portfolioGate)return portfolioGate;
+    const correlationGate=this._correlation_gate(token,entry*quantity,portfolio);if(correlationGate)return correlationGate;
+    const visibleQuantity=Number((side==='SELL'?buys:sells)[0].quantity);
+    if (!Number.isFinite(visibleQuantity)||visibleQuantity < quantity) return 'insufficient_visible_liquidity';
+    let riskUsed = sum(values(this.positions).map(plannedRisk));
+    riskUsed += sum(values(this.intents).filter(i => ['submitting', 'pending', 'unknown'].includes(i.state)).map(i => plannedRisk({...i,quantity:Math.max(0,i.quantity-(i.filled||0))})));
+    if (riskUsed + plannedRisk({entry,stop,quantity,side}) > this.capital * this.settings.daily_loss_pct) return 'aggregate_risk_limit';
     if (this._maintenance() || !this.running) return 'entries_paused';
     if (this.mode === 'paper') {
-      this.positions[symbol] = { symbol, token: Number(token), strategy: signal.strategy, quantity, entry, last: Number(quote.last_price), stop, target: signal.target, entry_fee: entry * quantity * FEE_RATE, opened_at: isoIST(now), protection: 'simulated', mode: 'paper' };
-      this.traded.add(symbol); this._persist(); this._event('paper_fill', `Simulated BUY ${quantity} ${symbol} at ${entry.toFixed(2)}.`, this.positions[symbol]); return 'paper_buy_filled';
+      this.positions[symbol] = { symbol, token: Number(token), strategy: signal.strategy, setup:signal.setup, side, tick_size,quantity, entry, last: Number(quote.last_price), stop, target: signal.target, entry_fee: entry * quantity * FEE_RATE, opened_at: isoIST(now), protection: 'simulated', mode: 'paper' };
+      this.traded.add(symbol); this._persist(); this._event('paper_fill', `Simulated ${side} ${quantity} ${symbol} at ${entry.toFixed(2)}.`, this.positions[symbol]); return side==='SELL'?'paper_short_filled':'paper_buy_filled';
     }
     if (signal.strategy === 'swing') {
-      const result = await this.delivery.submit_entry(symbol, quantity, entry, stop, signal.target, tick_size, Number(token));
+      const result = await this.delivery.submit_entry(symbol, quantity, entry, stop, signal.target, tick_size, Number(token),signal.setup);
       if (result.position) this.traded.add(symbol);
       this._sync_delivery(); this._persist(); this.request_reconciliation(); return `delivery_${result.status || 'unknown'}${result.reason ? ': ' + result.reason : ''}`;
     }
     const tag = 'EB' + randomUUID().replaceAll('-', '').slice(0, 18);
-    const intent = { tag, symbol, token: Number(token), strategy: signal.strategy, quantity, entry, stop, target: signal.target, created_at: isoIST(now), state: 'submitting', filled: 0, exit_requested: [], pnl_accounted: 0 };
+    const intent = { tag, symbol, token: Number(token), strategy: signal.strategy, setup:signal.setup, side, quantity, entry, stop, target: signal.target, created_at: isoIST(now), state: 'submitting', filled: 0, exit_requested: [], pnl_accounted: 0 };
     this.intents[tag] = intent; this.traded.add(symbol); this._persist();
-    this._event('order_intent', `Submitting protected cover BUY ${quantity} ${symbol}.`, intent);
-    try { intent.order_id = String(await this.broker.buy_cover(symbol, quantity, entry, stop, tag)); intent.state = 'pending'; }
+    this._event('order_intent', `Submitting protected cover ${side} ${quantity} ${symbol}.`, intent);
+    try { intent.order_id = String(await this.broker[side==='SELL'?'sell_cover':'buy_cover'](symbol, quantity, entry, stop, tag)); intent.state = 'pending'; }
     catch (exc) {
-      if (exc instanceof BrokerError && ['InputException', 'PermissionException', 'TokenException'].includes(exc.kind)) {
+      if (exc instanceof BrokerError && exc.definitive_rejection===true) {
         intent.state = 'rejected'; this._event('order_rejected', `Cover entry rejected before acknowledgement: ${symbol}.`, { tag, kind: exc.kind, detail: exc.detail }, 'error');
         if (['PermissionException', 'TokenException'].includes(exc.kind)) { if (exc.kind === 'TokenException') this.connected = false; this._halt('Broker authentication or trading permission rejected the entry. Reconnect or correct account permissions.'); }
       } else { intent.state = 'unknown'; this._halt(`Order acknowledgement unknown for ${symbol}; never retried automatically. Reconcile in Zerodha.`, 'order_unknown'); }
@@ -600,9 +757,10 @@ export class TradingEngine {
     const position = this.positions[symbol]; if (!position) return;
     if (this.mode === 'paper') {
       const quote = this.quotes[position.token] || {};
-      if (!marketHours(this._now()) || monotonic() - (quote.received_at ?? -Infinity) > 10 || bidOf(quote) <= 0) return;
-      const exit = bidOf(quote) * .9995, pnl = (exit - position.entry) * position.quantity - (position.entry_fee || 0) - exit * position.quantity * FEE_RATE;
-      this.realised += pnl; delete this.positions[symbol]; this._persist(); this._event('paper_fill', `Simulated SELL ${position.quantity} ${symbol}: ${reason}.`, { ...position, exit, pnl, reason, fees_estimated: true }); return;
+      const executable=directionOf(position)===1?bidOf(quote):askOf(quote);
+      if (!marketHours(this._now()) || monotonic() - (quote.received_at ?? -Infinity) > 10 || !Number.isFinite(executable) || executable <= 0) return;
+      const exit = executable * (directionOf(position)===1?.9995:1.0005), pnl = directionOf(position)*(exit - position.entry) * position.quantity - (position.entry_fee || 0) - exit * position.quantity * FEE_RATE;
+      this.realised += pnl; delete this.positions[symbol]; this._persist(); this._event('paper_fill', `Simulated ${exitSideOf(position)} ${position.quantity} ${symbol}: ${reason}.`, { ...position, exit, pnl, reason, fees_estimated: true }); return;
     }
     if (!this.connected || monotonic() - this._account_at > 45) { this._halt('Cannot request exits with stale account data. Check existing cover stops in Zerodha.'); return; }
     if (position.strategy === 'swing') {
@@ -638,6 +796,8 @@ export class TradingEngine {
     const orders = this.account.orders || [], byId = Object.fromEntries(orders.map(o => [String(o.order_id), o]));
     for (const [tag, intent] of entries(this.intents)) {
       if (['closed', 'rejected'].includes(intent.state)) continue;
+      const side=sideOf(intent),exitSide=exitSideOf(intent),direction=directionOf(intent);
+      if(!['BUY','SELL'].includes(side)){intent.state='conflict';this._halt('Invalid side in cover ownership journal.');continue;}
       const matches = orders.filter(o => (o.tag === tag || (o.tags || []).includes(tag)) && !o.parent_order_id);
       if (matches.length > 1) { intent.state = 'conflict'; this._halt(`Multiple broker orders match intent ${tag}; manual reconciliation required.`); continue; }
       let parent = byId[intent.order_id] || matches[0];
@@ -647,8 +807,8 @@ export class TradingEngine {
       }
       if (!parent) { intent.state = 'unknown'; this._halt(`Unresolved order intent for ${intent.symbol}; no automatic resubmission.`); continue; }
       intent.order_id = String(parent.order_id);
-      if (parent.variety !== 'co' || parent.transaction_type !== 'BUY' || parent.exchange !== 'NSE' || parent.tradingsymbol !== intent.symbol || !['MIS', 'CO'].includes(parent.product) || Number(parent.quantity ?? -1) !== Number(intent.quantity)) {
-        intent.state = 'conflict'; this._halt('Broker order does not match protected long-only ownership journal.'); continue;
+      if (parent.variety !== 'co' || parent.transaction_type !== side || parent.exchange !== 'NSE' || parent.tradingsymbol !== intent.symbol || !['MIS', 'CO'].includes(parent.product) || Number(parent.quantity ?? -1) !== Number(intent.quantity)) {
+        intent.state = 'conflict'; this._halt('Broker order does not match protected directional ownership journal.'); continue;
       }
       const children = orders.filter(o => String(o.parent_order_id) === intent.order_id); let missingChild = false;
       for (const prior of intent.broker_children || []) {
@@ -659,26 +819,29 @@ export class TradingEngine {
         children.push(resolved);
       }
       if (missingChild) { intent.state = 'unknown'; this._halt(`Cover child history for ${intent.symbol} is unavailable. Its absence does not prove an exit; reconcile in Zerodha.`, 'order_unknown'); continue; }
-      if (children.some(o => o.exchange !== 'NSE' || o.tradingsymbol !== intent.symbol || !['MIS', 'CO'].includes(o.product) || o.variety !== 'co' || String(o.parent_order_id) !== intent.order_id || o.transaction_type !== 'SELL')) {
+      if (children.some(o => o.exchange !== 'NSE' || o.tradingsymbol !== intent.symbol || !['MIS', 'CO'].includes(o.product) || o.variety !== 'co' || String(o.parent_order_id) !== intent.order_id || o.transaction_type !== exitSide)) {
         intent.state = 'conflict'; this._halt(`Cover child identity for ${intent.symbol} changed; manual reconciliation required.`, 'ownership_conflict'); continue;
       }
       intent.broker_parent = jsonable(parent); intent.broker_children = jsonable(children); intent.broker_orders = [intent.broker_parent, ...intent.broker_children];
-      const filled = Number(parent.filled_quantity || 0), sold = sum(children.filter(o => o.transaction_type === 'SELL').map(o => Number(o.filled_quantity || 0)));
+      if([parent,...children].some(o=>!Number.isSafeInteger(Number(o.filled_quantity||0))||Number(o.filled_quantity||0)<0||Number(o.filled_quantity||0)>Number(o.quantity)||!Number.isSafeInteger(Number(o.quantity))||Number(o.quantity)<0||(Number(o.filled_quantity)>0&&(!Number.isFinite(Number(o.average_price))||Number(o.average_price)<=0)))){
+        intent.state='conflict';this._halt(`Invalid broker fill data for ${intent.symbol}; account reconciliation is required.`,'ownership_conflict');continue;
+      }
+      const filled = Number(parent.filled_quantity || 0), sold = sum(children.map(o => Number(o.filled_quantity || 0)));
       if (sold > filled) { intent.state = 'conflict'; this._halt(`Cover exit fills exceed entry fills for ${intent.symbol}; account reconciliation is required.`, 'ownership_conflict'); continue; }
       const quantity = Math.max(0, filled - sold), entry = Number(parent.average_price || intent.entry); intent.filled = filled;
-      let pnl = sum(children.filter(o => o.transaction_type === 'SELL').map(o => (Number(o.average_price || 0) - entry) * Number(o.filled_quantity || 0)));
+      let pnl = sum(children.map(o => direction*(Number(o.average_price || 0) - entry) * Number(o.filled_quantity || 0)));
       pnl -= (entry * sold + sum(children.map(o => Number(o.average_price || 0) * Number(o.filled_quantity || 0)))) * FEE_RATE;
       this.realised += pnl - (intent.pnl_accounted || 0); intent.pnl_accounted = pnl;
       const symbol = intent.symbol, activeChildren = children.filter(o => !TERMINAL.has(o.status));
       if (quantity) {
-        this.positions[symbol] = { symbol, token: intent.token, strategy: 'intraday', quantity, entry, stop: intent.stop, target: intent.target, tag, mode: 'live', last: this.quotes[intent.token]?.last_price ?? entry, entry_fee: entry * quantity * FEE_RATE, opened_at: intent.created_at, protection: activeChildren.length ? 'broker_cover' : 'unconfirmed' };
-        const protectedQuantity = sum(activeChildren.filter(o => o.transaction_type === 'SELL').map(o => Number(o.pending_quantity || 0)));
-        const changedStop = activeChildren.some(o => !intent.exit_at && Number(o.trigger_price || 0) + .0001 < Number(intent.stop));
+        this.positions[symbol] = { symbol, token: intent.token, strategy: 'intraday', setup:intent.setup, side, quantity, entry, stop: intent.stop, target: intent.target, tag, mode: 'live', last: this.quotes[intent.token]?.last_price ?? entry, entry_fee: entry * quantity * FEE_RATE, opened_at: intent.created_at, protection: activeChildren.length ? 'broker_cover' : 'unconfirmed' };
+        const protectedQuantity = sum(activeChildren.map(o => Number(o.pending_quantity || 0)));
+        const changedStop = activeChildren.some(o => !intent.exit_at && (!Number.isFinite(Number(o.trigger_price))||Number(o.trigger_price)<=0||direction*(Number(o.trigger_price)-Number(intent.stop)) < -.0001));
         if (protectedQuantity !== quantity || changedStop) { intent.state = 'unprotected'; this._halt(`Cover protection quantity or stop for ${symbol} differs from the journal; inspect Zerodha immediately.`, 'protection_missing'); }
         else intent.state = TERMINAL.has(parent.status) ? 'open' : 'pending';
         if (intent.exit_at && activeChildren.length) intent.state = 'exit_pending';
         const net = sum((this.account.positions?.net || []).filter(p => p.tradingsymbol === symbol && p.exchange === 'NSE' && ['MIS', 'CO'].includes(p.product)).map(p => Number(p.quantity || 0)));
-        if (net !== quantity) { intent.state = 'conflict'; this._halt(`Account quantity for ${symbol} differs from the bot journal (manual trade or reconciliation delay). Entries paused.`, 'ownership_conflict'); }
+        if (net !== direction*quantity) { intent.state = 'conflict'; this._halt(`Account quantity for ${symbol} differs from the bot journal (manual trade or reconciliation delay). Entries paused.`, 'ownership_conflict'); }
       } else if (TERMINAL.has(parent.status)) {
         if (activeChildren.some(o => Number(o.pending_quantity || 0) > 0)) { intent.state = 'conflict'; this._halt(`Cover child remains active without owned quantity for ${symbol}; inspect Zerodha.`, 'ownership_conflict'); continue; }
         delete this.positions[symbol]; intent.state = filled ? 'closed' : 'rejected'; this._event('intent_closed', `Broker intent resolved: ${symbol}.`, { tag, filled, pnl_estimated: pnl });
@@ -700,45 +863,67 @@ export class TradingEngine {
     const turnover = t => Number(this.quotes[t]?.volume_traded || 0) * Number(this.quotes[t]?.last_price || 0);
     return tokens.sort((a, b) => Number(!managed.has(a)) - Number(!managed.has(b)) || turnover(b) - turnover(a));
   }
+  _daily_history_bars(rows,today,minimum){
+    if(!Array.isArray(rows))return [];
+    const bars=[];
+    for(const row of rows){
+      if(!row||typeof row!=='object')return [];
+      const at=parseTime(row.date??row.time);if(!at)return [];
+      if(dateIST(at)>=today)continue; // An unfinished/current daily bar is not history.
+      const fields=['open','high','low','close','volume'].map(key=>row[key]);
+      if(!fields.every(Number.isFinite))return [];
+      bars.push(new Candle(at,...fields));
+    }
+    if(bars.length<minimum||!validate_bars(bars,{interval:'swing'}).valid)return [];
+    const latest=parseTime(dateIST(bars.at(-1).time)+'T00:00:00+05:30'),current=parseTime(today+'T00:00:00+05:30');
+    if(current-latest>7*86400000||bars.slice(1).some((bar,index)=>Math.abs(bar.open/bars[index].close-1)>.2))return [];
+    return bars;
+  }
+  _retry_daily_history(token){
+    const attempts=Math.min(4,(this._daily_history_retry[token]?.attempts||0)+1);
+    this._daily_history_retry[token]={attempts,next_at:monotonic()+Math.min(300,60*2**(attempts-1))};
+  }
   async _history_pass(signal) {
     const config = this.strategy_settings(), today = dateIST(this._now()), holdingTokens = this._holding_tokens();
-    const wanted = this._priority_tokens(Object.keys(this.universe).map(Number).filter(t => config.swing_enabled || holdingTokens.has(t)), holdingTokens);
-    const coverage = today + (config.swing_enabled ? ':all' : ':holdings:' + [...holdingTokens].sort((a, b) => a - b).join(','));
+    const riskTokens=this.settings.correlation_filter?new Set([...this._correlation_wanted,...this._holding_tokens(),...values(this.positions).map(p=>Number(p.token))]):new Set();
+    const wanted = this._priority_tokens(Object.keys(this.universe).map(Number).filter(t => config.swing_enabled || holdingTokens.has(t)||riskTokens.has(t)), new Set([...holdingTokens,...riskTokens]));
+    const coverage = today + (config.swing_enabled ? ':all' : ':holdings:' + [...new Set([...holdingTokens,...riskTokens])].sort((a, b) => a - b).join(','));
     if (!wanted.length || this._history_date === coverage || !this.connected) return;
-    const broker = this.broker; this._daily_checked.clear(); let completed = 0, failed = 0;
+    const broker = this.broker; let completed = 0, failed = 0, deferred = 0;
     this._event('daily_history', 'Loading completed daily candles for NSE swing analysis. Coverage grows as the rate-limited download completes.');
     for (const token of wanted) {
       if (!this.connected || signal?.aborted || this._shutdown || broker !== this.broker || dateIST(this._now()) !== today) return;
-      const cache = this.store.get(`daily:${token}`, {});
+      const minimum=holdingTokens.has(token)?21:55;
+      if(this._daily_history_bars(this.daily[token],today,minimum).length){completed++;continue;}
+      if(monotonic()<(this._daily_history_retry[token]?.next_at||0)){deferred++;continue;}
+      const cache = this.store.get(`daily:${token}`, {})||{};let downloaded=false;
       try {
-        let rows;
-        if (cache.date === today) rows = cache.rows || [];
-        else {
+        let bars=cache.date===today?this._daily_history_bars(cache.rows,today,minimum):[];
+        if(!bars.length){
           const end = parseTime(`${today}T00:00:00+05:30`);
-          rows = await broker.call('historical_data', token, new Date(end - 160 * 86400000), new Date(end - 1000), 'day');
+          downloaded=true;
+          const rows = await broker.call('historical_data', token, new Date(end - 160 * 86400000), new Date(end - 1000), 'day');
           if (signal?.aborted || this._shutdown || broker !== this.broker || dateIST(this._now()) !== today) return;
-          this.store.set(`daily:${token}`, { date: today, rows: jsonable(rows) }); await sleep(100, signal);
+          bars=this._daily_history_bars(rows,today,minimum);
+          if(bars.length)this.store.set(`daily:${token}`,{date:today,rows:jsonable(bars.map(({time,...fields})=>({date:time,...fields})))});
         }
-        const bars = [];
-        for (const row of rows) {
-          const at = parseTime(row.date);
-          if (at && dateIST(at) < today) bars.push(new Candle(at, Number(row.open), Number(row.high), Number(row.low), Number(row.close), Number(row.volume)));
-        }
-        if (bars.length >= (holdingTokens.has(token) ? 21 : 55) && (parseTime(today + 'T00:00:00+05:30') - parseTime(dateIST(bars.at(-1).time) + 'T00:00:00+05:30')) <= 7 * 86400000) {
+        if(bars.length){
           this.daily[token] = bars; this._daily_checked.delete(token);
+          delete this._daily_history_retry[token];completed++;
           if (monotonic() - (this.quotes[token]?.received_at ?? -Infinity) <= 10) this._queue_current_analysis(token);
-        }
-        completed++;
+        }else{delete this.daily[token];this._retry_daily_history(token);failed++;}
       } catch (exc) {
         if (signal?.aborted || this._shutdown) return;
         if (!(exc instanceof BrokerError)) throw exc;
-        failed++;
+        failed++;this._retry_daily_history(token);
         if (exc.kind === 'TokenException') { this.connected = false; this._halt('Authentication expired while loading daily history. Reconnect Zerodha.', 'auth_expired'); break; }
       }
       if ((completed + failed) % 100 === 0) this._event('daily_history', 'Daily candle download progress.', { downloaded: completed, failed, ready: count(this.daily), total: count(this.universe) });
+      if(downloaded)await sleep(100,signal);
     }
-    this._history_failures = failed; if (this.connected && !failed) this._history_date = coverage;
-    this._event('daily_history', 'Daily history pass finished.', { downloaded: completed, failed, ready: count(this.daily), total: count(this.universe) });
+    this._history_failures = wanted.length-completed;
+    this._history_date=this.connected&&completed===wanted.length?coverage:'';
+    this._event('daily_history', 'Daily history pass finished.', { ready:completed,failed,deferred,total:wanted.length });
   }
   async _history(signal = this._controller?.signal) {
     while (!signal?.aborted && !this._shutdown) {
@@ -747,9 +932,19 @@ export class TradingEngine {
       await sleep(30000, signal);
     }
   }
+  _valid_intraday_seed(rows,today){
+    if(!Array.isArray(rows)||rows.length<34||!validate_bars(rows,{interval:'intraday'}).valid)return false;
+    const last=parseTime(rows.at(-1).time??rows.at(-1).date),priorDay=dateIST(last);
+    const age=parseTime(today+'T00:00:00+05:30')-parseTime(priorDay+'T00:00:00+05:30');
+    return priorDay<today&&age<=7*86400000&&timeIST(last)==='15:25';
+  }
   async _intraday_history_pass(signal) {
     if (!this.connected || !marketHours(this._now()) || !this.strategy_settings().intraday_enabled || !count(this.quotes)) return;
-    const managed = new Set(values(this.positions).map(p => Number(p.token))), wanted = this._priority_tokens(Object.keys(this.universe).map(Number).filter(t => !this._intraday_history_loaded.has(t)), managed);
+    const today=dateIST(this._now());
+    for(const [token,seed] of entries(this.previous_intraday))if(!this._valid_intraday_seed(seed,today)){
+      delete this.previous_intraday[token];this._intraday_history_loaded.delete(Number(token));delete this._intraday_history_retry[token];
+    }
+    const managed = new Set(values(this.positions).map(p => Number(p.token))), wanted = this._priority_tokens(Object.keys(this.universe).map(Number).filter(t => !this._intraday_history_loaded.has(t)&&monotonic()>=(this._intraday_history_retry[t]||0)), managed);
     if (wanted.length) this._event('intraday_history', 'Loading completed five-minute candles, prioritising current turnover.', { remaining: wanted.length });
     const broker = this.broker;
     for (const token of wanted) {
@@ -757,13 +952,30 @@ export class TradingEngine {
       const now = this._now(), boundary = new Date(Math.floor(now.getTime() / 300000) * 300000), start = parseTime(`${dateIST(now)}T09:15:00+05:30`);
       if (boundary <= start) break;
       try {
-        const rows = await broker.call('historical_data', token, start, new Date(boundary - 1000), '5minute');
+        const cache=this.store.get(`intraday_seed:${token}`,{})||{},needsSeed=this.settings.enhanced_signals===true;
+        if(!this.previous_intraday[token]?.length&&cache.date===dateIST(now)&&this._valid_intraday_seed(cache.bars,dateIST(now)))this.previous_intraday[token]=cache.bars.map(b=>new Candle(b.time??b.date,...['open','high','low','close','volume'].map(k=>b[k])));
+        const from=needsSeed&&!this.previous_intraday[token]?.length?new Date(+start-7*86400000):start;
+        const rows = await broker.call('historical_data', token, from, new Date(boundary - 1000), '5minute');
         if (signal?.aborted || this._shutdown || broker !== this.broker || dateIST(this._now()) !== dateIST(now)) return;
-        this._seed_intraday(token, rows, boundary); this._intraday_history_loaded.add(token);
+        if(needsSeed&&!this.previous_intraday[token]?.length){
+          const earlier=rows.filter(r=>{const at=parseTime(r.date??r.time);return at&&at<start&&at>=from;});
+          const lastDate=earlier.length?dateIST(parseTime(earlier.at(-1).date??earlier.at(-1).time)):null;
+          const source=earlier.filter(r=>dateIST(parseTime(r.date??r.time))===lastDate);
+          if(this._valid_intraday_seed(source,dateIST(now))){
+            const prior=source.map(r=>new Candle(r.date??r.time,...['open','high','low','close','volume'].map(k=>r[k])));
+            this.previous_intraday[token]=prior;this.store.set(`intraday_seed:${token}`,{date:dateIST(now),bars:prior});
+          }
+        }
+        this._seed_intraday(token, rows, boundary);
+        const current=this.books[token]?.bars||[];
+        const complete=current.length&&timeIST(current[0].time)==='09:15'&&+current.at(-1).time+300000===+boundary&&validate_bars(current,{interval:'intraday'}).valid;
+        if(complete&&(!needsSeed||this.previous_intraday[token]?.length||current.length>=34)){this._intraday_history_loaded.add(token);delete this._intraday_history_retry[token];}
+        else this._intraday_history_retry[token]=monotonic()+60;
       } catch (exc) {
         if (signal?.aborted || this._shutdown) return;
         if (!(exc instanceof BrokerError)) throw exc;
         this._intraday_history_failed++;
+        this._intraday_history_retry[token]=monotonic()+60;
         if (exc.kind === 'TokenException') { this.connected = false; this._halt('Authentication expired loading intraday history. Reconnect Zerodha.', 'auth_expired'); break; }
       }
       if (this._intraday_history_loaded.size % 100 === 0) this._event('intraday_history', 'Intraday warmup progress.', { loaded: this._intraday_history_loaded.size, failed: this._intraday_history_failed, warmed: values(this.books).filter(b => b.bars.length >= 21).length, total: count(this.universe) });
@@ -781,7 +993,7 @@ export class TradingEngine {
     const book = this.books[token]; if (!book) return;
     const merged = new Map(book.bars.map(b => [b.time.getTime(), b]));
     for (const row of rows) {
-      const at = parseTime(row.date);
+      const at = parseTime(row.date??row.time);
       if (!at || dateIST(at) !== dateIST(boundary) || at.getTime() + 300000 > boundary.getTime() || timeIST(at) < '09:15' || at.getUTCMinutes() % 5 || at.getUTCSeconds()) continue;
       const fields = ['open', 'high', 'low', 'close', 'volume'].map(k => Number(row[k]));
       if (!fields.every(Number.isFinite) || Math.min(...fields.slice(0, 4)) <= 0 || fields[4] < 0 || fields[1] < Math.max(fields[0], fields[3]) || fields[2] > Math.min(fields[0], fields[3])) continue;
@@ -812,19 +1024,19 @@ export class TradingEngine {
     this.holdings_signals = results;
   }
   snapshot() {
-    const positions = values(this.positions).map(p => ({ ...p, unrealised: round(((p.last ?? p.entry) - p.entry) * p.quantity - (p.entry_fee || 0)) }));
+    const positions = values(this.positions).map(p => ({ ...p, side:sideOf(p), unrealised: round(markedProfit(p)) }));
     const pending = values(this.intents).some(i => !['closed', 'rejected'].includes(i.state)), delivery = this.delivery?.snapshot() || {}, deliveryBusy = values(delivery.positions || {}).some(p => p.status !== 'closed'), unrealised = this._unrealised();
     return jsonable({ mode: this.mode, status: this.status, connected: this.connected, user_id: this.user_id, capital: this.capital,
       equity: round(this.capital + this.realised - this._capital_accounted_pnl + unrealised), realised_pnl: round(this.realised), unrealised_pnl: round(unrealised), daily_pnl: round(this._daily_pnl()), pnl_fees_estimated: true,
       capital_source: this.mode === 'paper' ? 'persisted_paper_balance_seeded_from_broker_cash' : 'verified_broker_cash', broker_available_cash: this._broker_available_cash,
-      risk_used: round(sum(values(this.positions).map(p => Math.max(0, p.entry - p.stop) * p.quantity))), universe_count: count(this.universe),
+      risk_used: round(sum(values(this.positions).map(plannedRisk))), universe_count: count(this.universe),
       subscribed_count: sum(entries(this.streams).filter(([, ready]) => ready).map(([i]) => Math.min(3000, count(this.universe) - Number(i) * 3000))),
-      warmed_count: values(this.books).filter(b => b.bars.length >= 21).length, swing_warmed_count: count(this.daily), swing_history_failures: this._history_failures,
+      warmed_count: entries(this.books).filter(([t,b]) => this._intraday_warmed(t,b)).length,prior_session_seed_count:count(this.previous_intraday),swing_warmed_count: count(this.daily), swing_history_failures: this._history_failures,
       heartbeat: this._heartbeat, market_open: marketHours(this._now()), feed_fresh: monotonic() - this._last_tick_received <= 10, account_fresh: monotonic() - this._account_at <= 45,
       positions, account: this.account, signals: this.signals, holdings_signals: this.holdings_signals, delivery, performance: this.analytics.snapshot(this._analysis_pending.size, this._analysis_cache.size),
       intents: values(this.intents).slice(-100), strategy_settings: this.strategy_settings(), pending_orders: [...values(this.intents).filter(i => !['closed', 'rejected', 'open'].includes(i.state)), ...values(delivery.positions || {}).filter(p => p.status !== 'closed')],
       safe_to_stop: !this._other_mode_live_risk() && (this.mode !== 'live' || (!positions.length && !pending && !deliveryBusy && !this.running)), unmanaged_live_exposure: this._other_mode_live_risk(),
-      message: this.message, error: this.error, recovery: { ...this.recovery }, live_swing_supported: true,
+      message: this.message, error: this.error, recovery: { ...this.recovery }, readiness:this.readiness(),live_swing_supported: true, decision_controls:this._decision_controls(),
       limitations: ['Strategies are unvalidated research rules, not proven profitable models.', 'Paper fills include a 0.05% price adjustment and estimated 0.1% fees per side.', 'New swing buys require DDPI/POA; existing holding sales can request current-day CDSL authorization. GTT limits do not guarantee fills through gaps or circuits.', 'Exchange holidays are inferred from fresh market data; no holiday calendar is assumed.'] });
   }
 }

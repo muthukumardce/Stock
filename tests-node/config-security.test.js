@@ -30,6 +30,16 @@ test('legacy auth keys and directory import once; invalid config save leaves sto
   assert.equal(manager.saved.public_url,undefined);assert.equal(manager.saved.paper_capital,undefined);
   const before=fs.readFileSync(manager.filename,'utf8');assert.throws(()=>manager.save({port:NaN}));assert.equal(fs.readFileSync(manager.filename,'utf8'),before);
 });
+
+test('private data paths cannot enter publicly served files through direct, missing or linked descendants',async t=>{
+  const dir=temp(t),manager=new ConfigManager(dir,{});await manager.load({password:'Static-path-test-password!'});
+  const before=fs.readFileSync(manager.filename,'utf8');
+  for(const data_dir of ['public',path.join('public','not-created','journal')])assert.throws(()=>manager.save({data_dir}),/outside publicly served/);
+  fs.mkdirSync(path.join(dir,'public'));fs.symlinkSync(path.join(dir,'public'),path.join(dir,'public-alias'),process.platform==='win32'?'junction':'dir');
+  for(const data_dir of ['public-alias',path.join('public-alias','new','journal')])assert.throws(()=>manager.save({data_dir}),/outside publicly served/);
+  assert.equal(fs.readFileSync(manager.filename,'utf8'),before);
+  assert.equal(manager.candidate({data_dir:'public-private'}).data_dir,path.join(dir,'public-private'));
+});
 test('native Fernet and Argon2 accept fixtures written by Python and reject tampering',async()=>{
   const cipher=new Fernet('AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8='),fixture='gAAAAABqqy0m8Lh_bQQ_vXguCv53cTMZA6SzHhhAOur8PPIUCXQvhf8hli4opcIuC1i96p5Cl5zsBL6yShht1doE1FMceOu9_Z_GGN_iDFsoO4hZs9CoA-U=';
   assert.equal(cipher.decrypt(fixture),'Node migration fixture');const token=cipher.encrypt('unicode ₹ payload');assert.equal(cipher.decrypt(token),'unicode ₹ payload');

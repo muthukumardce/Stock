@@ -11,6 +11,10 @@ A self-hosted Zerodha trading dashboard for **Windows, macOS and Linux**, runnin
 - Analyzes existing holdings for exits. Automatic selling is limited to selected symbols by default; the initial selection is empty. You can select symbols or all eligible NSE holdings in Settings.
 - Scans the available NSE EQ universe, including any ETFs classified as EQ, using completed candles and fresh market data.
 - Runs CPU analytics in lazy Node worker threads while one coordinated execution service handles orders.
+- Evaluates 11 intraday setup families in both directions: breakout, pullback, range reversion, opening range/drive, gap continuation/reversal, VWAP reclaim/rejection, volatility squeeze and relative strength. Swing remains long-only.
+- Combines 42 contextual candle formations with causal prior-session candles, completed 15-minute trend alignment and verified benchmark/sector context.
+- Shows market breadth, announced-event blackouts, account exposure, operational readiness, risk blockers and the evidence supporting or opposing a signal.
+- Automatically compares baseline and enhanced rules on a bounded historical sample after connection, with a separate Research page for results and cancellation.
 - Journals order intentions before broker mutations, reconciles actual fills and protection, and re-evaluates exposure after a restart.
 
 Read the [logic and analytics guide](docs/LOGIC_AND_ANALYTICS.md) for formulas, order lifecycles, risk checks, recovery behavior and worked examples.
@@ -62,8 +66,16 @@ All non-Kite configuration has defaults and is managed from the dashboard. No ex
 | Server | Local port `3000`; data directory `data`. |
 | Risk | Risk per trade `0.0025` (0.25%); maximum position allocation `0.10` (10%); daily loss limit `0.01` (1%); maximum five bot positions. |
 | Market filters | Maximum spread `0.003` (0.3%); minimum turnover estimate Rs 10,000,000. |
+| Enhanced rules | All 11 intraday families enabled, including protected shorts; completed higher timeframe alignment enabled. Minimum evidence score 60/100, which is not a profit probability. |
+| Market breadth | Enabled; at least 30 liquid stocks, 20% fresh quote coverage and 45% advancing shares for longs or declining shares for shorts. |
+| Announced events | Entries blocked one calendar day before through one day after an announced corporate event. Missing/stale official calendar coverage also blocks entries. |
+| Account exposure | Maximum 25% in one stock, 90% gross exposure and 3% estimated stress loss relative to reference assets. Existing/manual holdings count. |
+| Correlation | Enabled; absolute daily-return correlation of at least 0.85 groups exposure, capped at 35% of reference assets. Missing history blocks an entry; opposite positions do not automatically earn hedge credit. |
+| Activity limits | At most 10 new symbols attempted per day; a 30-minute entry cooldown after three consecutive realized loss events. |
+| Research | Automatic after connection; 20 currently listed NSE instruments, 45 calendar days of five-minute history; estimated costs 0.1% and slippage 0.05% per side. |
 | Intraday times | Entry cutoff `14:45`; exit target `15:10`, both India Standard Time. |
 | Analytics | Workers `0` means automatic; reserve four logical CPUs; batch size 32. |
+| Machine health | New entries wait below 512 MiB free journal-disk space or 256 MiB free RAM, or above 2,000 ms event-loop delay. |
 | Administrator/security | Change admin username/password and rotate generated security keys. Current password is required; dashboard sessions are revoked after a change. |
 
 Risk inputs labeled **fraction** use `0.01` for 1%. Strategy allocations labeled **percent** use `100` for 100%.
@@ -123,7 +135,7 @@ Electronic authorization lasts for the trading day and needs renewal on a later 
 | Action | Result |
 |---|---|
 | Start/Resume Trading | Connects if needed, refreshes account state and enables entry decisions only after recovery and risk checks pass. |
-| Pause entries | Stops new buys and requests cancellation of known pending entries. Monitoring and exits for managed positions continue. |
+| Pause entries | Stops new entries and requests cancellation of known pending entries. Monitoring and exits for managed positions continue. |
 | Close managed positions | Requests exits for bot positions and already adopted existing holdings. It does not sell unselected/unadopted holdings or guarantee immediate fills. |
 | Holdings authorization needed | Blocks new entries while existing positions remain monitored. The affected delivery sale/protection waits for verified authorization. |
 | Close browser / sign out | Ends dashboard access; server trading continues. |
@@ -148,9 +160,9 @@ When moving to another operating system, copy source, `.env`, `config/` and the 
 
 ## Resources, data and validation
 
-Automatic analytics capacity is logical CPUs minus four, with at least one worker. This machine reports **192 logical CPUs**, so its automatic ceiling is **188 worker threads**. Workers start as batches arrive and retire after being idle; they do not consume every core constantly. Broker rate limits and cold historical downloads often dominate startup time. Only one coordinated execution service sends orders.
+Automatic analytics capacity uses the detected available CPU estimate minus four, with at least one worker. On macOS/Linux it respects the runtime's usable parallelism. On supported Windows builds a bounded, read-only CIM probe handles Node versions that report just one processor group. This machine reports **96 physical / 192 logical CPUs**, so the verified wider estimate gives a ceiling of **188 worker threads**. Runtime CPU counts and any sampled usage subset remain visible. This is a scheduling estimate; the app does not change affinity or guarantee OS scheduling. Workers start as batches arrive and retire after being idle. Broker rate limits and cold historical downloads often dominate startup time. Only one coordinated execution service sends orders.
 
-Intraday needs 21 contiguous completed five-minute candles and cannot qualify before approximately 11:00 IST. Swing needs 55 completed daily candles. Full-universe historical warmup can take tens of minutes. Missing or stale information prevents entries. Rules use breakouts, volume, candle shape, moving averages and ATR; RSI and regression diagnostics are explanatory metrics, not an AI prediction model.
+Enhanced intraday indicators can warm from the previous completed session while VWAP resets at 09:15. Opening-drive setups can become eligible after three completed current-session candles (09:30), provided prior history, higher timeframe alignment and other conditions pass. There is no promise of a trade at that time. Without prior history, indicators need sufficient current-session candles. The optional baseline keeps its 21-bar minimum (approximately 11:00); swing needs 55 completed daily candles. Full-universe historical warmup can take tens of minutes. Missing or stale information prevents entries. Enhanced rules use EMA, Wilder RSI/ATR/ADX, MACD, Bollinger Bands, VWAP, relative volume and contextual candle patterns. Workers have a 15-second job timeout; these remain deterministic rules rather than a trained prediction model.
 
 Run automated checks with:
 
@@ -158,9 +170,33 @@ Run automated checks with:
 npm test
 ```
 
+`npm run benchmark` runs a synthetic 9,000-symbol analytics pass with no broker connection. Use `npm run benchmark -- 1000` for a smaller check. On this machine the recorded pass completed 9,000 valid analyses in 5.293 seconds with 188 workers and about 4.843 GiB peak process memory. This measures the supplied synthetic workload, not market-feed latency or order execution speed.
+
 Tests exercise application security, strategy calculations, real analytics workers, broker adapters, order recovery and UI polling with local fixtures. They do not establish profitability or prove real broker/tunnel operation. Paper fills omit order-queue dynamics; paper swing does not fully simulate the live GTT/trailing lifecycle. The [analytics guide](docs/LOGIC_AND_ANALYTICS.md) documents these differences.
 
 The dependency lock includes a patched `serialize-javascript` override because the Kite SDK includes an older Mocha test dependency in its published runtime dependencies. StockPilot uses Node's built-in test runner.
+
+## Understand decisions and review research
+
+The Overview page's **Decision controls** shows the live breadth sample, account exposure by stock, current restrictions and ranked candidates. Expand **Indicators & evidence** under Latest analysis to inspect EMA, RSI, MACD, ADX, Bollinger Bands, ATR, VWAP, relative volume and detected patterns. A score describes agreement among the implemented rules; it does not estimate the chance of making money. A candidate still needs current account, price, liquidity and risk checks.
+
+Open **Research** after connecting Zerodha. Automatic research is enabled by default; **Run analysis** requests a fresh comparison, **Refresh** reads progress, and **Cancel research** stops that research job without pausing trading. No symbols, cash amount or additional secrets need to be entered. Historical downloads use the same broker rate limiter as account activity, so the collection takes time. The most recent completed report remains available after a restart or a cancelled replacement run.
+
+The report compares the original breakout rules with the enhanced rules on identical candles and execution assumptions. It shows net return, drawdown, closed trades, win rate, expectancy, costs, chronological 60%/20%/20% reporting periods, instrument coverage and missing data. These reporting periods do not train or optimize a model. Trades, open exposure and indicator history carry across period boundaries.
+
+The default sample is the first 20 symbols alphabetically from the **current** NSE equity universe, over the preceding 45 calendar days, excluding today. It is a bounded diagnostic sample, not all NSE shares or a representative investment universe. Swing research uses daily candles over seven times the configured lookback (315 calendar days by default). When both modes are enabled, both comparisons run sequentially and are retained together. Available historical NIFTY 50 and verified sector-index series use the same requested window; missing context is reported.
+
+Research uses completed-candle signals and subsequent-candle entries, with conservative assumptions when both stop and target are touched. Missing candles are detected causally: earlier trades remain in the result, later entries that session stop, and existing exposure exits at the first observed opening after a gap. Positions without an observed exit remain explicitly unresolved. Shorts reserve full notional and incur adverse fill adjustments and costs on both sides. Swing research, paper swing and live delivery share daily SMA/trailing calculations; research does not reproduce the broker GTT lifecycle.
+
+The simulation also omits historical live breadth, account holdings, correlation, broker execution/protection, demat authorization, corporate actions and market queues. Results cannot prove profitability, and **research never changes strategy settings or enables live trading automatically**. See [research methodology and limits](docs/LOGIC_AND_ANALYTICS.md#12-historical-research-and-its-limits).
+
+For an independent dataset, run `npm run research -- candles.json report.json 100000` or `npm run research -- candles.csv report.json 100000 day`. This offline-only command requires an explicit hypothetical capital amount because it never connects to an account. It does not add a capital setting to the app. CSV columns are `symbol,time,open,high,low,close,volume`; JSON uses `{ "interval": "5minute", "symbols": { "INFY": [{ "time": "2026-09-16T09:15:00+05:30", "open": 1500, "high": 1502, "low": 1499, "close": 1501, "volume": 1000 }] } }`. Supply sufficient chronological history for the strategies. Input is limited to 64 MiB and 250,000 candles, and output must be a new file.
+
+To make a paired recovery backup, stop the server and run `npm run backup -- "D:\PrivateBackups\stockpilot-2026-09-17"` on Windows, or use a new private directory on macOS/Linux. The parent directory must exist. The command refuses an active server and existing destinations, checks the SQLite snapshot, and stores matching `.env`, `config/settings.json`, database and checksums. It contains credentials and encryption keys; keep it private. Restore the three files together while stopped, placing the database at the `data_dir` in the matching configuration. A restored snapshot still requires current broker reconciliation before trading.
+
+Backups copy the literal `.env` file. If the backup process has a Kite environment override that differs from that file, the command stops before creating the backup. Process and service environment secrets are never exported; verify any separately managed service credentials match the intended `.env` before backup and restore. Data directories and backup destinations cannot be inside `public/`, including directory aliases, because those files are publicly served.
+
+Run `npm test` for unit/integration checks. For real browser checks, run `npx playwright install chromium` once, then `npm run test:browser`. Browser verification uses isolated temporary configuration, synthetic account data and desktop/mobile viewports; it never connects to Zerodha or places orders. Operational scope and remaining external verification are recorded in [acceptance criteria](docs/ACCEPTANCE.md); public-data coverage is explained in [market context](docs/MARKET_CONTEXT.md).
 
 | Symptom | Check |
 |---|---|

@@ -122,6 +122,13 @@ test('confirmed partial IOC fill is the only quantity protected', async t => {
   assert.equal(p.quantity, 4); assert.equal(p.remaining_quantity, 4); assert.equal(p.token, 123); assert.equal(p.is_bot_owned, true);
 });
 
+test('a terminal partial IOC releases its unfilled allocation for another protected holding',async t=>{
+  const {manager,broker,store}=context(t);broker.buy_fill=4;await enter(manager);
+  store.set('strategy_settings',{swing_enabled:true,swing_capital:1000});
+  const result=await manager.submit_entry('TCS',5,100,95,110,.05,124);
+  assert.equal(result.status,'protected');assert.equal(mutations(broker,'place_order').length,2);
+});
+
 test('accepted entry with lost response is found by tag across restart without duplicate', async t => {
   const { manager, broker, restart } = context(t); broker.timeout_order_after = true;
   assert.equal((await enter(manager)).status, 'protected');

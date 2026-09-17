@@ -59,6 +59,13 @@ test('cover entry and cancel map to protected broker routes without independent 
   assert.equal(requests[1].url.searchParams.get('parent_order_id'), 'parent');
 });
 
+test('short cover uses SELL with a buy-stop trigger above entry through the same protected route',async()=>{
+  const {broker,requests}=fixture(()=>success({order_id:'short-parent'}));
+  assert.equal(await broker.sell_cover('INFY',10,100,102,'short-test'),'short-parent');
+  const body=new URLSearchParams(requests[0].options.body);
+  assert.equal(requests[0].url.pathname,'/orders/co');assert.equal(body.get('transaction_type'),'SELL');assert.equal(body.get('trigger_price'),'102');assert.equal(body.get('price'),'100');assert.equal(body.get('product'),'MIS');
+});
+
 test('GTT payload matches condition and orders schema and preserves trigger ID response', async () => {
   const {broker, requests} = fixture(() => success({trigger_id: 987}));
   const orders = [{exchange: 'NSE', tradingsymbol: 'INFY', transaction_type: 'SELL', quantity: 1, order_type: 'LIMIT', product: 'CNC', price: 98}];
@@ -146,10 +153,50 @@ test('API error types survive without raw server message in public error text', 
     assert.equal(error.kind, 'TokenException');
     assert.equal(error.http_status, 403);
     assert.equal(error.auth_required, false);
+    assert.equal(error.definitive_rejection, true);
     assert.equal(error.detail, '[redacted] expired');
     assert(!error.message.includes('expired'));
     return true;
   });
+});
+
+test('cover response with an acknowledgement never acquires definitive rejection, even with a familiar exception name', async () => {
+  for (const status of [400, 428, 500]) for (const acknowledgement of [
+    {order_id: 'accepted-parent'}, {data: {order_id: 'accepted-parent'}},
+    {trigger_id: 123}, {data: {trigger_id: 123}},
+  ]) {
+    const {broker, requests} = fixture(() => ({ok: false, status, json: async () => ({
+      status: 'error', error_type: 'InputException', message: 'Contradictory response', ...acknowledgement,
+    })}));
+    await assert.rejects(broker.buy_cover('INFY', 1, 100, 98, 'review-intent'), error => {
+      assert.equal(error.kind, 'InputException');
+      assert.equal(error.definitive_rejection, false);
+      assert.equal(error.auth_required, false);
+      return true;
+    });
+    assert.equal(requests.length, 1);
+  }
+});
+
+test('definitive rejection requires a verified client precondition response, not merely a kind string', async () => {
+  const valid = {status: 'error', error_type: 'InputException', message: 'Invalid trigger price'};
+  const cases = [
+    ...[200, 302, 408, 500, 502, 503, 504].map(status => ({status, body: valid})),
+    ...[{}, [], {...valid, status: 'success'}, {...valid, message: ''}, {...valid, message: null},
+      {...valid, data: []}, {...valid, data: 'unexpected'},
+      ...['NetworkException', 'DataException', 'GeneralException', 'OrderException', 'unknown kind'].map(error_type => ({...valid, error_type})),
+    ].map(body => ({status: 400, body})),
+  ];
+  for (const {status, body} of cases) {
+    const {broker, requests} = fixture(() => ({ok: status >= 200 && status < 300, status, json: async () => body}));
+    await assert.rejects(broker.buy_cover('INFY', 1, 100, 98, 'review-intent'), error => error.definitive_rejection === false);
+    assert.equal(requests.length, 1);
+  }
+  for (const [status, error_type] of [[400, 'InputException'], [403, 'TokenException'], [403, 'PermissionException'], [428, 'InputException'], [429, 'InputException']]) {
+    const {broker, requests} = fixture(() => ({ok: false, status, json: async () => ({...valid, error_type, data: null})}));
+    await assert.rejects(broker.buy_cover('INFY', 1, 100, 98, 'review-intent'), error => error.definitive_rejection === true);
+    assert.equal(requests.length, 1);
+  }
 });
 
 test('verified Kite HTTP 428 rejection retains authorization metadata through redaction', async () => {
@@ -196,10 +243,24 @@ test('parse failures and network failures do not acquire definitive authorizatio
   await assert.rejects(disconnected.broker.call('place_order', {variety: 'regular'}), error => {
     assert.equal(error.http_status, null);
     assert.equal(error.auth_required, false);
+    assert.equal(error.definitive_rejection, false);
     return true;
   });
   assert.equal(malformed.requests.length, 1);
   assert.equal(disconnected.requests.length, 1);
+});
+
+test('a transport error cannot forge a definitive precondition rejection flag', async () => {
+  const {broker, requests} = fixture(() => { throw Object.assign(new Error('Transport failed'), {
+    kind: 'InputException', http_status: 400, definitive_rejection: true,
+  }); });
+  await assert.rejects(broker.buy_cover('INFY', 1, 100, 98, 'review-intent'), error => {
+    assert.equal(error.kind, 'InputException');
+    assert.equal(error.http_status, null);
+    assert.equal(error.definitive_rejection, false);
+    return true;
+  });
+  assert.equal(requests.length, 1);
 });
 
 test('an incomplete successful order response remains ambiguous and is never retried', async () => {
@@ -249,4 +310,69 @@ test('up to three socket workers isolate subscriptions and close suppresses stal
   assert.equal(statuses.length, 1);
   assert(workers.every(worker => worker.terminated));
   await assert.rejects(broker.stream(Array(9001).fill(1), () => {}, () => {}, () => {}), /9,000/);
+});
+
+test('a failed feed worker retires once and restores only its original subscription with backoff',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});const workers=[],statuses=[],ticks=[];let now=0;
+  class FakeWorker extends EventEmitter {async terminate(){this.terminated=true;this.emit('exit',1);}}
+  const broker=new KiteBroker('key','token',{clock:()=>now,workerFactory:(_url,options)=>{const w=new FakeWorker();w.data=options.workerData;workers.push(w);return w;}});t.after(()=>broker.close());
+  await broker.stream(Array.from({length:3001},(_,i)=>i+1),v=>ticks.push(v),()=>{},(...v)=>statuses.push(v));
+  const failed=workers[0];failed.emit('error',new Error('synthetic worker failure'));failed.emit('exit',1);
+  failed.emit('message',{type:'ticks',ticks:[{instrument_token:1}]});await Promise.all([...broker._retiringSockets]);
+  assert.equal(failed.terminated,true);assert.equal(statuses.length,1);assert.equal(statuses[0][1],false);assert.deepEqual(ticks,[]);
+  t.mock.timers.tick(999);assert.equal(workers.length,2);t.mock.timers.tick(1);assert.equal(workers.length,3);
+  assert.deepEqual(workers[2].data.tokens,failed.data.tokens);assert.equal(broker.sockets.length,2);assert.equal(workers[1].terminated,undefined);
+  workers[2].emit('message',{type:'status',connected:true});workers[2].emit('message',{type:'ticks',ticks:[{instrument_token:1}]});assert.equal(statuses.at(-1)[1],true);assert.equal(ticks.length,1);
+  now=.5;workers[2].emit('message',{type:'status',connected:false});now=100;workers[2].emit('message',{type:'status',connected:true});now=100.5;
+  workers[2].emit('error',new Error('second failure'));await Promise.all([...broker._retiringSockets]);t.mock.timers.tick(1999);assert.equal(workers.length,3);t.mock.timers.tick(1);assert.equal(workers.length,4);
+});
+
+test('exhausted SDK reconnection retires the isolate and closing cancels pending replacement',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});const workers=[];
+  class FakeWorker extends EventEmitter {async terminate(){this.terminated=true;this.emit('exit',0);}}
+  const broker=new KiteBroker('key','token',{workerFactory:()=>{const w=new FakeWorker();workers.push(w);return w;}});
+  await broker.stream([1],()=>{},()=>{},()=>{});workers[0].emit('message',{type:'restart'});await Promise.all([...broker._retiringSockets]);
+  assert.equal(workers[0].terminated,true);await broker.close();t.mock.timers.tick(60000);assert.equal(workers.length,1);assert.equal(broker.sockets.length,0);
+  await broker.stream([2],()=>{},()=>{},()=>{});workers[0].emit('message',{type:'restart'});t.mock.timers.tick(60000);assert.equal(workers.length,2);await broker.close();
+});
+
+test('feed replacement waits for confirmed worker retirement instead of exceeding socket capacity',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});const workers=[];
+  class FakeWorker extends EventEmitter {async terminate(){if(!this.confirmed)throw new Error('termination uncertain');this.emit('exit',1);}}
+  const broker=new KiteBroker('key','token',{workerFactory:()=>{const w=new FakeWorker();workers.push(w);return w;}});t.after(()=>broker.close());
+  await broker.stream([1],()=>{},()=>{},()=>{});workers[0].emit('error',new Error('synthetic failure'));await Promise.all([...broker._retiringSockets]);
+  t.mock.timers.tick(120000);assert.equal(workers.length,1);assert.equal(broker.sockets.length,1);
+  workers[0].confirmed=true;workers[0].emit('exit',1);t.mock.timers.tick(1000);assert.equal(workers.length,2);assert.equal(broker.sockets.length,1);workers[1].confirmed=true;
+});
+
+test('worker construction failures back off to sixty seconds and stop after broker close',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});let attempts=0;
+  const broker=new KiteBroker('key','token',{workerFactory:()=>{attempts++;throw new Error('Cannot create worker');}});
+  await broker.stream([1],()=>{},()=>{},()=>{});assert.equal(attempts,1);
+  for(const delay of [1000,2000,4000,8000,16000,32000,60000,60000]){const before=attempts;t.mock.timers.tick(delay-1);assert.equal(attempts,before);t.mock.timers.tick(1);assert.equal(attempts,before+1);}
+  await broker.close();const before=attempts;t.mock.timers.tick(120000);assert.equal(attempts,before);
+});
+
+test('concurrent stream requests keep only the latest subscriptions within the three-worker limit',async()=>{
+  const workers=[];class FakeWorker extends EventEmitter{async terminate(){this.terminated=true;this.emit('exit',0);}}
+  const broker=new KiteBroker('key','token',{workerFactory:(_url,options)=>{const worker=new FakeWorker();worker.tokens=options.workerData.tokens;workers.push(worker);return worker;}});
+  const first=Array.from({length:6000},(_,i)=>i+1),latest=first.map(i=>i+10000);
+  await Promise.all([broker.stream(first,()=>{},()=>{},()=>{}),broker.stream(latest,()=>{},()=>{},()=>{})]);
+  assert.equal(workers.filter(w=>!w.terminated).length,2);assert.deepEqual(broker.sockets.flatMap(w=>w.tokens),latest);await broker.close();
+});
+
+test('close cancels a stream waiting for deferred old-worker termination',async()=>{
+  let release,started;const retiring=new Promise(resolve=>{release=resolve;}),began=new Promise(resolve=>{started=resolve;}),workers=[];
+  class FakeWorker extends EventEmitter{async terminate(){started();await retiring;this.terminated=true;this.emit('exit',0);}}
+  const broker=new KiteBroker('key','token',{workerFactory:()=>{const w=new FakeWorker();workers.push(w);return w;}});
+  await broker.stream([1],()=>{},()=>{},()=>{});const pending=broker.stream([2],()=>{},()=>{},()=>{});await began;
+  const closing=broker.close();release();await Promise.all([pending,closing]);assert.equal(workers.length,1);assert.equal(broker.sockets.length,0);
+});
+
+test('unconfirmed close retains old workers and prevents new subscriptions until they exit',async()=>{
+  const workers=[];class FakeWorker extends EventEmitter{async terminate(){if(this.uncertain)throw new Error('Cannot confirm termination');this.emit('exit',0);}}
+  const broker=new KiteBroker('key','token',{workerFactory:()=>{const w=new FakeWorker();w.uncertain=workers.length===0;workers.push(w);return w;}});
+  await broker.stream([1],()=>{},()=>{},()=>{});await assert.rejects(broker.close(),/termination is unconfirmed/);assert.equal(broker.sockets.length,1);
+  await assert.rejects(broker.stream([2],()=>{},()=>{},()=>{}),/termination is unconfirmed/);assert.equal(workers.length,1);
+  workers[0].emit('exit',1);assert.equal(broker.sockets.length,0);await broker.stream([2],()=>{},()=>{},()=>{});assert.equal(workers.length,2);await broker.close();
 });

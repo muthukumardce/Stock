@@ -3,6 +3,8 @@ import {Worker} from 'node:worker_threads';
 import {Mutex, monotonic, sleep, parseTime, isoIST} from './util.js';
 
 const SECRET_FIELDS = new Set(['access_token', 'api_key', 'api_secret', 'request_token', 'password', 'enctoken']);
+const REJECTION_STATUSES = new Set([400, 401, 403, 404, 405, 410, 422, 428, 429]);
+const REJECTION_KINDS = new Set(['InputException', 'PermissionException', 'TokenException']);
 
 export function jsonable(value) {
   if (value instanceof Date) return value.toISOString();
@@ -13,13 +15,14 @@ export function jsonable(value) {
 }
 
 export class BrokerError extends Error {
-  constructor(kind, detail = '', {http_status = null, auth_required = false} = {}) {
+  constructor(kind, detail = '', {http_status = null, auth_required = false, definitive_rejection = false} = {}) {
     super(`Zerodha request failed (${kind}). Check account activity and reconnect if needed.`);
     this.name = 'BrokerError';
     this.kind = kind;
     this.detail = detail;
     this.http_status = Number.isInteger(http_status) && http_status >= 100 && http_status <= 599 ? http_status : null;
     this.auth_required = this.http_status === 428 && auth_required === true;
+    this.definitive_rejection = definitive_rejection === true && REJECTION_STATUSES.has(this.http_status) && REJECTION_KINDS.has(kind);
   }
 }
 
@@ -77,6 +80,8 @@ export class KiteBroker {
     this._last_call = -Infinity;
     this._last_quote = -Infinity;
     this.sockets = [];
+    this._streamSlots = new Set(); this._retiringSockets = new Set();
+    this._streamLifecycle = new Mutex();
     this._generation = 0;
     this._fetch = options.fetch ?? globalThis.fetch;
     this._clock = options.clock ?? monotonic;
@@ -101,7 +106,7 @@ export class KiteBroker {
         const rawKind = error.kind || error.name || 'Error';
         const kind = /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(rawKind) ? rawKind : 'BrokerException';
         throw new BrokerError(kind, detail, error instanceof BrokerError ? {
-          http_status: error.http_status, auth_required: error.auth_required,
+          http_status: error.http_status, auth_required: error.auth_required, definitive_rejection: error.definitive_rejection,
         } : {});
       }
     });
@@ -216,13 +221,19 @@ export class KiteBroker {
     if (!response.ok || body?.status !== 'success') {
       const validError = body && typeof body === 'object' && !Array.isArray(body) && body.status === 'error' &&
         typeof body.message === 'string' && body.message.trim().length > 0 &&
-        typeof body.error_type === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(body.error_type);
+        typeof body.error_type === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(body.error_type) &&
+        (!Object.hasOwn(body, 'data') || body.data === null || plain(body.data));
       const acknowledged = [body?.order_id, body?.data?.order_id, body?.trigger_id, body?.data?.trigger_id]
         .some(value => value !== undefined && value !== null && value !== '');
       // Only the broker's explicit, well-formed precondition rejection is a
       // definitive authorisation failure. Network/parse errors remain ambiguous.
+      // An exception name alone never proves that a mutation was rejected:
+      // acknowledgements, server/time-out failures and contradictory envelopes
+      // must retain ownership and cash reservations until reconciliation.
       throw new BrokerError(body?.error_type || 'NetworkException', body?.message || `HTTP ${response.status}`, {
         http_status: response.status, auth_required: response.status === 428 && Boolean(validError) && !acknowledged,
+        definitive_rejection: response.ok === false && Boolean(validError) && !acknowledged &&
+          REJECTION_STATUSES.has(response.status) && REJECTION_KINDS.has(body.error_type),
       });
     }
     return transform(body.data);
@@ -241,6 +252,12 @@ export class KiteBroker {
       trigger_price: stop, validity: 'DAY', tag});
   }
 
+  async sell_cover(symbol, quantity, price, stop, tag) {
+    return this.call('place_order', {variety: 'co', exchange: 'NSE', tradingsymbol: symbol,
+      transaction_type: 'SELL', quantity, product: 'MIS', order_type: 'LIMIT', price,
+      trigger_price: stop, validity: 'DAY', tag});
+  }
+
   async cancel_cover(order_id, parent_order_id = null) {
     const payload = {variety: 'co', order_id: String(order_id)};
     if (parent_order_id) payload.parent_order_id = String(parent_order_id);
@@ -250,32 +267,69 @@ export class KiteBroker {
   async stream(tokens, on_ticks, on_order, on_status) {
     if (tokens.length > 9000) throw new RangeError("Universe exceeds Kite's 9,000-instrument streaming capacity.");
     if (tokens.some(token => !Number.isSafeInteger(token) || token <= 0)) throw new TypeError('Invalid stream instrument token');
-    await this.close();
-    const generation = this._generation;
+    // Request order determines ownership, including while an earlier shutdown
+    // is awaiting worker termination. Only the latest request may create feeds.
+    const generation = ++this._generation;
+    return this._streamLifecycle.run(async()=>{
+    await this._close_streams();if(generation!==this._generation)return;
     for (let offset = 0; offset < tokens.length; offset += 3000) {
       const index = offset / 3000, selected = tokens.slice(offset, offset + 3000);
+      const slot={worker:null,timer:null,failures:0};this._streamSlots.add(slot);
+      const current=()=>generation===this._generation&&this._streamSlots.has(slot);
+      const spawn=()=>{
+        slot.timer=null;if(!current())return;
+        let worker,failed=false,exited=false,retired=false,waitForExit=false,connectedAt=null;
+        const retire=()=>{
+          if(retired)return;retired=true;
+          this.sockets=this.sockets.filter(item=>item!==worker);slot.worker=null;
+          if(!current())return;
+          const delay=Math.min(60000,1000*2**Math.min(slot.failures++,6));
+          slot.timer=setTimeout(spawn,delay);slot.timer.unref?.();
+        };
+        const fail=()=>{
+          if(!current()||failed)return;failed=true;
+          if(connectedAt!==null&&this._clock()-connectedAt>=60)slot.failures=0;
+          on_status(index,false,selected);
+          if(!worker){retire();return;}
+          // Finish retiring the old worker before replacing it: Kite permits
+          // at most three simultaneous subscriptions for this connection set.
+          const retiring=Promise.resolve().then(()=>worker.terminate()).then(retire,()=>{if(exited)retire();else waitForExit=true;}).finally(()=>this._retiringSockets.delete(retiring));
+          this._retiringSockets.add(retiring);
+        };
       // KiteTicker 5.3.0 shares socket state at module scope. Each feed gets its own
       // isolate so 3 connections remain independent. These are not analytics workers.
-      const worker = this._workerFactory(new URL('./broker-stream-worker.js', import.meta.url), {
+      try{worker = this._workerFactory(new URL('./broker-stream-worker.js', import.meta.url), {
         workerData: {api_key: this.api_key, access_token: this.access_token, tokens: selected},
         execArgv: [],
-      });
+      });}catch{fail();return;}
+      slot.worker=worker;this.sockets.push(worker);
       worker.on('message', message => {
-        if (generation !== this._generation) return;
+        if (!current()||failed||slot.worker!==worker) return;
         if (message.type === 'ticks') on_ticks(message.ticks);
         else if (message.type === 'order') on_order(jsonable(message.order));
-        else if (message.type === 'status') on_status(index, Boolean(message.connected), selected);
+        else if (message.type === 'status') {
+          if(message.connected){if(connectedAt===null)connectedAt=this._clock();}
+          else {if(connectedAt!==null&&this._clock()-connectedAt>=60)slot.failures=0;connectedAt=null;}
+          on_status(index, Boolean(message.connected), selected);
+        }
+        else if(message.type==='restart')fail();
       });
-      const failed = () => { if (generation === this._generation) on_status(index, false, selected); };
-      worker.on('error', failed);
-      worker.on('exit', failed);
-      this.sockets.push(worker);
+      worker.on('error', fail);
+      worker.on('exit',()=>{exited=true;this.sockets=this.sockets.filter(item=>item!==worker);if(waitForExit)retire();else fail();});
+      };
+      spawn();
     }
+    });
   }
 
   async close() {
     this._generation++;
-    const sockets = this.sockets.splice(0);
-    await Promise.allSettled(sockets.map(worker => worker.terminate()));
+    return this._streamLifecycle.run(()=>this._close_streams());
+  }
+  async _close_streams(){
+    for(const slot of this._streamSlots)clearTimeout(slot.timer);this._streamSlots.clear();
+    const sockets=[...this.sockets];
+    await Promise.allSettled([...sockets.map(worker=>Promise.resolve().then(()=>worker.terminate()).then(()=>{this.sockets=this.sockets.filter(item=>item!==worker);})),...this._retiringSockets]);
+    if(this.sockets.length)throw new Error('Feed worker termination is unconfirmed; a new subscription cannot start yet');
   }
 }

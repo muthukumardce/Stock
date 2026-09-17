@@ -7,9 +7,10 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { Candle, atr } from './strategy.js';
+import { Candle, atr, technical_exit, daily_holding_exit } from './strategy.js';
 import { Mutex, monotonic, nowIST, parseTime, dateIST, marketHours } from './util.js';
 import { authorizedQuantity } from './holdings-authorization.js';
+import { pendingDeliveryQuantity } from './decision-controls.js';
 
 const TERMINAL = new Set(['COMPLETE', 'CANCELLED', 'REJECTED']);
 const INACTIVE_GTT = new Set(['deleted', 'cancelled', 'expired', 'rejected', 'disabled']);
@@ -262,7 +263,7 @@ export class DeliveryManager {
     return intent;
   }
 
-  async submit_entry(symbol, quantity, limit_price, stop_price, target_price = null, tick_size = 0.05, token = 0) {
+  async submit_entry(symbol, quantity, limit_price, stop_price, target_price = null, tick_size = 0.05, token = 0, setup = 'breakout') {
     return this.lock.run(async () => {
       quantity = quantityValue(quantity);
       const entry = _price(limit_price, tick_size, true);
@@ -277,7 +278,7 @@ export class DeliveryManager {
       if (this.snapshot().blocked) return this._result(null, 'blocked', 'Resolve existing delivery protection/order uncertainty first', true);
       const previous = this.state.positions[symbol];
       if (previous && previous.status !== 'closed') return this._result(previous);
-      const reserved = sum(Object.values(this.state.positions).filter(p => p.source === 'swing' && p.status !== 'closed').map(p => Number(p.entry_price ?? 0) * Number(p.requested_quantity ?? p.quantity ?? 0)));
+      const reserved = sum(Object.values(this.state.positions).filter(p => p.source === 'swing' && p.status !== 'closed').map(p => Number(p.entry_price ?? 0) * (Math.max(0,Number(p.quantity||0)-Number(p.sold_quantity||0))+pendingDeliveryQuantity(p,this.state))));
       if (reserved + entry * quantity * 1.001 > Number(settings.swing_capital)) return this._result(null, 'blocked', 'Swing allocation would be exceeded', true);
       try {
         if (!await this._profile_ready()) return this._result(null, 'blocked', 'Verified DDPI/POA is required for unattended delivery exits', true);
@@ -288,7 +289,7 @@ export class DeliveryManager {
         const quote = (await this.broker.call('quote', ['NSE:' + symbol]))['NSE:' + symbol] ?? {};
         if (!this._fresh_quote(quote)) return this._result(null, 'blocked', 'Fresh exchange quote required before delivery entry', true);
       } catch { return this._result(null, 'blocked', 'Delivery preflight unavailable', true); }
-      const p = { symbol, source: 'swing', status: 'entry_pending', blocked: true,
+      const p = { symbol, setup, source: 'swing', status: 'entry_pending', blocked: true,
         reason: 'Entry awaiting confirmed fills and GTT protection', requested_quantity: quantity,
         quantity: 0, sold_quantity: 0, entry_price: entry, stop, target, tick_size, token,
         exit_intents: [], gtt_order_ids: [], created_at: stamp() };
@@ -664,21 +665,22 @@ export class DeliveryManager {
     for (const [symbol, p] of Object.entries(this.state.positions)) {
       if (p.status === 'closed' || p.source === 'existing' && !allowed(symbol)) continue;
       const bars = this._daily_bars(bars_by_symbol[symbol] ?? []);
-      if (!bars.length || atr(bars) <= 0) { results.push(this._result(null, 'waiting', `${symbol}: valid completed daily bars required`)); continue; }
-      const trailing = _price(Math.max(p.trailing_stop ?? p.stop ?? 0, Math.max(...bars.slice(-20).map(b => b.close)) - 3 * atr(bars)), p.tick_size);
+      const holdingExit=daily_holding_exit(bars,p);
+      if (!holdingExit) { results.push(this._result(null, 'waiting', `${symbol}: valid completed daily bars required`)); continue; }
+      const trailing = holdingExit.trailing_stop;
       p.trailing_stop = trailing;
       this._save();
-      const average20 = mean(bars.slice(-20).map(b => b.close));
-      const trend_exit = bars.at(-1).close < average20 && mean(bars.slice(-5).map(b => b.close)) < average20;
+      const trend_exit = holdingExit.trend_exit;
+      const technical = technical_exit(bars,{strategy:'swing',setup:p.setup,opened_at:p.source==='swing'?p.created_at:undefined},this.settings,{as_of:this.now()});
       try {
         let quote = this._quote_hint(quotes_by_symbol?.[symbol]);
         quote ??= (await this.broker.call('quote', ['NSE:' + symbol]))['NSE:' + symbol] ?? {};
         const price = Number(quote.last_price ?? 0);
         if (!Number.isFinite(price) || price <= 0 || !this._fresh_quote(quote)) throw new Error('No fresh current quote');
-        if (trend_exit || price <= trailing || p.exit_requested) {
+        if (trend_exit || technical?.exit || price <= trailing || p.exit_requested) {
           const bid = Number(quote.depth?.buy?.[0]?.price || 0);
           if (bid <= 0) throw new Error('No executable bid');
-          results.push(await this.request_exit(symbol, Math.max(1, p.quantity - (p.sold_quantity ?? 0)), bid, trend_exit ? 'Daily trend loss' : 'Daily ATR trailing exit'));
+          results.push(await this.request_exit(symbol, Math.max(1, p.quantity - (p.sold_quantity ?? 0)), bid, trend_exit ? 'Daily trend loss' : technical?.reason || 'Daily ATR trailing exit'));
         } else results.push(await this.lock.run(async () => this._reconcile_position(p, await this._safe_account())));
         if (!results.at(-1).blocked && results.at(-1).status !== 'authorization_required') evaluated_symbols.add(symbol);
       } catch { results.push(this._result(null, 'blocked', `${symbol}: quote/exit evaluation failed`, true)); }

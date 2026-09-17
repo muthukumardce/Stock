@@ -3,11 +3,17 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24.9.0" },
+  "engines": {
+    "node": ">=24.9.0"
+  },
   "scripts": {
     "setup": "node src/cli.js setup",
     "start": "node src/index.js",
     "check": "node src/cli.js check",
+    "research": "node src/cli.js research",
+    "backup": "node src/cli.js backup",
+    "test:browser": "playwright test",
+    "benchmark": "node tools/benchmark-analytics.mjs",
     "test": "node --test tests-node/*.test.js tests/live-view.test.cjs"
   },
   "dependencies": {
@@ -18,5 +24,8 @@
   },
   "overrides": {
     "serialize-javascript": "7.0.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
   }
 }

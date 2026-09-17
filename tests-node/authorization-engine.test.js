@@ -150,6 +150,7 @@ test('CNC fill absent from settled holdings preserves verified authorization rej
   const f = await fixture(t, { physical: true, selected: [] });
   f.store.set('strategy_settings', { intraday_enabled: false, swing_enabled: true, intraday_allocation_pct: 0, swing_allocation_pct: 1, manage_existing_holdings: 'selected', managed_symbols: [] });
   f.broker.rejectGttAuthorization = true;
+  f.engine.daily[2]=Array.from({length:21},(_,i)=>new Candle(new Date(NOW-(21-i)*86400000),100,101,99,100,1000));
   const result = await f.engine._enter_locked(2, new Signal('swing', 100, 98, 104, 'confirmed delivery candidate', 2));
   assert.match(result, /^delivery_authorization_required/);
   assert.equal(f.broker.netPositions[0].tradingsymbol, 'NEW'); assert.ok(f.broker.netPositions[0].quantity > 0); assert.equal(f.broker.holdings.some(h => h.tradingsymbol === 'NEW'), false);

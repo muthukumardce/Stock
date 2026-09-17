@@ -8,6 +8,7 @@ import { Store } from './storage.js';
 import { ProcessLock, LoginLimiter, Fernet, digest_token, randomSecret, constantEqual, verifyPassword, hashPassword, strictJSON } from './security.js';
 import { Mutex, isoIST, dateIST, parseTime } from './util.js';
 import { ResourceMonitor } from './resources.js';
+import { HistoricalResearch } from './historical-research.js';
 import { requestContext } from './http-context.js';
 import { setImmediate as yieldIO } from 'node:timers/promises';
 
@@ -27,19 +28,23 @@ export async function createApp(options={}){
   const cfg=options.settings instanceof Settings?options.settings:new Settings(options.settings);
   cfg.validate();const manager=options.configManager;
   const lock=new ProcessLock(path.join(cfg.data_dir,'server-owner.sqlite3'));
-  lock.acquire();let store,engine,sampler;const streams=new Set();let closing=false;
+  lock.acquire();let store,engine,sampler,research,resources;const streams=new Set();let closing=false;
   try{
     store=new Store(path.join(cfg.data_dir,'stockpilot.sqlite3'),[cfg.kite_api_key,cfg.kite_api_secret,cfg.session_secret,cfg.token_encryption_key,cfg.admin_password_hash]);
     const Engine=options.engineFactory||(await import('./trading.js')).TradingEngine;engine=new Engine(cfg,store);
+    research=options.researchFactory?options.researchFactory(engine,store,cfg):new HistoricalResearch(engine,store,cfg);
     const app=express();app.disable('x-powered-by');app.set('trust proxy',false);
-    const state={settings:cfg,store,engine,resources:new ResourceMonitor(),cipher:new Fernet(cfg.token_encryption_key),limiter:new LoginLimiter(store),control:new Mutex(),loginLock:new Mutex(),postbackLock:new Mutex(),lastPostback:-Infinity,restartRequired:false};
-    app.state=state;
+    resources=new ResourceMonitor(cfg.data_dir);
+    const state={settings:cfg,store,engine,resources,cipher:new Fernet(cfg.token_encryption_key),limiter:new LoginLimiter(store),control:new Mutex(),loginLock:new Mutex(),postbackLock:new Mutex(),lastPostback:-Infinity,restartRequired:false};
+    engine.runtime_health=()=>state.resources.snapshot();
+    app.state=state;state.research=research;
     const fingerprint=digest_token(cfg.admin_username+':'+cfg.admin_password_hash,cfg.session_secret);
     if(store.get('admin_fingerprint')!==fingerprint){store.revoke_sessions();store.set('admin_fingerprint',fingerprint);}
     if(store.get('strategy_settings')===null)store.set('strategy_settings',defaultStrategies());
     store.event('server.started','Node.js server started. New entries remain paused until Start Trading.',{mode:cfg.trading_mode});
     const saved=store.get('kite_session');
     if(saved){try{const session=JSON.parse(state.cipher.decrypt(saved));if(session.expires>Date.now()/1000&&session.user_id.toUpperCase()===cfg.kite_user_id.toUpperCase()){store.add_secret(session.access_token);await engine.connect(session.access_token,session.user_id);store.event('session.restored','Zerodha monitoring restored. New entries are paused.');}else store.delete('kite_session');}catch{store.event('session.restore_failed','Reconnect to Zerodha. The saved session could not be restored.',{},'warning');}}
+    await research.maybeStart();
     sampler=setInterval(()=>{if(closing)return;const view=engine.snapshot();if(view.connected&&Number.isFinite(view.equity))store.sample(cfg.trading_mode,view.equity);},30000);sampler.unref();
     app.use((req,res,next)=>{
       res.set({'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','Permissions-Policy':'camera=(), microphone=(), geolocation=()','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self' https://kite.zerodha.com"});
@@ -59,6 +64,7 @@ export async function createApp(options={}){
     function ready(){if(state.restartRequired)throw failure(409,'Settings saved. Restart the server before trading.');if(fs.existsSync(path.join(cfg.data_dir,'maintenance.lock')))throw failure(409,'Server maintenance is in progress');if(!cfg.configured)throw failure(409,'Set KITE_API_KEY, KITE_API_SECRET and KITE_USER_ID in .env first');if(cfg.trading_mode==='live'&&!cfg.live_trading_enabled)throw failure(409,'Enable live execution in Settings');}
     function snapshot(){const view=engine.snapshot();return {...store.redact(view),configured:cfg.configured,resources:state.resources.snapshot(),strategy_settings:view.strategy_settings||store.get('strategy_settings'),holdings_authorization:view.mode==='live'?engine.holdings_authorization?.snapshot():null,limits:{capital:view.capital||0,risk_per_trade_pct:cfg.risk_per_trade_pct,daily_loss_pct:cfg.daily_loss_pct,max_positions:cfg.max_positions,max_position_pct:cfg.max_position_pct,entry_cutoff:cfg.entry_cutoff,exit_time:cfg.exit_time},server_time:isoIST(),maintenance:state.restartRequired||fs.existsSync(path.join(cfg.data_dir,'maintenance.lock')),restart_required:state.restartRequired};}
     app.get('/health',(_req,res)=>res.json({status:'ok',safe_to_stop:engine.snapshot().safe_to_stop===true}));
+    app.get('/api/readiness',(req,res)=>{authenticated(req);res.json({configured:cfg.configured,restart_required:state.restartRequired,...engine.readiness?.()});});
     app.get(['/','/settings'],(req,res)=>{try{authenticated(req);}catch{return res.redirect(303,'/login');}res.sendFile(path.join(STATIC,'index.html'));});
     app.get('/login',(_req,res)=>res.sendFile(path.join(STATIC,'login.html')));
     app.post('/api/login',async(req,res)=>{
@@ -106,7 +112,7 @@ export async function createApp(options={}){
           store.add_secret(result.access_token);
           const expiry=parseTime(dateIST(new Date(Date.now()+86400000))+'T06:00:00').getTime()/1000;
           store.set('kite_session',state.cipher.encrypt(JSON.stringify({access_token:result.access_token,user_id:result.user_id,expires:expiry})));
-          await engine.connect(result.access_token,result.user_id);store.event('session.connected','Zerodha monitoring is active.');await engine.start();return '/';
+          await research.cancel();await engine.connect(result.access_token,result.user_id);store.event('session.connected','Zerodha monitoring is active.');await engine.start();await research.maybeStart();return '/';
         }catch{
           store.event('session.start_failed','Zerodha session could not start trading. Check account recovery status.',{},'error');return '/?error=start';
         }
@@ -114,6 +120,15 @@ export async function createApp(options={}){
     });
     app.post('/api/trading/pause',async(req,res)=>{authenticated(req,true);await state.control.run(()=>engine.pause());res.json({ok:true});});
     app.post('/api/trading/flatten',async(req,res)=>{authenticated(req,true);await state.control.run(()=>engine.flatten());res.json({ok:true});});
+    app.get('/api/research',(req,res)=>{authenticated(req);res.json(store.redact(research.status()));});
+    app.post('/api/research/start',async(req,res)=>{
+      authenticated(req,true);if(!plainObject(req.body)||Object.keys(req.body).length)throw failure(422,'Research uses account funds and Settings; no order or credential inputs are accepted');
+      const result=await state.control.run(()=>{authenticated(req,true);if(state.restartRequired)throw failure(409,'Restart after the saved Settings change');return research.start();});res.json(store.redact(result));
+    });
+    app.post('/api/research/cancel',async(req,res)=>{
+      authenticated(req,true);if(!plainObject(req.body)||Object.keys(req.body).length)throw failure(422,'No inputs are needed to cancel research');
+      const result=await state.control.run(()=>{authenticated(req,true);return research.cancel();});res.json(store.redact(result));
+    });
     function authorizationRequest(req,refresh=false){
       authenticated(req,true);
       if(!plainObject(req.body)||Object.keys(req.body).some(key=>!refresh||key!=='user_confirmed')||refresh&&Object.hasOwn(req.body,'user_confirmed')&&typeof req.body.user_confirmed!=='boolean')throw failure(422,'Complete TPIN and OTP only on the official Zerodha/CDSL page');
@@ -166,7 +181,7 @@ export async function createApp(options={}){
     app.use('/static',express.static(STATIC,{etag:false,maxAge:0}));
     app.use((_req,_res,next)=>next(failure(404,'Not found')));
     app.use((err,_req,res,_next)=>{if(res.headersSent)return res.end();const status=err.type==='entity.too.large'?413:err.status||409;res.status(status).json({detail:status>=500?'Server request failed; inspect the activity log.':store.redact(err.message||'Request failed')});});
-    app.shutdown=async()=>{if(closing)return;closing=true;clearInterval(sampler);for(const res of streams)res.end();try{await state.control.run(()=>engine.shutdown());store.event('server.stopped','Server stopped. Broker orders remain at Zerodha.',{},'warning');}finally{store.close();lock.release();}};
+    app.shutdown=async()=>{if(closing)return;closing=true;clearInterval(sampler);for(const res of streams)res.end();try{await research.close();await state.control.run(()=>engine.shutdown());store.event('server.stopped','Server stopped. Broker orders remain at Zerodha.',{},'warning');}finally{state.resources.close();store.close();lock.release();}};
     return app;
-  }catch(error){clearInterval(sampler);try{await engine?.shutdown();}finally{store?.close();lock.release();}throw error;}
+  }catch(error){clearInterval(sampler);try{await research?.close();await engine?.shutdown();}finally{resources?.close();store?.close();lock.release();}throw error;}
 }

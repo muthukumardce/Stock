@@ -52,6 +52,34 @@ test('login, origin, CSRF, static dashboard, logout and audit redaction',async t
   assert.doesNotMatch(await (await f.request('/api/events/export')).text(),/testapisecret|"access_token":"hidden"/);
   assert.equal((await f.request('/api/logout','POST',{})).status,200);assert.equal((await f.request('/api/session')).status,401);
 });
+
+test('research endpoints are authenticated read-only jobs with CSRF and no arbitrary dataset or credentials',async t=>{
+  const f=await fixture(t);let starts=0,cancels=0;
+  f.app.state.research.start=()=>{starts++;return {status:'collecting',progress:0,report:null};};
+  f.app.state.research.cancel=async()=>{cancels++;return {status:'cancelled',report:null};};
+  f.app.state.research.status=()=>({status:'idle',report:null});
+  assert.equal((await f.request('/api/research')).status,401);assert.equal((await f.request('/api/research/start','POST',{})).status,401);
+  await f.login();assert.equal((await f.request('/api/research')).status,200);
+  assert.equal((await f.request('/api/research/start','POST',{}, {'x-csrf-token':'bad'})).status,403);
+  assert.equal((await f.request('/api/research/start','POST',{access_token:'must-not-be-accepted'})).status,422);
+  assert.equal((await f.request('/api/research/start','POST',{symbols:{TEST:[]}})).status,422);
+  assert.equal((await f.request('/api/research/start','POST',{})).status,200);assert.equal(starts,1);assert.equal(f.engine.starts,0);
+  assert.equal((await f.request('/api/research/cancel','POST',{})).status,200);assert.equal(cancels,1);
+  f.app.state.restartRequired=true;assert.equal((await f.request('/api/research/start','POST',{})).status,409);assert.equal(starts,1);
+  assert.doesNotMatch(JSON.stringify(f.store.events()),/must-not-be-accepted/);
+});
+
+test('all enhanced controls have editable defaults and invalid combinations are rejected before saving',async t=>{
+  const f=await fixture(t);await f.login();const config=await (await f.request('/api/config')).json();
+  assert.equal(config.values.enhanced_signals,true);assert.equal(config.values.auto_research,true);assert.equal(config.values.research_symbols,20);
+  for(const key of ['min_signal_score','enable_reversion','max_correlation','loss_cooldown_minutes'])assert.ok(config.fields.some(field=>field.key===key));
+  assert.equal((await f.request('/api/config','PUT',{min_rsi:80,max_rsi:50})).status,409);
+  assert.equal((await f.request('/api/config','PUT',{min_gap_pct:.02,max_gap_pct:.02})).status,409);
+  assert.equal((await f.request('/api/config','PUT',Object.fromEntries(Object.keys(config.values).filter(k=>k.startsWith('enable_')).map(k=>[k,false])))).status,409);
+  assert.equal((await f.request('/api/config','PUT',{research_symbols:999999})).status,409);
+  assert.equal((await f.request('/api/config','PUT',{min_signal_score:65,research_symbols:10})).status,200);
+  assert.equal(f.manager.candidate({}).min_signal_score,65);assert.equal(f.settings.min_signal_score,60);
+});
 test('Cloudflare origin and secure cookies are automatic; untrusted hosts and spoofed proxy metadata fail',async t=>{
   const f=await fixture(t),headers={host:'my-tunnel.trycloudflare.com','cf-ray':'aabbccddeeff1234-BOM','x-forwarded-proto':'https','cf-connecting-ip':'203.0.113.8',origin:'https://my-tunnel.trycloudflare.com'};
   assert.equal((await f.request('/login','GET',undefined,{host:'evil.example','x-forwarded-proto':'https'})).status,400);

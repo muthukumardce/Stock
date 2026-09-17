@@ -13,5 +13,8 @@ ticker.on('connect', () => {
 });
 ticker.on('ticks', ticks => parentPort.postMessage({type: 'ticks', ticks}));
 ticker.on('order_update', order => parentPort.postMessage({type: 'order', order}));
-for (const event of ['error', 'close', 'disconnect', 'noreconnect']) ticker.on(event, () => status(false));
+for (const event of ['error', 'close', 'disconnect']) ticker.on(event, () => status(false));
+// The SDK stops retrying (and can exit this worker) when its retry budget is
+// exhausted. The parent retires this isolate and reconnects with bounded delay.
+ticker.on('noreconnect',()=>parentPort.postMessage({type:'restart'}));
 ticker.connect();
