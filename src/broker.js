@@ -37,6 +37,24 @@ export class BrokerError extends Error {
   }
 }
 
+/** Only fixed explanations leave the adapter: raw errors may contain credentials,
+ * account identifiers or request URLs. Classification never changes retry safety. */
+export function orderRejectionReason(error) {
+  const detail = error instanceof BrokerError ? String(error.detail || '') : '';
+  if (error?.http_status === 429) return {code:'rate_limit',message:'Zerodha rate-limited order requests. Wait for the API cooldown before trying again.'};
+  if (error?.kind === 'TokenException') return {code:'session_expired',message:'Zerodha rejected the API session. Reconnect Zerodha before starting trading again.'};
+  if (/\bIP\b.*(?:whitelist|white.list|allowlist|not allowed|mismatch|invalid)|(?:whitelist|white.list|allowlist|static IP)/i.test(detail))
+    return {code:'ip_not_allowed',message:'Zerodha rejected the order IP. Check the trading machine’s static public outbound IP in Kite Connect → Profile → IP Whitelist. A tunnel URL does not change the outbound IP.'};
+  if (/(?:cover order|\bCO\b).*(?:not allowed|not enabled|not available|disabled|blocked)|(?:not allowed|not enabled|not available|disabled|blocked).*(?:cover order|\bCO\b)/i.test(detail))
+    return {code:'cover_unavailable',message:'Zerodha does not permit cover orders for this instrument or account. Check cover-order eligibility in Kite; no unprotected replacement order was submitted.'};
+  if (/insufficient.*(?:fund|margin)|(?:fund|margin).*insufficient/i.test(detail))
+    return {code:'insufficient_margin',message:'Zerodha reported insufficient funds or margin for this cover order. Check available funds in Kite.'};
+  if (/trigger.*(?:range|higher|lower|greater|lesser|invalid)|(?:invalid|range).*trigger/i.test(detail))
+    return {code:'invalid_trigger',message:'Zerodha rejected the stop trigger price. Check the permitted cover-order trigger range for this instrument.'};
+  if (error?.kind === 'PermissionException') return {code:'permission_denied',message:'Zerodha denied API order permission. Check Kite Connect trading permissions and the static public outbound IP in Profile → IP Whitelist. Reconnecting alone may not resolve this.'};
+  return {code:'order_rejected',message:'Zerodha rejected the cover-order request. Check order parameters and account restrictions; contact Zerodha support if no reason appears in Kite Orders.'};
+}
+
 /** RFC 4180 CSV reader: the instruments endpoint is CSV, including quoted company names. */
 export function parseInstruments(csv) {
   const rows = [];

@@ -210,6 +210,59 @@ function priorSessionRows(){
   return Array.from({length:75},(_,i)=>({date:new Date(+new Date('2026-09-16T09:15:00+05:30')+i*300000),open:100,high:101,low:99,close:100,volume:100}));
 }
 function currentSessionRows(){return priorSessionRows().slice(0,33).map(row=>({...row,date:new Date(+row.date+86400000)}));}
+test('intraday warmup progress survives feed gaps, retries and repeat passes while readiness stays accurate',async t=>{
+  const [engine]=ready(t);engine.books[1]=new CandleBook();
+  let failed=false,calls=0;
+  engine.broker={call:async()=>{calls++;if(failed)throw new BrokerError('NetworkException');return currentSessionRows();}};
+  const task=()=>engine.snapshot().background.tasks.find(task=>task.id==='intraday_history');
+  await engine._intraday_history_pass();
+  assert.equal(task().completed,1);assert.equal(task().ready,1);assert.equal(task().total,1);
+  await engine._intraday_history_pass();assert.equal(calls,1);assert.equal(task().completed,1);
+  engine._on_stream(0,false,[1]);
+  assert.equal(task().completed,1);assert.equal(task().ready,0);
+  engine.quotes[1]={last_price:100,volume_traded:100000,received_at:monotonic()};failed=true;
+  await engine._intraday_history_pass();assert.equal(task().completed,1);assert.equal(task().ready,0);assert.equal(task().failed,1);
+  failed=false;engine._intraday_history_retry[1]=0;await engine._intraday_history_pass();
+  assert.equal(task().completed,1);assert.equal(task().ready,1);assert.equal(calls,3);
+  engine._now=()=>new Date('2026-09-18T12:00:00+05:30');engine._roll_day();
+  assert.equal(task().completed,0);assert.equal(task().ready,0);assert.equal(task().progress_date,'2026-09-18');
+});
+
+test('intraday progress counts each completed stock once and retains progress across same-universe refresh',async t=>{
+  const [engine]=ready(t);engine.universe[2]={tradingsymbol:'OTHER'};engine.books={1:new CandleBook(),2:new CandleBook()};
+  engine.broker={call:async()=>currentSessionRows(),stream:async()=>{}};
+  const task=()=>engine.snapshot().background.tasks.find(task=>task.id==='intraday_history');
+  await engine._intraday_history_pass();assert.equal(task().completed,2);assert.equal(task().total,2);
+  await engine._refresh_universe_locked([cashInstrument('TEST',1),cashInstrument('OTHER',2)]);
+  assert.equal(task().completed,2);assert.equal(task().ready,0);
+  await engine._refresh_universe_locked([cashInstrument('REPLACEMENT',1)]);
+  assert.equal(task().completed,0);assert.equal(task().total,1);
+});
+
+test('routine candle coverage logs are bounded while Background retains live counts',async t=>{
+  const [engine,store]=ready(t);engine.account.holdings=[{exchange:'NSE',tradingsymbol:'TEST',quantity:1,instrument_token:1}];
+  engine.broker={call:async()=>[]};
+  for(let pass=0;pass<10;pass++)await engine._history_pass();
+  assert.equal(store.log.filter(event=>event.kind==='daily_history').length,1);
+  assert.equal(engine.snapshot().background.tasks.find(task=>task.id==='daily_history').completed,0);
+  for(let ready=1;ready<50;ready++)engine._history_progress_event('intraday_history',{ready,total:100});
+  assert.equal(store.log.filter(event=>event.kind==='intraday_history').length,1);
+  engine._history_logged.intraday_history.at-=301;engine._history_progress_event('intraday_history',{ready:50,total:100});
+  engine._history_progress_event('intraday_history',{ready:100,total:100});engine._history_progress_event('intraday_history',{ready:100,total:100});
+  assert.equal(store.log.filter(event=>event.kind==='intraday_history').length,3,'Changed coverage is sampled, and completion is reported once');
+});
+
+test('scanner keeps per-stock decisions on screen but aggregates routine activity and retains order failures',async t=>{
+  const [engine,store]=ready(t);engine.running=false;engine._last_summary=monotonic();
+  for(let i=0;i<50;i++){
+    engine._candidate(1,signal(),{},{});await engine._run_once();
+  }
+  assert.equal(store.log.filter(event=>event.kind==='signal'||event.kind==='decision').length,0);
+  assert.equal(engine.signals[0].status,'entries_paused');assert.equal(engine._stats['decision:entries_paused'],50);
+  engine._last_summary-=301;await engine._run_once();const summary=store.log.find(event=>event.kind==='scan_summary');
+  assert.equal(summary.data['decision:entries_paused'],50);assert.equal(summary.data['candidates:intraday'],50);
+  engine._event('order_rejected','Order failure',{kind:'InputException'},'error');assert.equal(store.log.at(-1).kind,'order_rejected');
+});
 for(const [label,invalid]of[
   ['malformed OHLCV',()=>{const rows=priorSessionRows();rows[5].close=0;return rows;}],
   ['stale date',()=>priorSessionRows().map(row=>({...row,date:new Date(+row.date-7*86400000)}))],
@@ -573,6 +626,31 @@ test('existing-holding paper sell needs selection, is idempotent, and never chan
   store.set('strategy_settings', { manage_existing_holdings: 'selected', managed_symbols: ['TEST'] }); engine._analyze_holdings(); engine._analyze_holdings();
   assert.equal(Object.keys(engine._paper_holding_actions).length, 1); assert.equal(engine.account.holdings[0].quantity, 10); assert.equal(engine.realised, 0);
 });
+
+for (const mode of ['paper','live']) test(`ignore existing stocks blocks long, short and swing entries in ${mode} mode`,async t=>{
+  const [engine,store]=ready(t,mode);engine.settings.intraday_short_enabled=true;
+  store.set('strategy_settings',{intraday_enabled:true,swing_enabled:true,intraday_allocation_pct:.5,swing_allocation_pct:.5,manage_existing_holdings:'ignore',managed_symbols:['TEST']});
+  for(const holding of [{quantity:5},{quantity:0,t1_quantity:5},{quantity:0,collateral_quantity:5},{quantity:5,used_quantity:5},{quantity:5,discrepancy:true},{quantity:5,exchange:'BSE'}]){
+    engine.account.holdings=[{exchange:'NSE',tradingsymbol:'TEST',...holding}];
+    for (const entry of [signal(),shortSignal(),signal('swing')]) assert.equal(await engine._enter_locked(1,entry),'existing_holdings_ignored');
+  }
+  engine.account.holdings=[];engine.account.positions.net=[{tradingsymbol:'TEST',product:'CNC',quantity:5}];
+  assert.equal(await engine._enter_locked(1,signal()),'existing_holdings_ignored');
+  assert.deepEqual(engine.positions,{});assert.deepEqual(engine.intents,{});assert.equal(store.log.some(e=>e.kind==='order_intent'||e.kind==='paper_fill'),false);
+  engine.account.positions.net=[];engine.account.holdings=[{tradingsymbol:'OTHER',quantity:5}];
+  if(mode==='live')engine.broker={buy_cover:async()=> 'unrelated-entry'};
+  assert.equal(await engine._enter_locked(1,signal()),mode==='paper'?'paper_buy_filled':'cover_order_pending');
+});
+
+test('ignored holdings override saved selections, suppress sales and authorization, and remain in risk exposure',t=>{
+  const [engine,store]=ready(t);store.set('strategy_settings',{...engine.strategy_settings(),manage_existing_holdings:'ignore',managed_symbols:['TEST']});
+  engine.account.holdings=[{exchange:'NSE',tradingsymbol:'TEST',quantity:10,instrument_token:1,last_price:100,average_price:100}];
+  engine.daily[1]=entryDailyBars();engine._analysis_cache.set('swing:1',{holding:{trailing:105,trend_exit:true}});
+  assert.deepEqual(engine._authorized_holdings(),[]);assert.deepEqual(engine._holding_management_settings().managed_symbols,[]);
+  engine._analyze_holdings();assert.deepEqual(engine._paper_holding_actions,{});
+  assert.equal(engine.holdings_signals[0].status,'ignored');assert.equal(engine.holdings_signals[0].managed,false);
+  assert.ok(engine._portfolio().rows.some(row=>row.symbol==='TEST'&&row.exposure>0));
+});
 test('holding snapshots explain excluded and other-exchange holdings without taking paper actions', t => {
   const [engine,store]=ready(t);engine.universe_summary={status:'verified'};engine._universe_date=dateIST(NOW);
   store.set('strategy_settings',{manage_existing_holdings:'all'});
@@ -871,6 +949,17 @@ test('definitive broker rejection journals useful metadata without raw broker de
   const event = store.log.find(row => row.kind === 'order_rejected');
   assert.equal(event.data.kind, 'InputException'); assert.equal(event.data.http_status, 400); assert.equal(event.data.operation, 'cover_entry');
   assert.equal(event.data.stage, 'submission'); assert.equal(Object.hasOwn(event.data, 'detail'), false); assertPrivateFailure(engine, store);
+});
+
+test('permission rejection explains HTTP 403 in the halt, activity and saved intent without exposing raw detail',async t=>{
+  const [engine,store]=ready(t,'live');let attempts=0;
+  engine.broker={buy_cover:async()=>{attempts++;throw new BrokerError('PermissionException',`IP is not whitelisted ${sensitiveFailureText}`,{http_status:403,definitive_rejection:true});}};
+  assert.equal(await engine._enter_locked(1,signal()),'cover_order_rejected');
+  assert.equal(engine.running,false);assert.equal(engine.connected,true);
+  assert.match(engine.message,/PermissionException, HTTP 403/);assert.match(engine.message,/IP Whitelist/);
+  assert.equal(Object.values(engine.intents)[0].rejection.code,'ip_not_allowed');
+  assert.match(store.log.find(e=>e.kind==='order_rejected').message,/HTTP 403/);assertPrivateFailure(engine,store);
+  assert.equal(await engine._enter_locked(1,signal()),'entries_paused');assert.equal(attempts,1);
 });
 test('overdue paper position waits for fresh current-session executable price after restart', async t => {
   const store = new MemoryStore(), broker = new RecoveryBroker(), yesterday = new Date(NOW - 86400000);

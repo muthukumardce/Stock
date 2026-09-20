@@ -351,6 +351,13 @@ test('selected existing holding excludes unselected, used and pledged shares', a
   assert.equal(mutations(broker, 'place_gtt')[0].orders[0].quantity, 7);
 });
 
+test('ignore holding policy never adopts, protects or sells holdings even with a saved selected symbol',async t=>{
+  const {manager,broker}=context(t);broker.holdings=[holding('INFY',10)];
+  const result=await manager.evaluate_holdings({INFY:daily_bars(true)},{manage_existing_holdings:'ignore',managed_symbols:['INFY']});
+  assert.equal(result.blocked,false);assert.deepEqual(manager.snapshot().positions,{});
+  assert.deepEqual(mutations(broker,'place_order'),[]);assert.deepEqual(mutations(broker,'place_gtt'),[]);
+});
+
 test('existing daily trend exit sells without new swing allocation', async t => {
   const { manager, broker, store } = context(t); broker.holdings = [holding('INFY', 5, 110)];
   store.set('strategy_settings', { swing_enabled: false, swing_capital: 0 });

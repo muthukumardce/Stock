@@ -5,7 +5,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { KiteBroker, BrokerError, jsonable } from './broker.js';
+import { KiteBroker, BrokerError, jsonable, orderRejectionReason } from './broker.js';
 import { AnalyticsPool } from './analytics.js';
 import { DeliveryManager } from './delivery.js';
 import { HoldingsAuthorization } from './holdings-authorization.js';
@@ -15,6 +15,7 @@ import { sideOf, directionOf, exitSideOf, plannedRisk, markedProfit } from './di
 import { MarketContext } from './market-context.js';
 import { EquityUniverse } from './equity-universe.js';
 import { BackgroundActivity } from './background-activity.js';
+import { activityHelp } from './activity-help.js';
 import { validate_bars } from './indicators.js';
 import { Mutex, sleep, monotonic, nowIST, parseTime, dateIST, timeIST, isoIST, marketHours } from './util.js';
 
@@ -88,6 +89,8 @@ export class TradingEngine {
     this._shutdown = false; this._last_tick_received = -Infinity; this._risk_halted = false;
     this.holdings_signals = []; this._paper_holding_actions = store.get('paper_holding_actions', {});
     this._last_holdings_scan = 0; this._intraday_history_loaded = new Set(); this._intraday_history_failed = 0; this._intraday_history_retry={};
+    this._intraday_warmup = null;
+    this._history_logged = {};
     this.analytics = options.analyticsFactory ? options.analyticsFactory(settings) : new AnalyticsPool(settings.analytics_workers || 0, settings.analytics_reserve_cpus ?? 4, settings.analytics_batch_size || 32);
     this._analysis_pending = new Map(); this._analysis_tasks = new Set(); this._analysis_cache = new Map(); this._analysis_generation = 0;
     this._analysis_requested = new Map(); this._analysis_sequence = 0;
@@ -126,6 +129,7 @@ export class TradingEngine {
   _halt(message, kind = 'risk_halt', data = null) {
     if (this.error !== message) this._event(kind, message, data, 'error');
     this.running = false; this.status = 'error'; this.error = this.message = message;
+    this.error_help = activityHelp({kind,message,data,level:'error'});
     if (this._unresolved_intents()) Object.assign(this.recovery, { phase: 'blocked', message, blocked: true, completed_at: null });
   }
   _maintenance() { return existsSync(join(this.settings.data_dir, 'maintenance.lock')); }
@@ -150,6 +154,7 @@ export class TradingEngine {
   }
   _selected_holdings() {
     const config = this.strategy_settings(), selected = new Set(config.managed_symbols || []);
+    if (config.manage_existing_holdings === 'ignore') return [];
     return (this.account.holdings || []).filter(h => h.exchange === 'NSE' && (h.product || 'CNC') === 'CNC' && !h.discrepancy && Number(h.quantity || 0) - Number(h.used_quantity || 0) - Number(h.collateral_quantity || 0) > 0 && (config.manage_existing_holdings === 'all' || selected.has(h.tradingsymbol)));
   }
   _authorized_holdings() {
@@ -158,6 +163,7 @@ export class TradingEngine {
   }
   _holding_management_settings(){
     const config=this.strategy_settings(),selected=new Set(config.managed_symbols||[]),symbols=new Set(this._authorized_holdings().map(h=>h.tradingsymbol));
+    if (config.manage_existing_holdings === 'ignore') return {...config,managed_symbols:[]};
     for(const [symbol,p] of entries(this.delivery?.snapshot().positions||{}))if(p.status!=='closed'&&(config.manage_existing_holdings==='all'||selected.has(symbol)))symbols.add(symbol);
     return {...config,manage_existing_holdings:'selected',managed_symbols:[...symbols]};
   }
@@ -537,7 +543,7 @@ export class TradingEngine {
   _candidate(token, signal, metrics = {}, source = null) {
     const record = { time: isoIST(this._now()), symbol: this.universe[token].tradingsymbol, ...signal, source, status: 'candidate', analytics: metrics || {} };
     this.signals.unshift(record); this.signals.length = Math.min(60, this.signals.length);
-    this._event('signal', `${record.symbol}: ${signal.reason}`, record);
+    this._stats['candidates:'+signal.strategy] = (this._stats['candidates:'+signal.strategy] || 0) + 1;
     this._discard_candidates(token,signal.strategy);
     this._candidates.push([Number(token), signal, monotonic(), record]);
     this._rank_candidates();
@@ -668,11 +674,19 @@ export class TradingEngine {
       const [token, signal, received, record] = this._candidates.shift();
       if (monotonic() - received <= 30) {
         const reason = record.source ? await this._enter_locked(token, signal,record.source) : 'signal_source_missing'; record.status = reason;
-        this._event('decision', `${record.symbol}: ${reason}`, { symbol: record.symbol, strategy: signal.strategy,side:sideOf(signal),setup:signal.setup,score:signal.score, decision: reason });
+        const rejection = reason === 'cover_order_rejected' ? values(this.intents).findLast(intent=>intent.symbol===record.symbol && intent.rejection)?.rejection : null;
+        if (rejection) record.reason = `${rejection.message} (${rejection.kind}, HTTP ${rejection.http_status})`;
+        if (reason === 'existing_holdings_ignored') record.reason = 'This stock is already owned and excluded by your existing-holdings setting.';
+        this._stats['decision:'+reason] = (this._stats['decision:'+reason] || 0) + 1;
+        if (/^(cover_order_|delivery_|paper_(buy|short)_filled)/.test(reason))
+          this._event('decision', `${record.symbol}: ${reason}${rejection ? `. ${record.reason}` : ''}`, { symbol: record.symbol, strategy: signal.strategy,side:sideOf(signal),setup:signal.setup,score:signal.score, decision: reason, ...(rejection ? {rejection} : {}) }, rejection ? 'error' : 'info');
       }
     }
     if(!this._candidates.length)this._candidate_batch_at=null;
-    if (monotonic() - this._last_summary >= 300 && count(this._stats)) { this._event('scan_summary', 'Closed-candle scan summary.', { ...this._stats }); this._stats = {}; this._last_summary = monotonic(); }
+    if (monotonic() - this._last_summary >= 300 && count(this._stats)) {
+      const candidates=sum(entries(this._stats).filter(([key])=>key.startsWith('candidates:')).map(([,n])=>n)),decisions=sum(entries(this._stats).filter(([key])=>key.startsWith('decision:')).map(([,n])=>n));
+      this._event('scan_summary', `Scanner summary: ${candidates} candidates and ${decisions} entry checks. Individual signals remain in Overview → Latest analysis.`, { ...this._stats }); this._stats = {}; this._last_summary = monotonic();
+    }
     if (monotonic() - this._last_persist >= 15) { this._persist(); this._last_persist = monotonic(); }
   }
   async _run(signal = this._controller?.signal) {
@@ -877,6 +891,7 @@ export class TradingEngine {
     if(regime.status==='warming_up')return 'market_breadth_unavailable';
     if(this.settings.market_regime_filter===true&&(side==='SELL'?regime.declining_fraction:regime.breadth)<this.settings.min_market_breadth)return 'market_breadth_defensive';
     const symbol = this.universe[token].tradingsymbol;
+    if (config.manage_existing_holdings === 'ignore' && this._owns_holding(symbol)) return 'existing_holdings_ignored';
     if(this.settings.event_risk_enabled===true){const event=this.market_context.forSymbol(symbol);if(event.entry_blocked)return event.blackout?'scheduled_event_blackout':'event_calendar_unavailable';}
     if (this.positions[symbol] || this.traded.has(symbol) || values(this.intents).some(i => i.symbol === symbol && !['closed', 'rejected'].includes(i.state))) return 'already_owned_or_traded_today';
     const pendingCount = values(this.intents).filter(i => ['submitting', 'unknown', 'pending'].includes(i.state) && !this.positions[i.symbol]).length;
@@ -929,11 +944,20 @@ export class TradingEngine {
     try { intent.order_id = String(await this.broker[side==='SELL'?'sell_cover':'buy_cover'](symbol, quantity, entry, stop, tag)); intent.state = 'pending'; }
     catch (exc) {
       if (exc instanceof BrokerError && exc.definitive_rejection===true) {
-        intent.state = 'rejected'; this._event('order_rejected', `Cover entry rejected before acknowledgement: ${symbol}.`, { tag, ...failureMetadata(exc, 'cover_entry', 'submission') }, 'error');
-        if (['PermissionException', 'TokenException'].includes(exc.kind)) { if (exc.kind === 'TokenException') this.connected = false; this._halt('Broker authentication or trading permission rejected the entry. Reconnect or correct account permissions.'); }
+        const failure = failureMetadata(exc, 'cover_entry', 'submission'), reason = orderRejectionReason(exc);
+        intent.state = 'rejected'; intent.rejection = {...failure,...reason};
+        this._event('order_rejected', `Cover entry rejected for ${symbol} (${failure.kind}${failure.http_status ? `, HTTP ${failure.http_status}` : ''}). ${reason.message}`, {tag,...intent.rejection}, 'error');
+        if (['PermissionException', 'TokenException'].includes(exc.kind)) { if (exc.kind === 'TokenException') this.connected = false; this._halt(`Cover order rejected (${failure.kind}${failure.http_status ? `, HTTP ${failure.http_status}` : ''}). ${reason.message}`,'risk_halt',intent.rejection); }
       } else { intent.state = 'unknown'; this._halt(`Order acknowledgement unknown for ${symbol}; never retried automatically. Reconcile in Zerodha.`, 'order_unknown'); }
     }
     this._persist(); this.request_reconciliation(); return `cover_order_${intent.state}`;
+  }
+  _owns_holding(symbol) {
+    // Settled, unsettled and pledged shares remain owned even when unavailable
+    // for sale. Include delivery buys that have not reached the holdings API yet.
+    return (this.account.holdings || []).some(h => h.tradingsymbol === symbol &&
+      ['quantity','t1_quantity','collateral_quantity'].some(key => Number(h[key] || 0) > 0)) ||
+      (this.account.positions?.net || []).some(p => p.tradingsymbol === symbol && p.product === 'CNC' && Number(p.quantity || 0) > 0);
   }
   _account_symbol_busy(symbol) {
     return (this.account.positions?.net || []).some(p => p.tradingsymbol === symbol && Number(p.quantity || 0) !== 0) || (this.account.holdings || []).some(p => p.tradingsymbol === symbol && Number(p.quantity || 0) + Number(p.t1_quantity || 0) > 0) || (this.account.orders || []).some(o => o.tradingsymbol === symbol && !TERMINAL.has(o.status));
@@ -1081,6 +1105,13 @@ export class TradingEngine {
     activity({status:'waiting',message:'Zerodha historical-data rate limit (HTTP 429). Downloads are paused until the cooldown ends; cached history is retained.',next_retry_at:health?.retry_at||error?.retry_at||new Date(+this._now()+delay*1000).toISOString()});
     return true;
   }
+  _history_progress_event(kind, progress) {
+    const scope = `${dateIST(this._now())}:${this._universe_generation}`, signature = `${scope}:${progress.ready}:${progress.total}`;
+    const previous = this._history_logged[kind], complete = progress.total > 0 && progress.ready === progress.total;
+    if (previous?.signature === signature || previous?.scope === scope && monotonic()-previous.at < 300 && !complete) return;
+    this._history_logged[kind] = {scope,signature,at:monotonic()};
+    this._event(kind,`${kind==='daily_history'?'Daily':'Five-minute'} candle coverage: ${progress.ready} of ${progress.total} currently loaded. See Background for live progress and retries.`,progress);
+  }
   async _history_pass(signal) {
     const config = this.strategy_settings(), today = dateIST(this._now()), holdingTokens = this._holding_tokens();
     const riskTokens=this.settings.correlation_filter?new Set([...this._correlation_wanted,...this._holding_tokens(),...values(this.positions).map(p=>Number(p.token))]):new Set();
@@ -1098,7 +1129,6 @@ export class TradingEngine {
     let completed = 0, failed = 0, deferred = 0;
     let finished=false;
     try {
-    this._event('daily_history', 'Loading completed daily candles for NSE swing analysis. Coverage grows as the rate-limited download completes.');
     for (const token of wanted) {
       if(!valid())return;
       const symbol=this.universe[token]?.tradingsymbol;if(!symbol)return;
@@ -1132,13 +1162,12 @@ export class TradingEngine {
         if (exc.kind === 'TokenException') { this.connected = false; this._halt('Authentication expired while loading daily history. Reconnect Zerodha.', 'auth_expired', failureMetadata(exc, 'daily_history', 'download')); break; }
       }
       activity({completed,failed});
-      if ((completed + failed) % 100 === 0) this._event('daily_history', 'Daily candle download progress.', { downloaded: completed, failed, ready: count(this.daily), total: count(this.universe) });
       if(downloaded)await sleep(100,signal);
     }
     if(!valid())return;
     this._history_failures = wanted.length-completed;
     this._history_date=this.connected&&completed===wanted.length?coverage:'';
-    this._event('daily_history', 'Daily history pass finished.', { ready:completed,failed,deferred,total:wanted.length });
+    this._history_progress_event('daily_history',{ready:completed,failed,deferred,total:wanted.length});
     const retryTimes=wanted.map(t=>this._daily_history_retry[t]?.next_at).filter(Number.isFinite);
     activity({status:'waiting',completed,failed,message:completed===wanted.length?'Daily candle coverage is current.':`${completed} of ${wanted.length} symbols ready; incomplete or unavailable histories will be retried.`,next_retry_at:completed===wanted.length?null:new Date(+this._now()+Math.max(30000,retryTimes.length?(Math.min(...retryTimes)-monotonic())*1000:30000)).toISOString()});finished=true;
     } catch(error) {activity({status:'failed',message:'Daily candle loading failed; the background loop will retry.',failed:failed+1});finished=true;throw error;}
@@ -1157,8 +1186,18 @@ export class TradingEngine {
     const age=parseTime(today+'T00:00:00+05:30')-parseTime(priorDay+'T00:00:00+05:30');
     return priorDay<today&&age<=7*86400000&&timeIST(last)==='15:25';
   }
+  _intraday_history_progress() {
+    const date = dateIST(this._now()), universe = JSON.stringify(entries(this.universe).map(([token,i])=>[token,i.tradingsymbol]));
+    if (!this._intraday_warmup || this._intraday_warmup.date !== date || this._intraday_warmup.universe !== universe)
+      this._intraday_warmup = {date,universe,completed:new Set()};
+    const progress = this._intraday_warmup;
+    let ready = 0;
+    for (const token of this._intraday_history_loaded) if (this.universe[token]) ready++;
+    return {completed:progress.completed.size,total:count(this.universe),ready,progress_date:date,progress_kind:'session_warmup'};
+  }
   async _intraday_history_pass(signal) {
-    const activity=this._activity.begin('intraday_history',{message:'Checking five-minute candle coverage.',completed:this._intraday_history_loaded.size,total:count(this.universe),failed:this._intraday_history_failed});
+    const update=this._activity.begin('intraday_history',{message:'Checking five-minute candle coverage.',...this._intraday_history_progress(),failed:this._intraday_history_failed});
+    const activity=patch=>update({...patch,...this._intraday_history_progress()});
     if (!this.connected || !marketHours(this._now()) || !this.strategy_settings().intraday_enabled || !count(this.quotes)) {
       activity({status:'waiting',message:!this.connected?'Waiting for Zerodha connection.':!this.strategy_settings().intraday_enabled?'Intraday trading is disabled.':!marketHours(this._now())?'Waiting for market hours to load current-session candles.':this._clock_block()?'Waiting for system clock verification and fresh market prices.':'Waiting for fresh market prices.'});return;
     }
@@ -1168,7 +1207,6 @@ export class TradingEngine {
       delete this.previous_intraday[token];this._intraday_history_loaded.delete(Number(token));delete this._intraday_history_retry[token];
     }
     const managed = new Set(values(this.positions).map(p => Number(p.token))), wanted = this._priority_tokens(Object.keys(this.universe).map(Number).filter(t => !this._intraday_history_loaded.has(t)&&monotonic()>=(this._intraday_history_retry[t]||0)), managed);
-    if (wanted.length) this._event('intraday_history', 'Loading completed five-minute candles, prioritising current turnover.', { remaining: wanted.length });
     const broker = this.broker,generation=this._universe_generation;
     const valid=()=>this.connected&&!signal?.aborted&&!this._shutdown&&broker===this.broker&&generation===this._universe_generation&&dateIST(this._now())===today;
     let finished=false;
@@ -1179,7 +1217,7 @@ export class TradingEngine {
       const currentIdentity=()=>valid()&&this.universe[token]?.tradingsymbol===symbol;
       const now = this._now(), boundary = new Date(Math.floor(now.getTime() / 300000) * 300000), start = parseTime(`${dateIST(now)}T09:15:00+05:30`);
       if (boundary <= start) break;
-      activity({message:`Downloading five-minute candles for ${symbol}.`,current_item:symbol,completed:this._intraday_history_loaded.size});
+      activity({message:`Downloading five-minute candles for ${symbol}.`,current_item:symbol});
       try {
         const cache=this.store.get(`intraday_seed:${token}`,{})||{},needsSeed=this.settings.enhanced_signals===true;
         if(!this.previous_intraday[token]?.length&&cache.date===dateIST(now)&&cache.symbol===symbol&&this._valid_intraday_seed(cache.bars,dateIST(now)))this.previous_intraday[token]=cache.bars.map(b=>new Candle(b.time??b.date,...['open','high','low','close','volume'].map(k=>b[k])));
@@ -1198,7 +1236,10 @@ export class TradingEngine {
         this._seed_intraday(token, rows, boundary);
         const current=this.books[token]?.bars||[];
         const complete=current.length&&timeIST(current[0].time)==='09:15'&&+current.at(-1).time+300000===+boundary&&validate_bars(current,{interval:'intraday'}).valid;
-        if(complete&&(!needsSeed||this.previous_intraday[token]?.length||current.length>=34)){this._intraday_history_loaded.add(token);delete this._intraday_history_retry[token];}
+        if(complete&&(!needsSeed||this.previous_intraday[token]?.length||current.length>=34)){
+          this._intraday_history_loaded.add(token);delete this._intraday_history_retry[token];
+          this._intraday_history_progress();this._intraday_warmup.completed.add(token);
+        }
         else this._intraday_history_retry[token]=monotonic()+60;
       } catch (exc) {
         if(!currentIdentity())return;
@@ -1208,12 +1249,12 @@ export class TradingEngine {
         this._intraday_history_retry[token]=monotonic()+60;
         if (exc.kind === 'TokenException') { this.connected = false; this._halt('Authentication expired loading intraday history. Reconnect Zerodha.', 'auth_expired', failureMetadata(exc, 'intraday_history', 'download')); break; }
       }
-      activity({completed:this._intraday_history_loaded.size,failed:this._intraday_history_failed});
-      if (this._intraday_history_loaded.size % 100 === 0) this._event('intraday_history', 'Intraday warmup progress.', { loaded: this._intraday_history_loaded.size, failed: this._intraday_history_failed, warmed: values(this.books).filter(b => b.bars.length >= 21).length, total: count(this.universe) });
+      activity({failed:this._intraday_history_failed});
       await sleep(100, signal);
     }
     const remaining=count(this.universe)-this._intraday_history_loaded.size,retries=values(this._intraday_history_retry).filter(Number.isFinite);
-    activity({status:this.connected?'waiting':'failed',completed:this._intraday_history_loaded.size,failed:this._intraday_history_failed,message:!this.connected?'Five-minute candle loading stopped. Reconnect Zerodha to resume.':remaining?`${remaining} symbols still need complete candles; waiting for fresh data or retry. Current candles must close before use.`:'Historical warmup is complete. Live candles continue to build from market prices.',next_retry_at:this.connected&&remaining?new Date(+this._now()+Math.max(15000,retries.length?(Math.min(...retries)-monotonic())*1000:15000)).toISOString():null});finished=true;
+    this._history_progress_event('intraday_history',{ready:this._intraday_history_loaded.size,total:count(this.universe),failed:this._intraday_history_failed});
+    activity({status:this.connected?'waiting':'failed',failed:this._intraday_history_failed,message:!this.connected?'Five-minute candle loading stopped. Reconnect Zerodha to resume.':remaining?`${remaining} symbols still need complete candles; waiting for fresh data or retry. Current candles must close before use.`:'Historical warmup is complete. Live candles continue to build from market prices.',next_retry_at:this.connected&&remaining?new Date(+this._now()+Math.max(15000,retries.length?(Math.min(...retries)-monotonic())*1000:15000)).toISOString():null});finished=true;
     } catch(error) {activity({status:'failed',message:'Five-minute candle loading failed; the background loop will retry.',failed:this._intraday_history_failed+1});finished=true;throw error;}
     finally {if(!finished)activity({status:'waiting',message:'Candle loading paused; waiting for market hours and a current account/universe.'});}
   }
@@ -1243,6 +1284,9 @@ export class TradingEngine {
       const symbol = holding.tradingsymbol || '', token = this._holding_token(holding), instrument = this.universe[token], quantity = Math.max(0, Number(holding.quantity || 0) - Number(holding.used_quantity || 0) - Number(holding.collateral_quantity || 0)), bars = this.daily[token] || [];
       const record = { symbol, exchange: holding.exchange, token, quantity, managed: selected.has(symbol), status: 'warming_up', reason: 'Waiting for at least 21 usable completed daily candles.', action: 'analysis_only' };
       results.push(record);
+      if (config.manage_existing_holdings === 'ignore') {
+        Object.assign(record, {managed:false,status:'ignored',action:'ignored',reason:'Ignored by your existing-holdings setting. Automatic buys and sells for this stock are disabled.'}); continue;
+      }
       if (holding.exchange !== 'NSE' || (holding.product || 'CNC') !== 'CNC') {
         Object.assign(record, { managed: false, status: 'unsupported', reason: 'Automatic exit analysis supports NSE delivery holdings only.' }); continue;
       }
@@ -1286,6 +1330,7 @@ export class TradingEngine {
   }
   _background_snapshot() {
     const tasks=this._activity.snapshot(),analytics=tasks.find(task=>task.id==='analytics');
+    Object.assign(tasks.find(task=>task.id==='intraday_history'),this._intraday_history_progress());
     const active=this._active_batches.size,pending=this._analysis_pending.size;
     Object.assign(analytics,{status:active?'running':this._shutdown?'stopped':this._last_analysis_error?'failed':'waiting',message:active?`Analyzing ${active} batches of completed candles; ${pending} symbol/strategy jobs queued.`:this._last_analysis_error|| (pending?`${pending} symbol/strategy jobs queued for workers.`:this.connected?'Waiting for completed candles or changed market context.':'Waiting for Zerodha connection.'),completed:this.analytics.completed_symbols||0,total:0,current_item:null,updated_at:this._last_analysis_at||analytics.updated_at});
     return {tasks};
@@ -1303,7 +1348,7 @@ export class TradingEngine {
       positions, account: this.account, signals: this.signals, holdings_signals: this._holding_signals(), delivery, background:this._background_snapshot(),performance: {...this.analytics.snapshot(this._analysis_pending.size, this._analysis_cache.size),active_batches:[...this._active_batches.values()].slice(0,32),active_batch_count:this._active_batches.size},
       intents: values(this.intents).slice(-100), strategy_settings: this.strategy_settings(), pending_orders: [...values(this.intents).filter(i => !['closed', 'rejected', 'open'].includes(i.state)), ...values(delivery.positions || {}).filter(p => p.status !== 'closed')],
       safe_to_stop: !this._other_mode_live_risk() && (this.mode !== 'live' || (!positions.length && !pending && !deliveryBusy && !this.running)), unmanaged_live_exposure: this._other_mode_live_risk(),
-      message: this.message, error: this.error, recovery: { ...this.recovery }, readiness:this.readiness(),live_swing_supported: true, decision_controls:this._decision_controls(),
+      message: this.message, error: this.error, error_help:this.error?this.error_help:null, recovery: { ...this.recovery }, readiness:this.readiness(),live_swing_supported: true, decision_controls:this._decision_controls(),
       limitations: ['Strategies are unvalidated research rules, not proven profitable models.', 'Paper fills include a 0.05% price adjustment and estimated 0.1% fees per side.', 'New swing buys require DDPI/POA; existing holding sales can request current-day CDSL authorization. GTT limits do not guarantee fills through gaps or circuits.', 'Exchange holidays are inferred from fresh market data; no holiday calendar is assumed.'] });
   }
 }

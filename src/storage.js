@@ -1,8 +1,13 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
+import { activityHelp } from './activity-help.js';
 
 const sensitive = /password|secret|token|authorization|cookie|checksum|api_key/i;
+const activityRow = row => {
+  const event = {...row,data:JSON.parse(row.data)}, help = activityHelp(event);
+  return help ? {...event,help} : event;
+};
 export class Store {
   constructor(filename, secrets = []) {
     fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
@@ -37,8 +42,19 @@ export class Store {
     if (level && typeof level === 'object') level = level.level || 'info';
     return Number(this.db.prepare('INSERT INTO events(timestamp,kind,level,message,data) VALUES(?,?,?,?,?)').run(new Date().toISOString(), kind, level, this.redact(String(message)), JSON.stringify(this.redact(data || {}))).lastInsertRowid);
   }
-  events(after = 0, limit = 200) { return this.db.prepare('SELECT * FROM events WHERE id>? ORDER BY id LIMIT ?').all(after, Math.min(2000, Math.max(1, limit))).map(row => ({ ...row, data: JSON.parse(row.data) })); }
-  latest_events(limit = 100) { return this.db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?').all(Math.min(2000, Math.max(1, limit))).reverse().map(row => ({ ...row, data: JSON.parse(row.data) })); }
+  events(after = 0, limit = 200) { return this.db.prepare('SELECT * FROM events WHERE id>? ORDER BY id LIMIT ?').all(after, Math.min(2000, Math.max(1, limit))).map(activityRow); }
+  latest_events(limit = 100) { return this.db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?').all(Math.min(2000, Math.max(1, limit))).reverse().map(activityRow); }
+  event_floor() { return this.get('activity_cleared_through',0); }
+  clear_events() {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const floor = Math.max(this.event_floor(),Number(this.db.prepare("SELECT seq FROM sqlite_sequence WHERE name='events'").get()?.seq || 0));
+      const deleted = Number(this.db.prepare('DELETE FROM events WHERE id<=?').run(floor).changes);
+      this.set('activity_cleared_through',floor);
+      this.db.exec('COMMIT');
+      return {deleted,event_floor:floor};
+    } catch (error) { this.db.exec('ROLLBACK');throw error; }
+  }
   new_session(digest, csrf, expires) { this.db.prepare('DELETE FROM sessions WHERE expires<?').run(Date.now()/1000); this.db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(digest, csrf, expires); }
   session(digest) { return this.db.prepare('SELECT * FROM sessions WHERE digest=? AND expires>?').get(digest, Date.now()/1000) || null; }
   drop_session(digest) { this.db.prepare('DELETE FROM sessions WHERE digest=?').run(digest); }

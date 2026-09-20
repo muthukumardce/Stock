@@ -7,6 +7,7 @@ const clock = value => {if(!value) return '—'; const d = new Date(value); retu
 const positive = n => Number(n) < 0 ? 'negative' : Number(n) > 0 ? 'positive' : '';
 const empty = (n,text) => `<tr><td colspan="${n}" class="empty-cell">${escape(text)}</td></tr>`;
 let csrf='', state={}, events=[], eventCursor=null, equityHistory=[], liveView=null, liveAllowed=true, activePage='overview', settingsLoaded=false, settingsDirty=false, busy=false, lastChartAt=0, toastTimer;
+let eventFloor=0,clearingActivity=false;
 let configLoaded=false, configLoading=null, configDirty=false, configFields=[];
 let paperModeDirty=false, savedExecution=null, configSaving=false, configRestartRequired=false;
 let authorizationBusy=false, authorizationPending=false, authorizationWasRequired=false, authorizationLastCheck=0;
@@ -123,7 +124,7 @@ document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',(
 
 function addEvents(rows){
   const known = new Set(events.map(e=>e.id));
-  for(const row of rows||[]) if(!known.has(row.id)){events.push(row);known.add(row.id);}
+  for(const row of rows||[]) if(Number.isSafeInteger(row.id)&&row.id>eventFloor&&!known.has(row.id)){events.push(row);known.add(row.id);}
   events.sort((a,b)=>a.id-b.id);events=events.slice(-500);
   if(events.length)eventCursor=Math.max(eventCursor??0,events.at(-1).id);
   renderActivity();
@@ -188,8 +189,9 @@ function renderBackground(){
   const background=state.background||{},tasks=Array.isArray(background.tasks)?background.tasks:[],performance=state.performance||{},resources=state.resources||{};
   $('background-tasks').innerHTML=tasks.map(task=>{
     const counts=progressCounts(task.completed,task.total),status=({running:'Running',waiting:'Waiting',idle:'Idle',failed:'Failed',stopped:'Stopped'})[task.status]||'Status unavailable';
-    const countText=counts?`${number(counts.completed)} of ${number(counts.total)} completed · ${counts.percent}%`:numeric(task.completed)!==null?`${number(task.completed)} completed`:'Progress totals not reported';
-    return `<article class="background-task"><div class="background-task-heading"><h3>${escape(task.label||task.id||'Background task')}</h3>${badge(status,task.status==='failed'?'red':task.status==='running'?'blue':task.status==='waiting'?'amber':'')}</div><p>${escape(task.message||'No current task detail reported.')}</p>${task.current_item?`<div class="background-current">Current: <strong>${escape(task.current_item)}</strong></div>`:''}${counts?`<progress max="${counts.total}" value="${counts.completed}" aria-label="${escape(task.label||task.id||'Task')} progress"></progress>`:''}<div class="background-task-meta"><span>${escape(countText)}${numeric(task.failed)>0?` · ${number(task.failed)} failed`:''}</span>${task.updated_at?`<span>Updated ${escape(clock(task.updated_at))} IST</span>`:''}</div>${task.next_retry_at?`<small>Next retry ${escape(dateLabel(task.next_retry_at))} · ${escape(clock(task.next_retry_at))} IST</small>`:''}</article>`;
+    const progressLabel=task.progress_kind==='session_warmup'?'warmed up this session':'completed';
+    const countText=counts?`${number(counts.completed)} of ${number(counts.total)} ${progressLabel} · ${counts.percent}%`:numeric(task.completed)!==null?`${number(task.completed)} ${progressLabel}`:'Progress totals not reported';
+    return `<article class="background-task"><div class="background-task-heading"><h3>${escape(task.label||task.id||'Background task')}</h3>${badge(status,task.status==='failed'?'red':task.status==='running'?'blue':task.status==='waiting'?'amber':'')}</div><p>${escape(task.message||'No current task detail reported.')}</p>${task.current_item?`<div class="background-current">Current: <strong>${escape(task.current_item)}</strong></div>`:''}${counts?`<progress max="${counts.total}" value="${counts.completed}" aria-label="${escape(task.label||task.id||'Task')} progress"></progress>`:''}<div class="background-task-meta"><span>${escape(countText)}${numeric(task.failed)>0?` · ${number(task.failed)} failed`:''}</span>${task.updated_at?`<span>Updated ${escape(clock(task.updated_at))} IST</span>`:''}</div>${task.progress_kind==='session_warmup'?`<small>${number(task.ready)} currently loaded; ${number(Math.max(0,Number(task.total)-Number(task.ready)))} awaiting load or refresh. Successful warmups stay counted after feed gaps. Resets for a new trading day or changed stock universe.</small>`:''}${task.next_retry_at?`<small>Next retry ${escape(dateLabel(task.next_retry_at))} · ${escape(clock(task.next_retry_at))} IST</small>`:''}</article>`;
   }).join('')||'<p class="empty-copy">Background task details have not been reported yet. Connect and start to see each job as it runs.</p>';
   $('background-cpu').textContent=numeric(resources.cpu_percent)===null?'Not reported':`${decimal(resources.cpu_percent,1)}%`;
   $('background-workers').textContent=numeric(performance.worker_limit)===null?'Not reported':`${numeric(performance.live_workers)===null?'':`${number(performance.live_workers)} live / `}${number(performance.worker_limit)} capacity`;
@@ -683,13 +685,51 @@ async function applyResearchSet(reportId,parameterSetId){
 }
 $('tuning-sets').addEventListener('click',event=>{const button=event.target.closest('[data-apply-set]');if(button&&!button.disabled)applyResearchSet(button.dataset.reportId,button.dataset.applySet);});
 function renderActivity(){
+  $('clear-activity').disabled=clearingActivity;
   $('recent-activity').innerHTML=events.slice(-4).reverse().map(e=>`<div class="timeline-item"><span class="dot ${e.level==='error'?'red':e.level==='warning'?'amber':'green'}"></span><div><p>${escape(e.message)}</p></div><time>${escape(clock(e.timestamp))}</time></div>`).join('') || '<p class="empty-copy">Waiting for activity.</p>';
   if(activePage!=='activity') return;
   const search=$('event-search').value.toLowerCase(),level=$('event-level').value;
   const filtered=events.filter(e=>(!level||e.level===level)&&(!search||JSON.stringify(e).toLowerCase().includes(search)));
-  $('activity-list').innerHTML=filtered.slice().reverse().map(e=>`<div class="audit-row"><div class="audit-heading"><time>${escape(new Date(e.timestamp).toLocaleDateString('en-IN',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short'}))} · ${escape(clock(e.timestamp))}</time>${badge(e.level,e.level==='error'?'red':e.level==='warning'?'amber':'blue')}<span class="audit-kind">${escape(e.kind)}</span></div><p>${escape(e.message)}</p>${Object.keys(e.data||{}).length?`<details><summary>View event details</summary><pre>${escape(JSON.stringify(e.data,null,2))}</pre></details>`:''}</div>`).join('')||'<div class="empty-cell">No events match this filter.</div>';
+  $('activity-list').innerHTML=filtered.slice().reverse().map(e=>`<div class="audit-row"><div class="audit-heading"><time>${escape(new Date(e.timestamp).toLocaleDateString('en-IN',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short'}))} · ${escape(clock(e.timestamp))}</time>${badge(e.level,e.level==='error'?'red':e.level==='warning'?'amber':'blue')}<span class="audit-kind">${escape(e.kind)}</span></div><p>${escape(e.message)}</p>${activityHelpMarkup(e.help)}${Object.keys(e.data||{}).length?`<details><summary>View event details</summary><pre>${escape(JSON.stringify(e.data,null,2))}</pre></details>`:''}</div>`).join('')||(events.length?'<div class="empty-cell">No events match this filter.</div>':'<div class="empty-cell">Activity log is empty. New events will appear here.</div>');
 }
 $('event-search').addEventListener('input',renderActivity);$('event-level').addEventListener('change',renderActivity);
+
+function applyEventFloor(floor){
+  if(!Number.isSafeInteger(floor)||floor<eventFloor)return;
+  eventFloor=floor;events=events.filter(event=>event.id>eventFloor);
+  eventCursor=Math.max(eventCursor??0,eventFloor);
+}
+async function clearActivity(){
+  if(clearingActivity)return;
+  clearingActivity=true;renderActivity();$('activity-error').textContent='';
+  try{
+    const result=await api('/api/events','DELETE',{});
+    if(!Number.isSafeInteger(result.event_floor)||result.event_floor<0)throw new Error('The server did not confirm which entries were cleared. Refresh Activity before trying again.');
+    applyEventFloor(result.event_floor);renderActivity();toast('Activity history cleared. Trading records and settings are unchanged.');
+  }catch(error){$('activity-error').textContent=error.message;}
+  finally{clearingActivity=false;renderActivity();}
+}
+$('clear-activity').addEventListener('click',clearActivity);
+
+function activityHelpMarkup(help){
+  if(!help||!Array.isArray(help.steps)||!help.steps.length)return '';
+  const links=(help.links||[]).map(link=>{
+    if(['overview','settings','background','research','holdings','orders'].includes(link.page))
+      return `<button type="button" class="text-button" data-help-page="${escape(link.page)}" data-help-target="${escape(link.target||'')}">${escape(link.label)}</button>`;
+    try{const url=new URL(link.url);if(url.protocol==='https:'&&['developers.kite.trade','support.zerodha.com','kite.zerodha.com'].includes(url.hostname))return `<a href="${escape(url.href)}" target="_blank" rel="noopener noreferrer">${escape(link.label)}</a>`;}catch{}
+    return '';
+  }).join('');
+  return `<div class="activity-help"><strong>What to check</strong><ul>${help.steps.map(step=>`<li>${escape(step)}</li>`).join('')}</ul>${links?`<div class="activity-help-links">${links}</div>`:''}</div>`;
+}
+async function openActivityHelp(event){
+  const button=event.target.closest('[data-help-page]');if(!button)return;
+  showPage(button.dataset.helpPage);
+  if(button.dataset.helpPage==='settings')try{await loadConfig();}catch{}
+  const target=$(button.dataset.helpTarget);
+  target?.scrollIntoView?.({block:'center',behavior:'smooth'});target?.focus?.({preventScroll:true});
+}
+$('activity-list').addEventListener('click',openActivityHelp);
+$('error-help').addEventListener('click',openActivityHelp);
 
 function render(next){
   state=next;
@@ -746,6 +786,7 @@ function render(next){
   $('strategy-cards').innerHTML=[['Intraday','intraday','Positions close during the trading day'],['Swing','swing','Positions may stay open overnight']].map(([name,key,desc])=>`<div class="strategy-item"><div><strong>${name}</strong><small>${escape(desc)}</small></div><div><strong>${money(config[`${key}_capital`]||0,0)}</strong><small>${badge(config[`${key}_enabled`]?'Enabled':'Disabled',config[`${key}_enabled`]?'green':'')}</small></div></div>`).join('');
   const warning=state.error||(state.maintenance?'Server maintenance is in progress. New entries are blocked.':!state.configured?'Setup needed: configure your Kite API credentials and Zerodha client ID on the server.':connected&&!state.account_fresh?'Account reconciliation is delayed. Check the activity log.':'');
   $('notice').textContent=warning;$('notice').hidden=!warning;$('notice').className=`notice ${state.error?'error':''}`;
+  $('error-help').innerHTML=state.error?activityHelpMarkup(state.error_help):'';$('error-help').hidden=!$('error-help').innerHTML;
   const recovery=state.recovery||{};
   $('recovery-status').textContent=recovery.message?`Account recovery: ${recovery.message}`:'';
   $('recovery-status').hidden=!recovery.message;
@@ -761,14 +802,14 @@ function renderTables(){
   const positions=state.positions||[];
   $('positions-body').innerHTML=positions.map(p=>`<tr><td>${escape(p.symbol||p.tradingsymbol)}</td><td>${badge(p.strategy||'intraday','blue')}<div class="entry-side">${entrySide(p)}</div></td><td>${number(p.quantity)}</td><td>${money(p.entry)}</td><td>${money(p.last??p.last_price)}</td><td>${money(p.stop)}${p.protection_status?` ${badge(p.protection_status)}`:''}</td><td class="align-right ${positive(p.unrealised??p.unrealised_pnl)}">${money(p.unrealised??p.unrealised_pnl)}</td></tr>`).join('')||empty(7,state.connected?'No managed positions. The scanner waits for qualifying signals.':'Connect to Zerodha to begin monitoring.');
   const openedSignals=new Set([...document.querySelectorAll('#signals-body details[open]')].map(row=>row.dataset.signal));
-  $('signals-body').innerHTML=(state.signals||[]).slice(0,8).map(s=>`<tr><td>${escape(clock(s.timestamp||s.time))}</td><td>${escape(s.symbol)}</td><td>${badge(s.strategy,'blue')}<div class="entry-side">${entrySide(s)}</div></td><td>${badge(String(s.status||'analysed').replaceAll('_',' '),s.status==='candidate'?'green':'')}</td><td class="signal-explanation"><span>${escape(s.reason)}</span>${signalMetrics(s,openedSignals)}</td></tr>`).join('')||empty(5,'Signals appear after complete candles pass the strategy checks. All decisions are recorded in the activity log.');
+  $('signals-body').innerHTML=(state.signals||[]).slice(0,8).map(s=>`<tr><td>${escape(clock(s.timestamp||s.time))}</td><td>${escape(s.symbol)}</td><td>${badge(s.strategy,'blue')}<div class="entry-side">${entrySide(s)}</div></td><td>${badge(String(s.status||'analysed').replaceAll('_',' '),s.status==='candidate'?'green':'')}</td><td class="signal-explanation"><span>${escape(s.reason)}</span>${signalMetrics(s,openedSignals)}</td></tr>`).join('')||empty(5,'Signals appear after complete candles pass the strategy checks. Routine decisions are grouped in activity summaries.');
   if(activePage==='holdings'){
     const holdings=state.account?.holdings||[],analysis=state.holdings_signals||[];
     $('holdings-count').textContent=number(holdings.length);$('account-updated').textContent=`Account updated ${clock(state.account?.updated_at)}`;
     $('holdings-body').innerHTML=holdings.map(h=>{
       const q=Number(h.quantity||0)+Number(h.t1_quantity||0),pnl=(Number(h.last_price||0)-Number(h.average_price||0))*q;
       const signal=Array.isArray(analysis)?analysis.find(x=>x.symbol===h.tradingsymbol&&(!x.exchange||x.exchange===h.exchange)):analysis[h.tradingsymbol];
-      const labels={exit_candidate:'Exit candidate',hold:'Hold',unsupported:'Unsupported',universe_unavailable:'Eligibility unavailable',history_unavailable:'No usable history',awaiting_market_data:'Waiting for market data',warming_up:'Waiting for daily history',analysing:'Analysing'};
+      const labels={ignored:'Ignored',exit_candidate:'Exit candidate',hold:'Hold',unsupported:'Unsupported',universe_unavailable:'Eligibility unavailable',history_unavailable:'No usable history',awaiting_market_data:'Waiting for market data',warming_up:'Waiting for daily history',analysing:'Analysing'};
       const managed=signal?.managed,label=signal?.action==='simulated_sell'?'Paper exit recorded':labels[signal?.status]||'Awaiting status';
       const reason=signal?.reason||(!state.connected?'Connect Zerodha to refresh holding analysis.':'Holding analysis status is not available yet.');
       return `<tr><td>${escape(h.tradingsymbol)}<small> · ${escape(h.exchange)}</small></td><td>${number(q)}</td><td>${money(h.average_price)}</td><td>${money(h.last_price)}</td><td>${money(q*Number(h.last_price||0),0)}</td><td class="${positive(pnl)}">${money(pnl)}</td><td class="signal-explanation">${badge(managed?'Managed':'Observe only',managed?'blue':'')} ${signal?.scope==='recovery_only'?badge('Exit only','amber')+' ':''}${badge(label,['exit_candidate','unsupported','history_unavailable','universe_unavailable'].includes(signal?.status)?'amber':'')}<div><small>${escape(reason)}${signal?.scope_reason?' '+escape(signal.scope_reason):''}</small></div></td></tr>`;
@@ -800,7 +841,13 @@ function loadSettings(){
   for(const [key,fallback] of [['intraday_allocation_pct',1],['swing_allocation_pct',0]])form.elements[key].value=Number(((values[key]??fallback)*100).toFixed(6));
   form.elements.manage_existing_holdings.value=values.manage_existing_holdings||'selected';
   form.elements.managed_symbols.value=(values.managed_symbols||[]).join(', ');
+  updateHoldingPolicy();
 }
+function updateHoldingPolicy(){
+  const form=$('settings-form');
+  form.elements.managed_symbols.disabled=form.elements.manage_existing_holdings.value!=='selected';
+}
+$('holding-policy').addEventListener('change',updateHoldingPolicy);
 $('settings-form').addEventListener('input',()=>settingsDirty=true);
 $('settings-form').addEventListener('submit',async event=>{
   event.preventDefault();const form=event.currentTarget,button=form.querySelector('[type=submit]');button.disabled=true;$('settings-error').textContent='';
@@ -880,7 +927,7 @@ document.querySelectorAll('[data-copy-url]').forEach(button=>button.addEventList
   try{await navigator.clipboard.writeText(input.value);toast('URL copied.');}
   catch{input.focus();input.select();toast('URL selected. Copy it using your device’s copy command.');}
 }));
-function updateView(data){equityHistory=data.equity_history||equityHistory;render(data.state);addEvents(data.events);if(Number.isSafeInteger(data.event_cursor)&&data.event_cursor>=0)eventCursor=Math.max(eventCursor??0,data.event_cursor);if(data.equity_history)drawChart();}
+function updateView(data){applyEventFloor(data.event_floor);equityHistory=data.equity_history||equityHistory;render(data.state);addEvents(data.events);if(Number.isSafeInteger(data.event_cursor)&&data.event_cursor>=0)eventCursor=Math.max(eventCursor??0,data.event_cursor);if(data.equity_history)drawChart();}
 function statePath(){return eventCursor===null?'/api/state':`/api/state?after=${eventCursor}`;}
 async function refresh(){const request=new AbortController(),timer=setTimeout(()=>request.abort(),10000);try{updateView(await api(statePath(),'GET',undefined,{signal:request.signal}));}finally{clearTimeout(timer);}}
 async function action(path){

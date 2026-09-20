@@ -1,7 +1,22 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
-import {KiteBroker, BrokerError, jsonable, parseInstruments} from '../src/broker.js';
+import {KiteBroker, BrokerError, jsonable, parseInstruments, orderRejectionReason} from '../src/broker.js';
+
+test('order rejection explanations classify broker restrictions without copying private broker messages',()=>{
+  for(const [kind,detail,code] of [
+    ['PermissionException','IP is not whitelisted','ip_not_allowed'],
+    ['PermissionException','This operation is not permitted','permission_denied'],
+    ['PermissionException','CO orders are blocked for this instrument','cover_unavailable'],
+    ['InputException','Insufficient funds for this order','insufficient_margin'],
+    ['InputException','Trigger price is outside the allowed range','invalid_trigger'],
+    ['TokenException','Session expired','session_expired'],
+    ['InputException','Unexpected rejection','order_rejected'],
+  ]){
+    const reason=orderRejectionReason(new BrokerError(kind,detail+' private-key private-token https://broker.invalid',{http_status:403}));
+    assert.equal(reason.code,code);assert.doesNotMatch(JSON.stringify(reason),/private-key|private-token|broker.invalid/);
+  }
+});
 
 const success = data => ({ok: true, status: 200, json: async () => ({status: 'success', data})});
 function fixture(handler = () => success({})) {

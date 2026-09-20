@@ -31,7 +31,8 @@ async function fixture(t,{root,environment={},exchangeToken,engineFactory=Engine
   const origin=`http://127.0.0.1:${server.address().port}`;
   let cookie='',csrf='';
   const request=(url,method='GET',body,headers={})=>new Promise((resolve,reject)=>{
-    const req=http.request(origin+url,{method,headers:{...(body!==undefined?{'content-type':'application/json'}:{}),...(cookie?{cookie}:{}),...(method!=='GET'?{origin,'x-csrf-token':csrf}:{}),...headers}},res=>{const chunks=[];res.on('data',chunk=>chunks.push(chunk));res.on('end',()=>resolve(new Response(Buffer.concat(chunks),{status:res.statusCode,headers:res.headers})));res.on('error',reject);});req.on('error',reject);req.end(body===undefined?undefined:typeof body==='string'?body:JSON.stringify(body));
+    const payload=body===undefined?undefined:typeof body==='string'?body:JSON.stringify(body);
+    const req=http.request(origin+url,{method,headers:{...(payload!==undefined?{'content-type':'application/json','content-length':Buffer.byteLength(payload)}:{}),...(cookie?{cookie}:{}),...(method!=='GET'?{origin,'x-csrf-token':csrf}:{}),...headers}},res=>{const chunks=[];res.on('data',chunk=>chunks.push(chunk));res.on('end',()=>resolve(new Response(Buffer.concat(chunks),{status:res.statusCode,headers:res.headers})));res.on('error',reject);});req.on('error',reject);req.end(payload);
   });
   const login=async(headers={})=>{const r=await request('/api/login','POST',{username:'admin',password:PASSWORD},headers);assert.equal(r.status,200,await r.clone().text());cookie=r.headers.get('set-cookie').split(';')[0];csrf=(await (await request('/api/session','GET',undefined,headers)).json()).csrf;return r;};
   let closed=false;
@@ -72,6 +73,22 @@ test('state polling retains contiguous bounded activity pages and rejects malfor
     assert.equal((await f.request(`/api/state?after=${value}`)).status,422,value);
   }
   assert.equal((await f.request('/api/state?after=0')).status,200);
+});
+
+test('Clear All requires authenticated CSRF, clears the export and shares a durable deletion cursor without changing trading state',async t=>{
+  const f=await fixture(t);assert.equal((await f.request('/api/events','DELETE',{})).status,401);await f.login();
+  f.store.set('bot_state_live',{intents:{EB1:{state:'unknown'}}});f.engine.positions=[{symbol:'TEST',quantity:5}];
+  const last=f.store.event('order_unknown','An acknowledged order must remain managed',{},'error');
+  assert.equal((await f.request('/api/events','DELETE',{}, {'x-csrf-token':'bad'})).status,403);
+  assert.equal((await f.request('/api/events','DELETE',{}, {origin:'https://evil.example'})).status,403);
+  assert.equal((await f.request('/api/events','DELETE',{level:'info'})).status,422);
+  assert.equal(f.store.latest_events().at(-1).id,last);
+  const cleared=await (await f.request('/api/events','DELETE',{})).json();assert.equal(cleared.ok,true);assert.equal(cleared.event_floor,last);assert.ok(cleared.deleted>0);
+  assert.equal(await (await f.request('/api/events/export')).text(),'');
+  const view=await (await f.request('/api/state?after=0')).json();assert.deepEqual(view.events,[]);assert.equal(view.event_floor,last);assert.equal(view.event_cursor,last);
+  assert.deepEqual(f.engine.positions,[{symbol:'TEST',quantity:5}]);assert.equal(f.store.get('bot_state_live').intents.EB1.state,'unknown');
+  const next=f.store.event('account_trade','A new trade');assert.ok(next>last);
+  assert.deepEqual((await (await f.request(`/api/state?after=${last}`)).json()).events.map(event=>event.id),[next]);
 });
 
 test('research cooldown is enforced over HTTP and background status carries safe diagnostics without a full report',async t=>{
@@ -345,6 +362,15 @@ test('strategy allocations use percentages without a configured rupee capital an
   assert.equal((await f.request('/api/settings','PUT',{...values,swing_allocation_pct:.5})).status,422);
   assert.equal((await f.request('/api/settings','PUT','{"__proto__":{}}')).status,422);
   f.engine.positions=[{symbol:'ABC'}];assert.equal((await f.request('/api/settings','PUT',values)).status,409);
+});
+
+test('ignore existing stocks policy persists and cannot be enabled over active managed exposure',async t=>{
+  const f=await fixture(t);await f.login();const values={...defaultStrategies(),manage_existing_holdings:'ignore',managed_symbols:['TEST']};
+  assert.equal((await f.request('/api/settings','PUT',values)).status,200);
+  assert.deepEqual(f.store.get('strategy_settings'),values);
+  assert.equal((await f.request('/api/settings','PUT',{...values,manage_existing_holdings:'invalid'})).status,422);
+  f.engine.pending=[{symbol:'TEST'}];assert.equal((await f.request('/api/settings','PUT',values)).status,409);
+  f.engine.pending=[];f.engine.positions=[{symbol:'TEST'}];assert.equal((await f.request('/api/settings','PUT',values)).status,409);
 });
 test('Settings persist defaults, reject old env-only fields and require restart without trading exposure',async t=>{
   const f=await fixture(t);await f.login();

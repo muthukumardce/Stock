@@ -9,7 +9,7 @@ A self-hosted Zerodha trading dashboard for **Windows, macOS and Linux**, runnin
 - Shows account cash, holdings, positions, orders, trades, strategy P&L, scanner coverage, CPU/RAM usage and a durable activity log.
 - Shows startup progress and a Background page for account checks, candle downloads, active analytics batches and historical research.
 - Supports intraday and swing trading. Intraday starts enabled with 100% of the strategy allocation; swing starts disabled with 0%.
-- Analyzes existing holdings for exits. Automatic selling is limited to selected symbols by default; the initial selection is empty. You can select symbols or all eligible NSE holdings in Settings.
+- Analyzes existing holdings for exits. Automatic selling is limited to selected symbols by default; the initial selection is empty. Settings also offers **Ignore stocks I already own**, which excludes held stocks from automatic buys and sells in paper and live mode.
 - Scans NSE EQ-series stocks and listed ETFs verified against NSE's official security lists and matched to Kite, using completed candles and fresh market data. Bonds in Kite's broader `EQ` instrument type are excluded from new entries.
 - Runs CPU analytics in lazy Node worker threads while one coordinated execution service handles orders.
 - Evaluates 11 intraday setup families in both directions: breakout, pullback, range reversion, opening range/drive, gap continuation/reversal, VWAP reclaim/rejection, volatility squeeze and relative strength. Swing remains long-only.
@@ -66,7 +66,7 @@ The **Paper trading** switch is at the top of Settings. On means simulated buys 
 | Settings area | Controls and defaults |
 |---|---|
 | Strategies | Intraday enabled, 100% allocation; swing disabled, 0%. Allocations together must not exceed 100%. |
-| Existing holdings | Selected symbols, initially empty; optionally all eligible NSE holdings. |
+| Existing holdings | Selected symbols, initially empty; optionally all eligible NSE holdings, or ignore owned stocks to prevent automatic buys and sells. |
 | Execution | Paper trading on by default. The top Settings switch changes both the trading mode and real-order permission together. Save and restart to apply. |
 | Server | Local port `3000`; data directory `data`. |
 | Risk | Risk per trade `0.0025` (0.25%); maximum position allocation `0.10` (10%); daily loss limit `0.01` (1%); maximum five bot positions. |
@@ -93,6 +93,8 @@ An initially unfunded account can still start. The dashboard shows **Waiting for
 Strategy/holding settings apply without a server restart after entries are paused and managed exposure and pending orders are resolved. Application settings require the same checks; saving them stops the engine and marks the server for restart. Stop with **Ctrl+C**, wait for shutdown, then run `npm start` again. The UI tells you when a restart is required. Administrator/password changes take effect immediately and require another dashboard login.
 
 Settings are stored in `config/settings.json`; strategy permissions and journals are in the SQLite database under the selected data directory. Keep both directories and `.env` private and backed up. Generated encryption keys are necessary to read saved broker sessions; rotate them using Settings instead of replacing them by hand.
+
+**Ignore stocks I already own** uses the latest verified account holdings, including unsettled and pledged shares and today's delivery buys. It overrides any saved symbol selection. Ignored holdings remain visible and count toward account risk. Pause entries and resolve managed positions and pending orders before changing this setting; it does not remove existing order protection.
 
 ## Connect through Cloudflare Tunnel
 
@@ -144,7 +146,11 @@ After **Start Trading** and any required Zerodha login, the dashboard shows the 
 
 Setup reaching 100% does not mean every NSE stock has enough history or that a trade can be placed. Candle downloads continue in the background, and **Entry readiness** explains conditions such as a closed market, clock mismatch, missing funds or incomplete recovery. These are waiting conditions, not an indefinitely running setup step.
 
-Open **Background** to see current work, the symbol being downloaded where available, completed/total counts, retries, the analytics queue and active worker batches, and research progress. Candle coverage counts usable data, including valid cached history; it is not a count of newly downloaded files. Daily-history scope can cover holdings and risk checks even when swing entries are disabled. Downloading all needed data takes time because broker requests are rate limited.
+Open **Background** to see current work, the symbol being downloaded where available, completed/total counts, retries, the analytics queue and active worker batches, and research progress. Five-minute history counts each successfully warmed stock once per session and universe, so feed gaps and repeat downloads do not reduce or double-count completed progress. A separate currently-loaded count shows data awaiting refresh. The warmup counter resets on server restart, a new trading day or a changed stock universe. Daily history counts current usable coverage, including valid cached history, and can cover holdings and risk checks even when swing entries are disabled. Downloading all needed data takes time because broker requests are rate limited.
+
+**Activity** groups routine scanner candidates and blocked entry decisions into approximately five-minute summaries. Candle coverage is logged when it changes, at most once per five minutes plus completion; Background continues to show live progress. Orders, fills, account changes and errors remain individual events. Errors include **What to check**, with links to the relevant app setting or official Zerodha guidance. This also works for previously saved errors.
+
+**Clear All** permanently deletes all saved activity entries, including entries outside the current search or severity filter. Export full history first if you need a copy. Trading journals, open orders, positions, settings and login sessions are retained. New events continue normally, and other open dashboards receive the clear on their next update.
 
 **Pause entries** prevents a pending startup from enabling trading. An in-flight broker request may still finish before startup reports cancellation. Account monitoring and analysis continue after connection, and exits for already managed positions remain active. Background status describes current work; **Activity** retains the durable event history and **Research** contains the detailed comparison report.
 

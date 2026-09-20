@@ -25,6 +25,11 @@ async function harness(){
 }
 const holding=(tradingsymbol,exchange='NSE')=>({tradingsymbol,exchange,quantity:10,average_price:100,last_price:101});
 
+test('ignored holding clearly explains that automatic buys and sells are disabled',async()=>{
+  const h=await harness(),body=h.render({account:{holdings:[holding('INFY')]},holdings_signals:[{symbol:'INFY',exchange:'NSE',managed:false,status:'ignored',action:'ignored',reason:'Automatic buys and sells for this stock are disabled.'}]});
+  assert.match(body,/>Ignored</);assert.match(body,/Automatic buys and sells/);assert.doesNotMatch(body,/>Managed</);
+});
+
 test('holdings show visible escaped status reasons, separate exchange decisions and exit-only scope',async()=>{
   const h=await harness(),body=h.render({account:{holdings:[holding('SAME'),holding('SAME','BSE'),holding('NOHISTORY'),holding('RECOVERY')]},holdings_signals:[
     {symbol:'SAME',exchange:'NSE',managed:true,status:'hold',reason:'Daily trend is intact.'},
