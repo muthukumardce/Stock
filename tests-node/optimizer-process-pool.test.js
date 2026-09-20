@@ -6,6 +6,7 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {OptimizerProcessPool,optimizerProcessEnvironment} from '../src/optimizer-process-pool.js';
 import {reapResearchProcess} from '../src/research-process-reaper.js';
 import {ResearchProcessLifecycle,defunctResearchProcess} from '../src/research-process-lifecycle.js';
+import {MAX_RESEARCH_BARS} from '../src/backtest.js';
 
 const task=id=>({trial:{id:'candidate_'+id,parameter_set_id:'P'+id,parameters:{}},phase:'tuning_train',remaining_ms:60000});
 const stage=value=>({'5minute':{metrics:{net_pnl:value},data_quality:{eligible:false}}});
@@ -132,7 +133,7 @@ test('the initializing-process ceiling limits cold starts even with abundant RAM
   const f=fixture(t,{workerLimit:4,memoryReserveMiB:100,startupMemoryMiB:100,freeMemory:()=>10000*2**20,maxInitializing:2}),done=f.run([task(1),task(2),task(3),task(4)]);
   f.tick();f.ready(0);f.tick();f.ready(1);assert.equal(f.tick(),false);
   assert.equal(f.updates.at(-1).memory_wait_reason,'initializing');assert.equal(f.updates.at(-1).available_memory_mib,10000);
-  f.send(0,'progress',progress(.5,1000001,1000001));assert.equal(f.tick(),false,'Malformed progress cannot free startup reservations');
+  f.send(0,'progress',progress(.5,MAX_RESEARCH_BARS+1,MAX_RESEARCH_BARS+1));assert.equal(f.tick(),false,'Malformed progress cannot free startup reservations');
   f.send(0,'progress',progress(0,0));assert.equal(f.tick(),false,'Initial zero progress does not prove the large context has normalized');
   f.send(0,'progress',progress(.1,10));assert.equal(f.tick(),true);assert.equal(f.children.length,3);assert.equal(f.pool._snapshot().initializing_processes,2);
   const rejected=assert.rejects(done,error=>error.name==='AbortError');await f.pool.close();await rejected;assert.equal(f.tick(),false);

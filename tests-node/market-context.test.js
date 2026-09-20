@@ -47,6 +47,30 @@ test('official BE constituents are classified while explicit corporate-action du
   const parsed=parseIndexConstituents(source,{withMetadata:true});assert.equal(parsed.records.length,7);assert.equal(parsed.total_rows,8);assert.equal(parsed.records[0].series,'BE');
   assert.deepEqual(parsed.excluded,[{symbol:'DUMMYHEG',reason:'index_corporate_action_placeholder'}]);
   assert.throws(()=>parseIndexConstituents(source.replace('Dummy HEG Ltd.','HEG Ltd.')));
+  for(const isin of ['DU1560A01023','DU2560A01023']){
+    const parsed=parseIndexConstituents(csv()+`\nDummy Inox Ltd.,Industrials,DUMMYINGL1,EQ,${isin}`,{withMetadata:true});
+    assert.equal(parsed.records.length,7);assert.equal(parsed.excluded.length,1);
+    assert.throws(()=>parseIndexConstituents(csv().replace('INE000A00000',isin)),'Invalid real-stock ISIN still fails');
+  }
+});
+
+test('Total Market membership validates coverage, survives restart and becomes stale without a sector benchmark',async()=>{
+  const source=INDEX_SOURCES.find(item=>item.id==='niftytotalmarket');
+  assert.equal(source.url,'https://www.niftyindices.com/IndexConstituent/ind_niftytotalmarket_list.csv');
+  assert.ok(!BENCHMARKS.some(item=>item.name===source.name));
+  const body='Company Name,Industry,Symbol,Series,ISIN Code\n'+Array.from({length:750},(_,i)=>`Stock ${i},Industry ${i%15},STOCK${i},EQ,INE000A0${String(i).padStart(4,'0')}`).join('\n');
+  let truncated=false;
+  const f=fixture({indexes:[source],fetchOverride:url=>url===source.url?response(truncated?csv():body,'text/csv'):response([])});
+  assert.equal(f.service.researchConstituents().status,'unavailable');await f.service.refresh(f.engine);
+  const membership=f.service.researchConstituents();assert.equal(membership.records.length,750);assert.equal(membership.status,'fresh');
+  assert.equal(f.service.contextForSymbol('STOCK0').sector_index,null,'Broad index cannot stand in for a sector');
+  membership.records.pop();assert.equal(f.service.researchConstituents().records.length,750);
+  truncated=true;f.advance(DAY);await f.service.refresh(f.engine);
+  assert.equal(f.service.researchConstituents().observed_at,membership.observed_at);
+  assert.equal(f.service.snapshot().classification.sources[0].last_error,'constituent_coverage_incomplete');
+  await f.service.close();
+  const restored=fixture({indexes:[source],store:f.store});assert.equal(restored.service.researchConstituents().records.length,750);
+  restored.advance(8*DAY);assert.equal(restored.service.researchConstituents().status,'stale');await restored.service.close();
 });
 
 test('calendar date and row validation rejects rollover dates, out-of-window data and unexpected wrappers',()=>{

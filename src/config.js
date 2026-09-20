@@ -21,7 +21,7 @@ export const DEFAULTS = Object.freeze({
   correlation_filter:true, max_correlation:0.85, max_correlated_exposure_pct:0.35,
   max_trades_per_day:10, loss_streak_limit:3, loss_cooldown_minutes:30,
   auto_research:true, research_symbols:20, research_days:45, research_fee_rate:0.001, research_slippage_rate:0.0005,
-  research_tuning:true, research_tuning_apply:true, research_tuning_trials:9, research_tuning_seconds:600, research_tuning_workers:0, research_cpu_affinity:'pinned',
+  research_workers:0, research_cpu_affinity:'pinned',
 });
 export const FIELDS = [
   ['port','Local server port','number'],
@@ -52,11 +52,9 @@ export const FIELDS = [
   ['max_account_gross_pct','Maximum gross exposure fraction of reference assets','number'],['max_account_risk_pct','Maximum estimated account stress loss fraction','number'],['unprotected_stress_pct','Stress move for exposure without a verified stop','number'],
   ['correlation_filter','Limit historically correlated exposure','checkbox'],['max_correlation','Daily return correlation threshold','number'],['max_correlated_exposure_pct','Maximum correlated group fraction of reference assets','number'],
   ['max_trades_per_day','Maximum new symbols attempted per day','number'],['loss_streak_limit','Consecutive realized loss events before cooldown','number'],['loss_cooldown_minutes','Loss cooldown (minutes)','number'],
-  ['auto_research','Automatically refresh daily research when account data is ready','checkbox'],['research_symbols','Historical research sample size','number'],['research_days','Historical research lookback (calendar days)','number'],
+  ['auto_research','Automatically refresh daily research when account data is ready','checkbox'],['research_symbols','Nifty Total Market research stocks (0 = all constituents)','number'],['research_days','Historical research lookback (calendar days)','number'],
   ['research_fee_rate','Research estimated costs per side (fraction)','number'],['research_slippage_rate','Research adverse slippage per side (fraction)','number'],
-  ['research_tuning','Search for improved strategy parameters during research','checkbox'],['research_tuning_apply','Automatically apply validated parameters to paper and live trading','checkbox'],
-  ['research_tuning_trials','Maximum parameter candidates per search (including current settings)','number'],['research_tuning_seconds','Parameter search time limit (seconds)','number'],
-  ['research_tuning_workers','Parallel research jobs (0 = automatic)','number'],
+  ['research_workers','Parallel comparison workers (0 = automatic)','number'],
   ['research_cpu_affinity','Research CPU scheduling','select',['pinned','automatic']],
 ].map(([key,label,type,choices])=>({key,label,type,choices}));
 /** Resolve existing parents as well as the final path, including directory links. */
@@ -78,7 +76,12 @@ export function pathWithin(filename,directory) {
   return relative===''||!path.isAbsolute(relative)&&relative!=='..'&&!relative.startsWith('..'+path.sep);
 }
 export class Settings {
-  constructor(values = {}, root = process.cwd()) { Object.assign(this, DEFAULTS, {admin_password_hash:'',session_secret:'',token_encryption_key:'',kite_api_key:'',kite_api_secret:'',kite_user_id:''}, values); this.root = root; if(typeof this.data_dir!=='string'||!this.data_dir.trim())throw new Error('Choose a data directory'); this.data_dir = path.resolve(root, this.data_dir); }
+  constructor(values = {}, root = process.cwd()) {
+    Object.assign(this, DEFAULTS, {admin_password_hash:'',session_secret:'',token_encryption_key:'',kite_api_key:'',kite_api_secret:'',kite_user_id:''}, values);
+    if(!Object.hasOwn(values,'research_workers')&&Object.hasOwn(values,'research_tuning_workers'))this.research_workers=values.research_tuning_workers;
+    for(const key of ['research_tuning','research_tuning_apply','research_tuning_trials','research_tuning_seconds','research_tuning_workers'])delete this[key];
+    this.root = root; if(typeof this.data_dir!=='string'||!this.data_dir.trim())throw new Error('Choose a data directory'); this.data_dir = path.resolve(root, this.data_dir);
+  }
   get configured() { return Boolean(this.kite_api_key && this.kite_api_secret && this.kite_user_id && !this.kite_api_key.startsWith('your-') && !this.kite_api_secret.startsWith('your-')); }
   validate() {
     if(pathWithin(this.data_dir,path.join(this.root,'public')))throw new Error('Data directory must be outside publicly served files');
@@ -100,9 +103,9 @@ export class Settings {
     if(this.opening_range_minutes%5!==0)throw new Error('Opening range must be a multiple of five minutes');
     for(const [key,min,max] of [['min_signal_score',0,100],['min_adx',0.1,60],['min_rsi',0,99],['max_rsi',1,100],['max_atr_extension',0.1,10],['min_market_breadth',0,1],['min_market_coverage',0,1],['max_account_stock_pct',0.01,1],['max_account_gross_pct',0.01,1],['max_account_risk_pct',0.001,1],['unprotected_stress_pct',0.001,1],['max_correlation',0.01,1],['max_correlated_exposure_pct',0.01,1],['research_fee_rate',0,0.02],['research_slippage_rate',0,0.02]])if(!Number.isFinite(this[key])||this[key]<min||this[key]>max)throw new Error(`${key} must be between ${min} and ${max}`);
     if(this.min_rsi>=this.max_rsi)throw new Error('Minimum RSI must be below maximum RSI');
-    for(const [key,min,max] of [['research_tuning_trials',3,100],['research_tuning_seconds',60,1800],['research_tuning_workers',0,100]])if(!Number.isInteger(this[key])||this[key]<min||this[key]>max)throw new Error(`${key} must be an integer between ${min} and ${max}`);
+    for(const [key,min,max] of [['research_workers',0,100]])if(!Number.isInteger(this[key])||this[key]<min||this[key]>max)throw new Error(`${key} must be an integer between ${min} and ${max}`);
     if(!['pinned','automatic'].includes(this.research_cpu_affinity))throw new Error('Research CPU scheduling must be pinned or automatic');
-    for(const [key,min,max] of [['candidate_wait_ms',0,10000],['min_market_samples',1,9000],['max_trades_per_day',1,100],['loss_streak_limit',1,20],['loss_cooldown_minutes',1,240],['research_symbols',1,150],['research_days',10,60]])if(!Number.isInteger(this[key])||this[key]<min||this[key]>max)throw new Error(`${key} must be an integer between ${min} and ${max}`);
+    for(const [key,min,max] of [['candidate_wait_ms',0,10000],['min_market_samples',1,9000],['max_trades_per_day',1,100],['loss_streak_limit',1,20],['loss_cooldown_minutes',1,240],['research_symbols',0,1000],['research_days',10,60]])if(!Number.isInteger(this[key])||this[key]<min||this[key]>max)throw new Error(`${key} must be an integer between ${min} and ${max}`);
     if (![this.entry_cutoff,this.exit_time].every(v=>/^\d\d:\d\d$/.test(v)&&Number(v.slice(3))<60) || !('09:15'<this.entry_cutoff&&this.entry_cutoff<this.exit_time&&this.exit_time<'15:30')) throw new Error('Require 09:15 < entry cutoff < close target < 15:30 IST');
     return this;
   }

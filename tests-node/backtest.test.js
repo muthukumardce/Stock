@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MAX_COMPARISON_RUNTIME_MS,MAX_RESEARCH_RUNTIME_MS,runBacktest, compareStrategies, parseDataset } from '../src/backtest.js';
+import { MAX_COMPARISON_RUNTIME_MS,MAX_RESEARCH_RUNTIME_MS,MAX_RESEARCH_BARS,runBacktest, compareStrategies, parseDataset } from '../src/backtest.js';
 import { ResearchService } from '../src/research.js';
 import { Candle, intraday_signal, swing_signal, daily_holding_exit } from '../src/strategy.js';
 
@@ -173,7 +173,7 @@ for (const [name, mutate] of [
 
 test('resource, cost and split configuration are bounded', () => {
   assert.throws(() => runBacktest(dataset(), { max_bars: 10 }), /bar limit/);
-  assert.throws(() => runBacktest(dataset(), { max_bars: 1000001 }));
+  assert.throws(() => runBacktest(dataset(), { max_bars: MAX_RESEARCH_BARS + 1 }));
   assert.throws(() => runBacktest(dataset(), { fee_rate: -1 }));
   assert.throws(() => runBacktest(dataset(), { initial_capital: NaN }));
   assert.throws(() => runBacktest(dataset(), { split_fractions: [.6, .3, .2] }));

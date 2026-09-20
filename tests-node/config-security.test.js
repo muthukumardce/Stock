@@ -34,6 +34,20 @@ test('research CPU scheduling defaults safely, persists either mode and rejects 
   const legacy=JSON.parse(before);delete legacy.research_cpu_affinity;fs.writeFileSync(manager.filename,JSON.stringify(legacy));
   assert.equal((await new ConfigManager(dir,{}).load()).research_cpu_affinity,'pinned');
 });
+
+test('old research settings preserve the stock count and worker limit without restoring refinement',async t=>{
+  const dir=temp(t),manager=new ConfigManager(dir,{ADMIN_PASSWORD_HASH:HASH});await manager.load();
+  const legacy=JSON.parse(fs.readFileSync(manager.filename,'utf8'));delete legacy.research_workers;
+  Object.assign(legacy,{research_symbols:150,research_tuning:true,research_tuning_apply:true,research_tuning_trials:50,research_tuning_workers:6,min_signal_score:63});
+  fs.writeFileSync(manager.filename,JSON.stringify(legacy));const before=fs.readFileSync(manager.filename,'utf8');
+  const restored=new ConfigManager(dir,{}),settings=await restored.load();
+  assert.equal(settings.research_symbols,150);assert.equal(settings.research_workers,6);assert.equal(settings.min_signal_score,63);
+  assert.equal(settings.research_tuning,undefined);assert.equal(settings.publicValues().research_tuning_apply,undefined);
+  assert.equal(fs.readFileSync(manager.filename,'utf8'),before,'Reading old settings must not rewrite the configuration');
+  for(const workers of [null,-1,101,2.5,'6'])assert.throws(()=>restored.save({research_workers:workers}),/research_workers/);
+  restored.save({research_symbols:0,research_workers:4});const next=await new ConfigManager(dir,{}).load();
+  assert.equal(next.research_symbols,0);assert.equal(next.research_workers,4);assert.equal(next.min_signal_score,63);assert.equal(next.research_tuning,undefined);
+});
 test('legacy auth keys and directory import once; invalid config save leaves stored settings intact',async t=>{
   const dir=temp(t),key='AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
   const manager=new ConfigManager(dir,{ADMIN_PASSWORD_HASH:HASH,SESSION_SECRET:'s'.repeat(40),TOKEN_ENCRYPTION_KEY:key,DATA_DIR:'journal',PUBLIC_URL:'https://old.example',PAPER_CAPITAL:'999999'});

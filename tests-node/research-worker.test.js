@@ -26,7 +26,7 @@ test('optimization worker receives bounded datasets and incumbent options withou
   const job=f.service.startOptimization([dataset()],options),worker=f.workers[0];
   assert.equal(job.type,'optimization');assert.equal(job.status,'running');assert.equal(job.trial_count,5);assert.equal(job.runtime_budget_ms,120000);
   assert.equal(f.timers[0].delay,130000);assert.equal(worker.options.workerData.type,'optimization');assert.equal(worker.options.workerData.datasets.length,1);
-  assert.deepEqual(worker.options.workerData.options,{...options,max_bars:1000000,parallelism:5,threads_per_process:4,analytics_worker_heap_mib:128,worker_heap_mib:512,
+  assert.deepEqual(worker.options.workerData.options,{...options,max_bars:5000000,parallelism:5,threads_per_process:4,analytics_worker_heap_mib:128,worker_heap_mib:512,
     memory_reserve_mib:job.capacity.memory_reserve_mib,startup_memory_mib:job.capacity.startup_memory_mib,max_initializing_processes:4});assert.equal(worker.options.resourceLimits.maxOldGenerationSizeMb,512);
   const result={status:'accepted',reason:'Validation improved.',parameters:{min_signal_score:65},trials:[]};
   worker.emit('message',{type:'complete',result});assert.equal(f.service.status().status,'running','Result must wait for worker retirement');
@@ -101,7 +101,7 @@ test('optimization validates all tuning limits before creating a worker',t=>{
     assert.throws(()=>f.service.startOptimization([dataset()],{tuning}));
   }
   for(const datasets of [null,[],[dataset(),dataset(),dataset()],[{}],[{symbols:{TEST:'bad'}}],
-    [{symbols:{TEST:Array(1000001)}}],[{symbols:{TEST:[]},sector_bars:Object.fromEntries(Array.from({length:101},(_,index)=>[index,[]]))}]]){
+    [{symbols:{TEST:Array(MAX_RESEARCH_BARS+1)}}],[{symbols:{TEST:[]},sector_bars:Object.fromEntries(Array.from({length:101},(_,index)=>[index,[]]))}]]){
     assert.throws(()=>f.service.startOptimization(datasets));
   }
   assert.equal(f.workers.length,0);assert.equal(f.service.status().status,'idle');
@@ -109,11 +109,11 @@ test('optimization validates all tuning limits before creating a worker',t=>{
 
 test('two-interval optimization validates context bars and shares the bounded worker and watchdog',async t=>{
   const f=fixture(t),one={interval:'5minute',symbols:{TEST:Array(999999)},benchmark_bars:Array(1)},two={interval:'day',symbols:{TEST:Array(1000000)}};
-  const job=f.service.startOptimization([one,two],{tuning:{max_candidates:100,max_runtime_ms:1800000}});
+  const job=f.service.startOptimization([one,two],{max_bars:1000000,tuning:{max_candidates:100,max_runtime_ms:1800000}});
   assert.equal(job.total_bars,1999999);assert.equal(f.timers[0].delay,1810000);assert.equal(f.workers[0].options.workerData.datasets.length,2);
   assert.equal(job.capacity.worker_heap_mib,4096);assert.equal(f.workers[0].options.resourceLimits.maxOldGenerationSizeMb,4096);
   assert.equal(f.workers[0].options.workerData.options.worker_heap_mib,4096);
-  await f.service.cancel();one.benchmark_bars.push({});assert.throws(()=>f.service.startOptimization([one,two]),/1000000 total/);
+  await f.service.cancel();one.benchmark_bars.push({});assert.throws(()=>f.service.startOptimization([one,two],{max_bars:1000000}),/1000000 total/);
 });
 
 test('comparison worker compatibility retains its scaled per-variant budget and isolated completion',async t=>{
@@ -186,7 +186,7 @@ test('comparison cancellation signals every child and waits for coordinator reti
 
 test('comparison budgets count symbol and context candles, scale to the supported large sample, and stay finite',async t=>{
   const f=fixture(t);
-  assert.equal(COMPARISON_RUNTIME_POLICY,'bars-v3-multicore');assert.equal(MAX_COMPARISON_RUNTIME_MS,1800000);
+  assert.equal(COMPARISON_RUNTIME_POLICY,'bars-v4-total-market');assert.equal(MAX_COMPARISON_RUNTIME_MS,1800000);
   assert.equal(MAX_RESEARCH_RUNTIME_MS,600000,'Optimizer candidate cap stays independent');
   const cases=[
     {symbols:75,benchmark:0,sector:0,budget:60000},
@@ -231,7 +231,7 @@ test('a real worker transports typed simulation timeout details without waiting 
 
 test('timeout diagnostics reject inconsistent or unbounded metadata and preserve legacy worker recognition',async t=>{
   const f=fixture(t);
-  for(const patch of [{processed_bars:76},{processed_bars:-1},{processed_bars:.5},{total_bars:2000001},{total_bars:'75'}]){
+  for(const patch of [{processed_bars:76},{processed_bars:-1},{processed_bars:.5},{total_bars:MAX_RESEARCH_BARS*2+1},{total_bars:'75'}]){
     f.service.start(dataset());const worker=f.workers.at(-1);
     worker.emit('message',{type:'progress',phase:'enhanced',processed_bars:25,total_bars:75});
     worker.emit('message',{type:'failed',error:'Backtest runtime limit exceeded; use a smaller dataset',error_details:{phase:'arbitrary',processed_bars:50,total_bars:75,...patch,elapsed_ms:Infinity}});
@@ -290,7 +290,7 @@ test('automatic tuning capacity uses physical cores at full CPU eligibility with
     assert.equal(job.capacity.allocated_cpu_threads,entry.expected*(job.capacity.threads_per_process+1)+1);
     assert.equal(f.workers[0].options.workerData.options.parallelism,entry.expected);await f.service.cancel();
   }
-  const f=fixture(t);for(const options of [{parallelism:-1},{parallelism:101},{parallelism:1.5},{reserve_cpus:-1},{live_workers:Infinity},{max_bars:1000001},{max_bars:0}])assert.throws(()=>f.service.startOptimization([dataset()],options));
+  const f=fixture(t);for(const options of [{parallelism:-1},{parallelism:101},{parallelism:1.5},{reserve_cpus:-1},{live_workers:Infinity},{max_bars:5000001},{max_bars:0}])assert.throws(()=>f.service.startOptimization([dataset()],options));
   assert.equal(f.workers.length,0);
 });
 
@@ -302,7 +302,7 @@ test('live tuning progress retains bounded parameter-set results and worker acti
   assert.equal(state.trial,100);assert.equal(state.trial_count,100);assert.equal(state.total_bars,2000000);assert.equal(state.parallelism.active_sets[0].parameter_set_id,'P100');assert.equal(state.parallelism.completed_tasks,100);
   assert.deepEqual(state.trials[0].parameters,{min_adx:23});assert.equal(state.parallelism.worker_limit,3);assert.equal(state.parallelism.active_workers,3);assert.equal(state.parallelism.active_sets.length,3);
   assert.doesNotMatch(JSON.stringify(state),/hidden|untrusted/);
-  f.workers[0].emit('message',{type:'progress',trial:101,trial_count:101,total_bars:2000001,parallelism:{active_sets:[{parameter_set_id:'P101'}]}});
+  f.workers[0].emit('message',{type:'progress',trial:101,trial_count:101,total_bars:MAX_RESEARCH_BARS*2+1,parallelism:{active_sets:[{parameter_set_id:'P101'}]}});
   assert.equal(f.service.status().trial,100);assert.equal(f.service.status().trial_count,100);assert.equal(f.service.status().total_bars,2000000);assert.equal(f.service.status().parallelism.active_sets[0].parameter_set_id,null);
 });
 
@@ -323,7 +323,7 @@ test('invalid active progress and inconsistent candle or interval counts are omi
   const valid={parameter_set_id:'P2',phase:'tuning_train',interval:'5minute',progress:.5,processed_bars:25,total_bars:50,completed_intervals:0,total_intervals:1};
   const send=patch=>{worker.emit('message',{type:'progress',parallelism:{active_sets:[{...valid,...patch,private_field:'not-forwarded'}]}});return f.service.status().parallelism.active_sets[0];};
   for(const progress of [-.1,1.1,NaN,Infinity,'0.5'])assert.equal(Object.hasOwn(send({progress}),'progress'),false);
-  for(const patch of [{processed_bars:-1},{processed_bars:25.5},{total_bars:1000001},{processed_bars:51},{total_bars:'50'}]){
+  for(const patch of [{processed_bars:-1},{processed_bars:25.5},{total_bars:MAX_RESEARCH_BARS+1},{processed_bars:51},{total_bars:'50'}]){
     const value=send(patch);assert.equal(Object.hasOwn(value,'processed_bars'),false);assert.equal(Object.hasOwn(value,'total_bars'),false);
   }
   for(const patch of [{completed_intervals:2},{total_intervals:0},{total_intervals:3},{completed_intervals:.5}]){
@@ -368,10 +368,21 @@ test('150-stock research shares CPU and scaled memory between candidate processe
   const comparison=f.service.start({interval:'5minute',symbols},{max_bars:1000000});assert.equal(comparison.total_bars,600000);assert.equal(f.workers[1].options.resourceLimits.maxOldGenerationSizeMb,1536);
 });
 
-test('backtest supports an explicit one-million-bar bound without running a huge simulation',()=>{
-  assert.equal(MAX_RESEARCH_BARS,1000000);
-  assert.doesNotThrow(()=>runBacktest(dataset(),{max_bars:1000000}));
-  assert.throws(()=>runBacktest(dataset(),{max_bars:1000001}),/Maximum bars/);
+test('backtest supports an explicit five-million-bar bound without running a huge simulation',()=>{
+  assert.equal(MAX_RESEARCH_BARS,5000000);
+  assert.doesNotThrow(()=>runBacktest(dataset(),{max_bars:MAX_RESEARCH_BARS}));
+  assert.throws(()=>runBacktest(dataset(),{max_bars:5000001}),/Maximum bars/);
+});
+
+test('a 750-stock comparison admits three million candles with bounded scaled memory and cancellation',async t=>{
+  const f=fixture(t,{capacityDetector:()=>({available_cpus:32,source:'test'}),freeMemory:()=>64*2**30});
+  const symbols=Object.fromEntries(Array.from({length:750},(_,i)=>['STOCK'+i,Array(4000)]));
+  assert.throws(()=>f.service.start({interval:'5minute',symbols}),/250000 total/);
+  const job=f.service.start({interval:'5minute',symbols},{max_bars:MAX_RESEARCH_BARS,parallelism:4});
+  assert.equal(job.total_bars,3000000);assert.equal(job.runtime_budget_ms,MAX_COMPARISON_RUNTIME_MS);
+  assert.equal(f.workers[0].options.resourceLimits.maxOldGenerationSizeMb,6144);
+  assert.equal(f.workers[0].options.workerData.options.parallelism,4);
+  await f.service.cancel();assert.equal(f.service.status().status,'cancelled');assert.equal(f.terminated,1);
 });
 
 test('cooperative cancellation signals the coordinator and waits for nested retirement before unblocking',async t=>{

@@ -4,7 +4,9 @@ import { parseTime, dateIST, timeIST } from './util.js';
 import {evaluateComparisonTask} from './backtest-analytics.js';
 
 const MINUTE = 60000, DAY = 86400000;
-export const MAX_RESEARCH_BARS = 1000000;
+// Full Total Market membership across up to 60 calendar days of five-minute
+// bars, including benchmark/sector context. Offline callers retain 250k defaults.
+export const MAX_RESEARCH_BARS = 5000000;
 const LIMIT_BARS = MAX_RESEARCH_BARS, LIMIT_SYMBOLS = 5000;
 export const MAX_RESEARCH_RUNTIME_MS = 600000;
 // Comparison variants can cover the full supported research sample. Optimizer

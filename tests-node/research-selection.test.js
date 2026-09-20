@@ -1,9 +1,38 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {selectResearchSymbols} from '../src/research-selection.js';
+import {selectResearchSymbols,selectIndexResearchSymbols} from '../src/research-selection.js';
 
 const universe=symbols=>Object.fromEntries(symbols.map((tradingsymbol,index)=>[index+1,{tradingsymbol,entry_eligible:true}]));
 const fresh=industry=>({classification_status:'fresh',industry});
+
+test('Nifty Total Market offers a reproducible industry sample and all 750 members without outside replacements',()=>{
+  const records=Array.from({length:750},(_,i)=>({symbol:`STOCK${String(i).padStart(3,'0')}`,industry:`Industry ${i%15}`}));
+  const index={status:'fresh',records,source:'official fixture',observed_at:'2026-09-17T10:00:00Z'};
+  const input=universe([...records.map(row=>row.symbol),'OUTSIDE']);
+  for(const row of Object.values(input))Object.defineProperty(row,'last_price',{get(){throw new Error('Price must not select the sample');}});
+  const sample=selectIndexResearchSymbols(input,60,index);
+  assert.equal(sample.selected.length,60);assert.equal(sample.diversification.industries.length,15);
+  assert.ok(sample.diversification.industries.every(group=>group.symbols.length===4));
+  assert.deepEqual(selectIndexResearchSymbols(Object.fromEntries(Object.entries(input).reverse()),60,{...index,records:[...records].reverse()}),sample);
+  const all=selectIndexResearchSymbols(input,0,index);
+  assert.equal(all.scope.mode,'all');assert.equal(all.scope.constituent_count,750);assert.equal(all.scope.eligible_count,750);assert.equal(all.scope.selected_count,750);
+  assert.deepEqual(all.selected.map(([,row])=>row.tradingsymbol),records.map(row=>row.symbol));
+  assert.match(all.diversification.caveat,/survivorship bias/);
+  assert.equal(selectIndexResearchSymbols(input,1000,index).selected.length,750);
+  delete input[1];input[2].entry_eligible=false;
+  const partial=selectIndexResearchSymbols(input,0,index);
+  assert.equal(partial.selected.length,748);
+  assert.deepEqual(partial.scope.excluded_symbols,[{symbol:'STOCK000',reason:'broker_instrument_unavailable'},{symbol:'STOCK001',reason:'not_entry_eligible'}]);
+  assert.ok(!partial.selected.some(([,row])=>row.tradingsymbol==='OUTSIDE'));
+});
+
+test('missing or stale index membership blocks research without falling back to NSE stocks',()=>{
+  for(const index of [undefined,{status:'unavailable'},{status:'fresh',records:[]},{status:'stale',records:[{symbol:'A',industry:'Banks'}]}]){
+    const result=selectIndexResearchSymbols(universe(['A','B']),20,index);
+    assert.equal(result.selected.length,0);assert.match(result.blocked_reason,/fresh Nifty Total Market/);
+  }
+  for(const limit of [-1,1.5,1001,'20',NaN])assert.throws(()=>selectIndexResearchSymbols({},limit),/stock count/);
+});
 
 test('research sampling rotates across verified industries before taking more names from a group',()=>{
   const symbols=['BANKA','BANKB','BANKC','BANKD','ITA','ITB','ITC','ITD','FARMA','FARMB','FARMC','FARMD'];

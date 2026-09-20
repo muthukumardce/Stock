@@ -11,7 +11,7 @@ import {ResearchProcessLifecycle} from './research-process-lifecycle.js';
 
 const TUNABLE_KEYS=['min_signal_score','min_adx','min_setup_volume','max_atr_extension'];
 const MAX_CANDIDATES=100,MAX_TOTAL_BARS=MAX_RESEARCH_BARS*2;
-export const COMPARISON_RUNTIME_POLICY='bars-v3-multicore';
+export const COMPARISON_RUNTIME_POLICY='bars-v4-total-market';
 const plain=value=>value&&typeof value==='object'&&!Array.isArray(value);
 const numericParameters=value=>plain(value)?Object.fromEntries(TUNABLE_KEYS.filter(key=>Number.isFinite(value[key])).map(key=>[key,value[key]])):{};
 const timeoutPhases=['validating','baseline','enhanced','tuning_train','tuning_validation','tuning_test'];
@@ -97,7 +97,7 @@ function tuningOptions(value={}) {
 // Each coordinator/trial retains its input copy plus normalized candles and
 // chronological events. Scale the V8 heap allowance by total dataset size;
 // reserve another 256 MiB per worker for young generation and native overhead.
-const workerHeapMiB=total=>Math.min(4096,Math.max(512,Math.ceil(total/250000)*512));
+const workerHeapMiB=total=>Math.min(12288,Math.max(512,Math.ceil(total/250000)*512));
 function barLimit(value=250000){
   if(!Number.isInteger(value)||value<1||value>MAX_RESEARCH_BARS)throw new RangeError(`Maximum bars must be between 1 and ${MAX_RESEARCH_BARS}`);
   return value;

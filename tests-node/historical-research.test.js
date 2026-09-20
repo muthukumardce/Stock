@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { HistoricalResearch } from '../src/historical-research.js';
 import { ResearchService } from '../src/research.js';
 import { Store } from '../src/storage.js';
+import { MAX_RESEARCH_BARS } from '../src/backtest.js';
 import { STRATEGY_VERSION } from '../src/strategy.js';
 
 const NOW = new Date('2026-09-17T11:30:00+05:30');
@@ -39,6 +40,7 @@ function context(t, { worker = new FakeWorker(), settings: changed = {}, broker:
   const engine = { connected: true, broker, capital: 120000,
     universe: { 99: { tradingsymbol: 'TCS' }, 12: { tradingsymbol: 'INFY' }, 1: { tradingsymbol: 'ABC' } },
     strategy_settings: () => ({ intraday_enabled: true, swing_enabled: false }), _strategy_options: () => ({ enhanced_signals: true, min_signal_score: 60 }) };
+  engine.market_context={researchConstituents:()=>({name:'NIFTY TOTAL MARKET',status:'fresh',observed_at:NOW.toISOString(),source:'fixture',records:Object.values(engine.universe).filter(row=>row.entry_eligible!==false).sort((a,b)=>a.tradingsymbol.localeCompare(b.tradingsymbol)).slice(0,settings.research_symbols||1000).map(row=>({symbol:row.tradingsymbol,industry:'Fixture industry'}))})};
   const research = new HistoricalResearch(engine, store, settings, { worker, now: () => NOW, delay: 0, ...options });
   t.after(async () => { await research.close(); store.close(); rmSync(dir, { recursive: true, force: true }); });
   return { research, worker, engine, store, settings, calls };
@@ -54,7 +56,7 @@ class FakeClock {
   async advance(ms){this.time+=ms;for(const timer of [...this.timers].filter(timer=>timer.at<=this.time)){this.timers.delete(timer);await timer.fn();}}
 }
 
-test('historical collection bounds an explicitly unclassified fallback and cannot submit broker orders', async t => {
+test('historical collection uses verified index members and cannot submit broker orders', async t => {
   const { research, worker, calls, store } = context(t);
   research.start(); await research.task;
   assert.deepEqual(calls.map(c => c[0]), ['historical_data', 'historical_data']);
@@ -65,9 +67,43 @@ test('historical collection bounds an explicitly unclassified fallback and canno
   assert.deepEqual(Object.keys(worker.inputs[0].dataset.symbols), ['ABC', 'INFY']);
   assert.equal(worker.inputs[0].options.initial_capital, 120000);
   const state = research.status(); assert.equal(state.status, 'complete'); assert.equal(state.progress, 100);
-  assert.equal(state.report.metadata.diversification.status, 'unclassified'); assert.match(state.report.metadata.live_controls, /not reconstructed/);
+  assert.equal(state.report.metadata.diversification.status, 'limited'); assert.match(state.report.metadata.live_controls, /not reconstructed/);
   assert.deepEqual(store.get('research_report'), state.report);
   assert.equal(Object.hasOwn(worker.inputs[0], 'broker'), false);
+});
+
+test('retired refinement cannot apply queued settings or block baseline/enhanced research after restart',async t=>{
+  const {research,engine,store,settings}=context(t,{settings:{research_tuning:true,research_tuning_apply:true,min_signal_score:63,research_symbols:1}});
+  await research.close();
+  store.set('research_pending_tuning',{parameters:{min_signal_score:90}});
+  store.set('research_report',{...report(),optimization:{status:'accepted',parameters:{min_signal_score:90}},alternate_reports:{day:{...report(),optimization:{status:'accepted'}}}});
+  store.set('research_failure',{error:{code:'worker_timeout',phase:'tuning_train',message:'Retired search failed'}});
+  store.set('research_access_block',{signature:research._accessSignature(),error:{code:'worker_timeout',phase:'tuning'}});
+  const worker=new FakeWorker();worker.startOptimization=()=>assert.fail('Refinement must never run');
+  const resumed=new HistoricalResearch(engine,store,settings,{worker,now:()=>NOW,delay:0});t.after(()=>resumed.close());
+  resumed.applyParameters=()=>assert.fail('Research must never apply settings');
+  assert.equal(store.get('research_pending_tuning'),null);assert.equal(resumed.status().error,null);
+  assert.equal(resumed.status().report.optimization,undefined);assert.equal(resumed.status().report.alternate_reports.day.optimization,undefined);
+  assert.equal(typeof resumed.selectParameterSet,'undefined');
+  await resumed.maybeStart();await resumed.task;
+  assert.equal(resumed.status().status,'complete');assert.equal(worker.inputs.length,1);
+  assert.equal(resumed.status().report.optimization,undefined);assert.equal(settings.min_signal_score,63);
+});
+
+test('all-members collection uses the same membership snapshot for both intervals and stops when membership is stale',async t=>{
+  const {research,engine,worker,calls}=context(t,{settings:{research_symbols:0}});
+  engine.strategy_settings=()=>({intraday_enabled:true,swing_enabled:true});
+  const index={status:'fresh',records:[{symbol:'ABC',industry:'Banks'},{symbol:'INFY',industry:'IT'},{symbol:'MISSING',industry:'Energy'}],source:'official fixture',observed_at:NOW.toISOString()};
+  engine.market_context={researchConstituents:()=>index};
+  const start=worker.start.bind(worker);worker.start=(...args)=>{const result=start(...args);index.records=[{symbol:'TCS',industry:'IT'}];return result;};
+  research.start();await research.task;
+  assert.equal(worker.inputs.length,2);
+  for(const input of worker.inputs){assert.deepEqual(Object.keys(input.dataset.symbols),['ABC','INFY']);assert.equal(input.options.max_bars,MAX_RESEARCH_BARS);}
+  const result=research.status().report;
+  assert.equal(result.metadata.universe.constituent_count,3);assert.equal(result.metadata.universe.selected_count,2);
+  assert.deepEqual(result.alternate_reports.day.metadata.universe,result.metadata.universe);
+  assert.deepEqual(result.metadata.universe.excluded_symbols,[{symbol:'MISSING',reason:'broker_instrument_unavailable'}]);
+  const count=calls.length;index.status='stale';assert.throws(()=>research.start(),/fresh Nifty Total Market/);assert.equal(calls.length,count);
 });
 
 test('background research summary identifies the download in flight and excludes the full report',async t=>{
@@ -217,7 +253,7 @@ test('both enabled scopes run sequentially and persist paired reports only after
 test('historical relative context uses verified index identity, matching range and completed candles',async t=>{
   const calls=[],broker={async call(...args){calls.push(args);return args[0]==='quote'?{'NSE:NIFTY 50':{instrument_token:500},'NSE:NIFTY IT':{instrument_token:501}}:[...candles(),...candles('2026-09-17')];}};
   const {research,engine,worker}=context(t,{broker,settings:{research_symbols:1}});
-  engine.market_context={forSymbol:()=>({index_membership:[{index:'NIFTY IT',status:'fresh'}]})};research.start();await research.task;
+  engine.market_context={...engine.market_context,forSymbol:()=>({index_membership:[{index:'NIFTY IT',status:'fresh'}]})};research.start();await research.task;
   const data=worker.inputs[0].dataset;assert.equal(data.benchmark_bars.length,75);assert.equal(data.sector_bars['NIFTY IT'].length,75);assert.equal(data.symbol_sectors[research._selection()[0][1].tradingsymbol],'NIFTY IT');
   assert.ok(data.benchmark_bars.every(r=>r.time.startsWith('2026-09-16')));assert.deepEqual(calls.map(c=>c[0]),['historical_data','quote','historical_data','historical_data']);
   assert.equal(research.status().report.metadata.context.benchmark,'NIFTY 50');
@@ -226,7 +262,7 @@ test('historical relative context uses verified index identity, matching range a
 test('research index caches are bound to verified index names rather than recycled numeric tokens',async t=>{
   const calls=[],broker={async call(method,token){calls.push([method,token]);return method==='quote'?{'NSE:NIFTY 50':{instrument_token:500},'NSE:NIFTY IT':{instrument_token:501}}:candles();}};
   const {research,engine,worker,store}=context(t,{broker,settings:{research_symbols:1}});
-  engine.market_context={forSymbol:()=>({index_membership:[{index:'NIFTY IT',status:'fresh'}]})};
+  engine.market_context={...engine.market_context,forSymbol:()=>({index_membership:[{index:'NIFTY IT',status:'fresh'}]})};
   store.set('research_index:500:5minute',{date:'2026-09-17',from:'2026-09-07T00:00:00+05:30',symbol:'NIFTY BANK',rows:candles()});
   store.set('research_index:501:5minute',{date:'2026-09-17',from:'2026-09-07T00:00:00+05:30',rows:candles()});
   research.start();await research.task;
@@ -238,7 +274,7 @@ test('research index caches are bound to verified index names rather than recycl
 
 test('missing benchmark history is visible and cannot fabricate relative-strength context',async t=>{
   const broker={async call(method){return method==='quote'?{}:candles();}};
-  const {research,engine,worker}=context(t,{broker,settings:{research_symbols:1}});engine.market_context={forSymbol:()=>({index_membership:[]})};
+  const {research,engine,worker}=context(t,{broker,settings:{research_symbols:1}});engine.market_context={...engine.market_context,forSymbol:()=>({index_membership:[]})};
   research.start();await research.task;assert.deepEqual(worker.inputs[0].dataset.benchmark_bars,[]);assert.deepEqual(research.status().report.metadata.context.unavailable,['NIFTY 50']);
 });
 
@@ -251,7 +287,7 @@ test('empty and malformed index responses recover while valid symbol history rem
     return candles();
   }};
   const {research,engine,worker,store}=context(t,{broker,settings:{research_symbols:1}});
-  engine.market_context={forSymbol:()=>({index_membership:[{index:'NIFTY IT',status:'fresh'}]})};
+  engine.market_context={...engine.market_context,forSymbol:()=>({index_membership:[{index:'NIFTY IT',status:'fresh'}]})};
   research.start();await research.task;
   assert.equal(research.status().status,'complete');assert.deepEqual(research.status().report.metadata.context.unavailable,['NIFTY 50','NIFTY IT']);
   assert.equal(store.get('research_index:500:5minute'),null);assert.equal(store.get('research_index:501:5minute'),null);
@@ -274,7 +310,7 @@ test('real worker accepts unavailable sector history as absent context rather th
     return candles();
   }};
   const {research,engine}=context(t,{broker,worker:new ResearchService(),settings:{research_symbols:1}});
-  engine.market_context={forSymbol:()=>({index_membership:[{index:'NIFTY IT',status:'fresh'}]})};
+  engine.market_context={...engine.market_context,forSymbol:()=>({index_membership:[{index:'NIFTY IT',status:'fresh'}]})};
   research.start();await research.task;
   assert.equal(research.status().status,'complete');
   assert.deepEqual(research.status().report.metadata.context.unavailable,['NIFTY IT']);
@@ -345,7 +381,7 @@ test('worker progress is mapped to dashboard percent and final result retained',
 });
 
 test('comparison exposes separate CPU telemetry and passes automatic worker reservations',async t=>{
-  const worker=new FakeWorker(false),{research,engine,settings}=context(t,{worker,settings:{research_symbols:1,research_tuning_workers:6,analytics_reserve_cpus:7}});
+  const worker=new FakeWorker(false),{research,engine,settings}=context(t,{worker,settings:{research_symbols:1,research_workers:6,analytics_reserve_cpus:7}});
   engine.analytics={snapshot:()=>({active_jobs:2})};
   research.start();await until(()=>worker.inputs.length===1);
   assert.equal(worker.inputs[0].options.parallelism,6);assert.equal(worker.inputs[0].options.reserve_cpus,7);assert.equal(worker.inputs[0].options.live_workers,2);
@@ -355,9 +391,9 @@ test('comparison exposes separate CPU telemetry and passes automatic worker rese
   assert.deepEqual(research.summary().comparison,{phase:'enhanced',interval:'5minute',symbol_count:1,processed_bars:45,total_bars:75,capacity,parallelism});
   assert.equal(research.summary().progress,90);assert.equal(research.summary().progress_detail.stage_progress,60);
   assert.equal(research.summary().progress_detail.completed,45);assert.equal(research.summary().progress_detail.total,75);assert.equal(research.summary().progress_detail.unit,'candles');
-  assert.equal(research.summary().tuning,null,'Comparison workers are not parameter candidates');
+  assert.equal(research.summary().tuning,undefined,'Comparison workers are not parameter candidates');
   worker.job={status:'complete',progress:1,result:report()};await research.task;
-  assert.equal(research.summary().comparison,null);assert.equal(research.summary().progress_detail,null);assert.equal(settings.research_tuning_workers,6);
+  assert.equal(research.summary().comparison,null);assert.equal(research.summary().progress_detail,null);assert.equal(settings.research_workers,6);
 });
 
 test('overall progress never resets between intraday and swing comparisons and titles follow real simulation work',async t=>{
@@ -381,7 +417,7 @@ test('benchmark lookup and index downloads have distinct current-task titles',as
   const identities=deferred(),history=deferred();
   const broker={call(method,token){return method==='quote'?identities.promise:token===500?history.promise:Promise.resolve(candles());}};
   const {research,engine}=context(t,{broker,settings:{research_symbols:1}});
-  engine.market_context={forSymbol:()=>({index_membership:[]})};
+  engine.market_context={...engine.market_context,forSymbol:()=>({index_membership:[]})};
   research.start();await until(()=>research.summary().current_task?.title==='Looking up benchmark and sector indexes');
   assert.equal(research.summary().progress,45);
   identities.resolve({'NSE:NIFTY 50':{instrument_token:500}});
@@ -430,7 +466,7 @@ test('late index history cannot populate a cache after the universe refreshes',a
   const pending=deferred();let indexRequested=false;
   const broker={async call(method,token){if(method==='quote')return {'NSE:NIFTY 50':{instrument_token:500}};if(token===500){indexRequested=true;return pending.promise;}return candles();}};
   const {research,engine,worker,store}=context(t,{broker,settings:{research_symbols:1}});
-  engine.market_context={forSymbol:()=>({index_membership:[]})};research.start();await until(()=>indexRequested);
+  engine.market_context={...engine.market_context,forSymbol:()=>({index_membership:[]})};research.start();await until(()=>indexRequested);
   engine._universe_generation=1;pending.resolve(candles());await research.task;
   assert.equal(research.status().status,'cancelled');assert.equal(worker.inputs.length,0);assert.equal(store.get('research_index:500:5minute'),null);
 });
@@ -490,6 +526,7 @@ test('real worker consumes fixture candles from read-only collector and persists
     strategy_settings: () => ({ intraday_enabled: true }), _strategy_options: () => ({ enhanced_signals: true }) };
   const settings = { auto_research: true, research_symbols: 1, research_days: 10, research_fee_rate: .001, research_slippage_rate: .0005,
     risk_per_trade_pct: .0025, max_position_pct: .1, max_positions: 5, entry_cutoff: '14:45', exit_time: '15:10' };
+  engine.market_context={researchConstituents:()=>({name:'NIFTY TOTAL MARKET',status:'fresh',observed_at:NOW.toISOString(),source:'fixture',records:Object.values(engine.universe).filter(row=>row.entry_eligible!==false).sort((a,b)=>a.tradingsymbol.localeCompare(b.tradingsymbol)).slice(0,settings.research_symbols||1000).map(row=>({symbol:row.tradingsymbol,industry:'Fixture industry'}))})};
   const research = new HistoricalResearch(engine, store, settings, { now: () => NOW, delay: 0 });
   t.after(async () => { await research.close(); store.close(); rmSync(dir, { recursive: true, force: true }); });
   research.start(); await research.task;
@@ -506,7 +543,7 @@ test('automatic scheduler observes connected funds, eligible instruments and nex
   await research.startAutomatic();await research.startAutomatic();assert.equal(clock.timers.size,1);
   assert.match(research.status().automation.reason,/Connect Zerodha/);assert.equal(calls.length,0);
   engine.connected=true;await clock.advance(1000);assert.match(research.status().automation.reason,/balance/);
-  engine.capital=50000;await clock.advance(1000);assert.match(research.status().automation.reason,/instruments/);
+  engine.capital=50000;await clock.advance(1000);assert.match(research.status().automation.reason,/constituent list/);
   engine.universe[1].entry_eligible=true;await clock.advance(1000);await research.task;
   assert.equal(worker.inputs.length,1);assert.equal(worker.inputs[0].options.initial_capital,50000);
   const signature=research.signature();engine.strategy_settings=()=>({intraday_enabled:true,swing_enabled:false,intraday_capital:engine.capital,swing_capital:0});
@@ -642,7 +679,7 @@ test('unusable histories preserve coverage taxonomy with a bounded issues collec
 
 for(const phase of ['context_identity','context_history'])test(`HTTP 429 during ${phase} stops index collection and schedules a retry`,async t=>{
   const calls=[];const broker={async call(method,token){calls.push([method,token]);if(method==='quote'){if(phase==='context_identity')throw Object.assign(new Error('throttled'),{http_status:429,retry_after_seconds:3});return {'NSE:NIFTY 50':{instrument_token:500}};}if(token===500)throw Object.assign(new Error('throttled'),{http_status:429,retry_after_seconds:3});return candles();}};
-  const {research,engine,worker}=context(t,{broker,settings:{research_symbols:1}});engine.market_context={forSymbol:()=>({index_membership:[]})};
+  const {research,engine,worker}=context(t,{broker,settings:{research_symbols:1}});engine.market_context={...engine.market_context,forSymbol:()=>({index_membership:[]})};
   research.start();await research.task;const state=research.status();
   assert.equal(state.error.code,'rate_limit');assert.equal(state.error.phase,phase);assert.equal(state.error.symbol,phase==='context_history'?'NIFTY 50':null);assert.equal(worker.inputs.length,0);
   assert.equal(calls.length,phase==='context_history'?3:2);
@@ -694,7 +731,7 @@ test('revised comparison budget invalidates only obsolete comparison-timeout blo
   assert.equal(worker.inputs.length,1);assert.equal(research.status().status,'complete');assert.equal(store.get('research_access_block'),null);
   // Authentication and the separate parameter-search limit still need the same
   // corrective action; a comparison-budget revision cannot silently clear them.
-  for(const error of [{code:'authentication',phase:'symbol_history'},{code:'permission',phase:'context_history'},{code:'worker_timeout',phase:'tuning'}]){
+  for(const error of [{code:'authentication',phase:'symbol_history'},{code:'permission',phase:'context_history'}]){
     store.delete('research_auto_signature');store.set('research_access_block',{signature,error:{...error,message:'Existing access or tuning block.'}});
     await research.maybeStart();assert.equal(worker.inputs.length,1);assert.equal(research.status().automation.status,'action_required');
   }
@@ -723,276 +760,4 @@ test('real research worker retires between intraday and swing comparisons before
   engine.strategy_settings=()=>({intraday_enabled:true,swing_enabled:true});
   research.start();await research.task;
   assert.equal(research.status().status,'complete');assert.equal(research.status().report.metadata.interval,'5minute');assert.equal(research.status().report.alternate_reports.day.metadata.interval,'day');assert.equal(worker.worker,null);
-});
-
-function tuningContext(t,{result,apply}={}){
-  const rows=[];
-  for(let offset=44;offset>=0;offset--){const date=new Date(Date.parse('2026-09-16T12:00:00Z')-offset*86400000);if(![0,6].includes(date.getUTCDay()))rows.push(...candles(date.toISOString().slice(0,10)));}
-  const worker=new FakeWorker();worker.optimizations=[];
-  worker.startOptimization=function(datasets,options){this.optimizations.push(structuredClone({datasets,options}));this.job={status:'complete',progress:1,result:result??{status:'no_improvement',reason:'No candidate passed validation.',parameters:null,trials:[]}};};
-  const f=context(t,{worker,broker:{call:async()=>rows},settings:{research_days:45,research_tuning:true,research_tuning_apply:true,research_tuning_trials:9,research_tuning_seconds:600,min_signal_score:60,min_adx:18,min_setup_volume:1.2,max_atr_extension:2.5}});
-  f.engine._strategy_options=()=>({enhanced_signals:true,min_signal_score:f.settings.min_signal_score,min_adx:f.settings.min_adx,min_setup_volume:f.settings.min_setup_volume,max_atr_extension:f.settings.max_atr_extension});
-  f.applications=[];
-  f.research.applyParameters=async request=>{f.applications.push(request.parameters);if(apply)return apply(request,f);assert.equal(request.isCurrent(),true);Object.assign(f.settings,request.parameters);return {status:'applied',reason:'Validated test fixture applied.',changes:[{key:'min_signal_score',before:60,after:65}]};};
-  return f;
-}
-const acceptedTuning=()=>({status:'accepted',reason:'Final test passed.',parameters:{min_signal_score:65},selected_id:'candidate_1',trials:[]});
-
-test('stage progress describes concurrent parameter work separately from weighted overall completion',async t=>{
-  const f=tuningContext(t),phase='tuning_train';
-  f.worker.startOptimization=function(){this.job={status:'running',phase,progress:.3,parallelism:{total_tasks:2,completed_tasks:0,active_sets:[{parameter_set_id:'P1',phase,progress:.5},{parameter_set_id:'P2',phase,progress:.5}]}};};
-  f.research.start();await until(()=>f.research.state.tuning?.phase===phase);
-  let state=f.research.summary();assert.equal(state.progress,58);assert.equal(state.progress_detail.stage_progress,50);assert.equal(state.progress_detail.completed,0);assert.equal(state.progress_detail.total,2);
-  f.worker.job={status:'running',phase,progress:.45,parallelism:{total_tasks:2,completed_tasks:1,active_sets:[{parameter_set_id:'P2',phase,progress:.5}]}};
-  await until(()=>f.research.state.progress===67);state=f.research.summary();assert.equal(state.progress_detail.stage_progress,75);assert.equal(state.progress_detail.completed,1);
-  f.worker.job={status:'running',phase:'tuning_validation',progress:.625,parallelism:{total_tasks:1,completed_tasks:0,active_sets:[{parameter_set_id:'P2',phase:'tuning_validation',progress:.1}]}};
-  await until(()=>f.research.state.tuning?.phase==='tuning_validation');state=f.research.summary();assert.equal(state.progress,77.5);assert.equal(state.progress_detail.stage_progress,10);assert.match(state.progress_detail.stage,/Validating/);
-  f.worker.job={status:'complete',progress:1,result:{status:'no_improvement',reason:'No validation improvement.',parameters:null,trials:[]}};
-  await f.research.task;assert.equal(f.research.summary().progress_detail,null);assert.equal(f.research.summary().progress,100);
-});
-
-test('one overall bar includes real candidate fractions without restarting at parameter-search phases',async t=>{
-  const f=tuningContext(t),samples=[],update=f.research._progress.bind(f.research);
-  f.research._progress=value=>{update(value);samples.push(f.research.state.progress);};
-  f.worker.startOptimization=function(datasets,options){this.optimizations.push({datasets,options});this.job={status:'running',phase:'tuning_train',progress:0,message:'Training:0 of 9 sets finished.',parallelism:{active_sets:[{parameter_set_id:'P1',progress:0}]}};};
-  f.research.start();await until(()=>f.research.state.tuning?.phase==='tuning_train');
-  assert.equal(f.research.status().progress,40);assert.equal(f.research.summary().current_task.title,'Training parameter sets');
-  f.worker.job={...f.worker.job,progress:.3,message:'Training:0 of 9 sets finished.',parallelism:{active_sets:[{parameter_set_id:'P1',progress:.5}]}};
-  await until(()=>f.research.state.progress===58);
-  assert.equal(f.research.summary().tuning.parallelism.active_sets[0].progress,.5);
-  // Even a delayed/regressing worker snapshot cannot move the main bar back.
-  f.worker.job={...f.worker.job,progress:.1};await until(()=>f.research.state.tuning?.progress===.1);
-  assert.equal(f.research.status().progress,58);
-  f.worker.job={...f.worker.job,phase:'tuning_validation',progress:.6,message:'Validation:0 of 3 sets finished.',parallelism:{active_sets:[]}};
-  await until(()=>f.research.state.tuning?.phase==='tuning_validation');
-  assert.equal(f.research.status().progress,76);assert.equal(f.research.summary().current_task.title,'Validating shortlisted parameter sets');
-  f.worker.job={...f.worker.job,phase:'tuning_test',progress:.85,message:'Testing on reserved dates.'};
-  await until(()=>f.research.state.tuning?.phase==='tuning_test');
-  assert.equal(f.research.status().progress,91);assert.match(f.research.summary().current_task.title,/Final testing/);
-  f.worker.job={status:'complete',progress:1,result:{status:'no_improvement',reason:'No candidate passed validation.',parameters:null,trials:[]}};
-  await f.research.task;
-  assert.equal(f.research.status().progress,100);assert.equal(f.research.status().current_task,null);
-  assert.ok(samples.every((value,index)=>value<100&&(index===0||value>=samples[index-1])));
-});
-
-test('a cancelled parameter search clears its active task and does not claim overall completion',async t=>{
-  const f=tuningContext(t);
-  f.worker.startOptimization=function(){this.job={status:'running',phase:'tuning_train',progress:.2};};
-  f.research.start();await until(()=>f.research.state.tuning?.phase==='tuning_train');
-  await f.research.cancel();await f.research.task;
-  assert.equal(f.research.status().status,'cancelled');assert.equal(f.research.status().progress,52);assert.equal(f.research.status().current_task,null);
-});
-
-test('tuning reuses collected candles with frozen risk/cost assumptions and keeps settings after no improvement',async t=>{
-  const f=tuningContext(t);f.research.start();await f.research.task;
-  assert.equal(f.research.status().status,'complete');assert.equal(f.worker.optimizations.length,1);
-  assert.deepEqual(f.worker.optimizations[0].datasets[0],f.worker.inputs[0].dataset);
-  const options=f.worker.optimizations[0].options;
-  assert.equal(options.initial_capital,120000);assert.equal(options.risk_per_trade_pct,.0025);assert.equal(options.fee_rate,.001);assert.equal(options.slippage_rate,.0005);
-  assert.equal(f.research.status().report.optimization.status,'no_improvement');assert.equal(f.applications.length,0);assert.equal(f.settings.min_signal_score,60);
-  assert.ok(f.store.get('research_tuning_test_dates')['5minute']);
-});
-
-test('only accepted tuning applies, persists its outcome and suppresses a fresh run caused by its own parameter update',async t=>{
-  const f=tuningContext(t,{result:acceptedTuning()});f.research.start();await f.research.task;
-  assert.deepEqual(f.applications,[{min_signal_score:65}]);assert.equal(f.settings.min_signal_score,65);
-  assert.equal(f.store.get('research_pending_tuning'),null);assert.equal(f.store.get('research_report').optimization.application.status,'applied');
-  assert.equal(f.store.get('research_auto_signature'),f.research.signature());
-  await f.research.maybeStart();assert.equal(f.worker.optimizations.length,1);
-});
-
-test('an old empty holdout-wait report is refreshed exactly once after the research workflow signature changes',async t=>{
-  const f=tuningContext(t,{result:selectableTuning()});
-  const {intraday_capital,swing_capital,...strategies}=f.engine.strategy_settings();
-  // Persist the actual pre-workflow-version signature format, as an existing
-  // installation would have written it before parameter evidence was retained.
-  const legacySignature=createHash('sha256').update(JSON.stringify([
-    STRATEGY_VERSION,f.settings.kite_user_id||f.engine.user_id||null,f.settings.publicValues?.(),'2026-09-17',
-    f.settings.research_symbols,f.settings.research_days,f.engine._strategy_options(),strategies,f.research._backtestOptions(0),
-    f.settings.research_tuning,f.settings.research_tuning_apply,f.settings.research_tuning_trials,f.settings.research_tuning_seconds,f.research._selectionPlan(),
-  ])).digest('hex');
-  const consumed={'5minute':'2026-09-16'};
-  f.store.set('research_report',{...report(),completed_at:NOW.toISOString(),optimization:{status:'waiting_for_fresh_data',reason:'Fresh final-test dates are required.',parameters:null,trials:[],application:{status:'not_applied'}}});
-  f.store.set('research_auto_signature',legacySignature);f.store.set('research_tuning_test_dates',consumed);
-  await f.research.close();
-  const restored=new HistoricalResearch(f.engine,f.store,f.settings,{worker:f.worker,now:()=>NOW,delay:0});t.after(()=>restored.close());
-  restored.applyParameters=f.research.applyParameters;
-  assert.deepEqual(restored.status().report.optimization.trials,[]);assert.equal(restored.status().automation.status,'ready');
-  assert.notEqual(restored.signature(),legacySignature);
-  await restored.maybeStart();await restored.task;
-  assert.equal(f.worker.inputs.length,1);assert.equal(f.worker.optimizations.length,1);assert.equal(f.worker.optimizations[0].options.final_test_allowed,false);
-  assert.equal(restored.status().report.optimization.trials.length,3);assert.equal(restored.status().report.optimization.final_test_allowed,false);
-  assert.deepEqual(f.store.get('research_tuning_test_dates'),consumed);assert.equal(f.applications.length,0);
-  assert.equal(f.store.get('research_auto_signature'),restored.signature());assert.equal(restored.status().automation.status,'complete');
-  await Promise.all([restored.maybeStart(),restored.maybeStart(),restored.maybeStart()]);
-  assert.equal(f.worker.inputs.length,1);assert.equal(f.worker.optimizations.length,1,'The new workflow must not cause an automatic same-day retry loop');
-  await restored.close();
-});
-
-test('overlapping test dates still produce parameter evidence after settings changes and restart without another final test',async t=>{
-  const f=tuningContext(t,{result:selectableTuning()});f.research.start();await f.research.task;const consumed=f.store.get('research_tuning_test_dates');
-  f.settings.min_signal_score=70;f.research.start();await f.research.task;
-  let optimization=f.research.status().report.optimization;
-  assert.equal(f.worker.optimizations.length,2);assert.equal(f.worker.optimizations[0].options.final_test_allowed,true);assert.equal(f.worker.optimizations[1].options.final_test_allowed,false);
-  assert.equal(optimization.status,'no_improvement');assert.equal(optimization.trials.length,3);assert.equal(optimization.trials[1].train['5minute'].metrics.net_pnl,-100);
-  assert.equal(optimization.final_test_allowed,false);assert.equal(optimization.final_test_block.blocked_intervals[0].reserved_through,consumed['5minute']);
-  assert.equal(optimization.parameters,null);assert.equal(f.applications.length,0);assert.deepEqual(f.store.get('research_tuning_test_dates'),consumed);
-  await f.research.close();
-  const worker=new FakeWorker();worker.optimizations=[];worker.startOptimization=f.worker.startOptimization;
-  const restored=new HistoricalResearch(f.engine,f.store,f.settings,{worker,now:()=>NOW,delay:0});t.after(()=>restored.close());
-  assert.equal(restored.status().progress,100,'Restored completed reports must not show0%');assert.equal(restored.status().report.optimization.trials.length,3);
-  restored.start();await restored.task;
-  optimization=restored.status().report.optimization;
-  assert.equal(worker.optimizations.length,1);assert.equal(worker.optimizations[0].options.final_test_allowed,false);
-  assert.equal(optimization.trials.length,3);assert.equal(optimization.final_test_allowed,false);assert.deepEqual(f.store.get('research_tuning_test_dates'),consumed);
-});
-
-test('historical coordinator cannot automatically accept a worker result when final-test dates were already reserved',async t=>{
-  const candidate={...selectableTuning(),...acceptedTuning()},f=tuningContext(t,{result:candidate});
-  f.store.set('research_tuning_test_dates',{'5minute':'2026-09-16'});
-  f.research.start();await f.research.task;
-  const result=f.research.status().report.optimization;
-  assert.equal(f.worker.optimizations[0].options.final_test_allowed,false);assert.equal(result.status,'waiting_for_fresh_data');assert.equal(result.parameters,null);
-  assert.equal(result.application.status,'not_applied');assert.equal(f.applications.length,0);assert.equal(f.store.get('research_pending_tuning'),null);assert.equal(f.settings.min_signal_score,60);
-});
-
-test('a completed blocked-date set remains explicitly selectable without being automatically qualified',async t=>{
-  const f=tuningContext(t,{result:selectableTuning()});f.store.set('research_tuning_test_dates',{'5minute':'2026-09-16'});
-  f.research.start();await f.research.task;
-  const result=f.research.status().report.optimization;
-  assert.equal(result.final_test_allowed,false);assert.equal(result.trials[1].application_eligible,true);assert.equal(f.applications.length,0);
-  await f.research.selectParameterSet(result.report_id,'P2');assert.equal(f.settings.min_signal_score,65);
-  assert.equal(f.research.status().report.optimization.status,'no_improvement');assert.equal(f.research.status().report.optimization.final_test_allowed,false);
-});
-
-test('accepted tuning waits for a safe application point and then applies once without repeating research',async t=>{
-  let ready=false;
-  const f=tuningContext(t,{result:acceptedTuning(),apply:(request,fixture)=>{if(!ready)return {status:'waiting',reason:'Managed position still open.'};assert.equal(request.isCurrent(),true);Object.assign(fixture.settings,request.parameters);return {status:'applied',reason:'Applied at a safe point.'};}});
-  f.research.start();await f.research.task;
-  assert.equal(f.research.status().report.optimization.application.status,'waiting');assert.ok(f.store.get('research_pending_tuning').id);assert.equal(f.settings.min_signal_score,60);
-  ready=true;await Promise.all([f.research.maybeStart(),f.research.maybeStart()]);
-  assert.equal(f.applications.length,2,'One deferred attempt and one successful attempt');assert.equal(f.worker.optimizations.length,1);
-  assert.equal(f.store.get('research_pending_tuning'),null);assert.equal(f.store.get('research_report').optimization.application.status,'applied');
-});
-
-test('cancelling a waiting application invalidates its lock-time authority and prevents later application',async t=>{
-  const gate=deferred();let allowed;
-  const f=tuningContext(t,{result:acceptedTuning(),apply:async request=>{await gate.promise;allowed=request.isCurrent();return {status:allowed?'applied':'stale',reason:'Lock-time context checked.'};}});
-  f.research.start();await until(()=>f.applications.length===1);
-  await f.research.cancel();gate.resolve();await f.research.task;
-  assert.equal(allowed,false);assert.equal(f.store.get('research_pending_tuning'),null);assert.equal(f.settings.min_signal_score,60);
-  assert.ok(f.store.get('research_tuning_test_dates')['5minute'],'Cancelled searches still consume their reserved test dates');
-});
-
-test('accepted research results remain unapplied when automatic application is disabled',async t=>{
-  const f=tuningContext(t,{result:acceptedTuning()});f.settings.research_tuning_apply=false;f.research.start();await f.research.task;
-  assert.equal(f.research.status().report.optimization.status,'accepted');assert.equal(f.research.status().report.optimization.application.status,'disabled');
-  assert.equal(f.applications.length,0);assert.equal(f.settings.min_signal_score,60);
-});
-
-test('a newer research run supersedes a candidate already waiting on its application lock',async t=>{
-  const f=tuningContext(t,{result:acceptedTuning(),apply:()=>({status:'waiting',reason:'Exposure remains.'})});
-  f.research.start();await f.research.task;
-  const gate=deferred();let current;
-  f.research.applyParameters=async request=>{await gate.promise;current=request.isCurrent();return {status:current?'applied':'stale',reason:'Checked after lock wait.'};};
-  const applying=f.research._applyPending();
-  f.research.start();await f.research.task;
-  gate.resolve();await applying;
-  assert.equal(current,false);assert.equal(f.research.status().report.optimization.status,'waiting_for_fresh_data');
-  assert.equal(f.store.get('research_pending_tuning'),null);assert.equal(f.settings.min_signal_score,60);
-});
-
-test('shutdown waits for a scheduler application and invalidates it before storage can close',async t=>{
-  const f=tuningContext(t,{result:acceptedTuning(),apply:()=>({status:'waiting',reason:'Exposure remains.'})});
-  f.research.start();await f.research.task;
-  const gate=deferred();let current;
-  f.research.applyParameters=async request=>{await gate.promise;current=request.isCurrent();return {status:current?'applied':'stale',reason:'Checked after lock wait.'};};
-  const tick=f.research.maybeStart();let closed=false;
-  const closing=f.research.close().then(()=>closed=true);await delay(5);assert.equal(closed,false);
-  gate.resolve();await Promise.all([closing,tick]);
-  assert.equal(current,false);assert.equal(closed,true);assert.equal(f.settings.min_signal_score,60);
-});
-
-test('a saved candidate cannot cross into a different configured Zerodha account',async t=>{
-  const f=tuningContext(t,{result:acceptedTuning(),apply:()=>({status:'waiting',reason:'Exposure remains.'})});
-  f.settings.kite_user_id='AB1234';f.research.start();await f.research.task;
-  assert.ok(f.store.get('research_pending_tuning'));f.settings.kite_user_id='CD5678';
-  const result=await f.research._applyPending();
-  assert.equal(result.status,'stale');assert.equal(f.applications.length,1);assert.equal(f.store.get('research_pending_tuning'),null);assert.equal(f.settings.min_signal_score,60);
-});
-
-const selectableTuning=()=>({status:'no_improvement',reason:'Training lost money.',parameters:null,
-  ranges:{'5minute':{train:{from:'2026-08-01',to:'2026-08-28'}}},
-  incumbent_parameters:{min_signal_score:60,min_adx:18,min_setup_volume:1.2,max_atr_extension:2.5},
-  trials:[{}, {min_signal_score:65}, {min_adx:21}].map((parameters,index)=>({id:index?'candidate_'+index:'incumbent',parameter_set_id:`P${index+1}`,parameters,status:'rejected',reason:'Training lost money.',train:{'5minute':{metrics:{net_pnl:-100,net_return_pct:-1,max_drawdown_pct:2,trade_count:12}}}}))});
-
-test('manual selection applies the complete P set including losing results without relabeling qualification',async t=>{
-  const f=tuningContext(t,{result:selectableTuning()});f.settings.research_tuning_apply=false;
-  f.research.start();await f.research.task;
-  const result=f.research.status().report.optimization;
-  assert.ok(result.report_id);assert.equal(result.trials[0].application_eligible,false);assert.equal(result.trials[1].application_eligible,true);
-  await f.research.selectParameterSet(result.report_id,'P2');assert.equal(f.settings.min_signal_score,65);
-  await f.research.selectParameterSet(result.report_id,'P3');assert.equal(f.settings.min_signal_score,60,'Switching sets restores unchanged thresholds from the original report');assert.equal(f.settings.min_adx,21);
-  assert.deepEqual(f.applications[1],{min_signal_score:60,min_adx:21,min_setup_volume:1.2,max_atr_extension:2.5});
-  const applied=f.research.status().report.optimization;
-  assert.equal(applied.status,'no_improvement');assert.equal(applied.trials[2].status,'rejected');assert.equal(applied.application.source,'manual');assert.equal(applied.application.parameter_set_id,'P3');
-  assert.equal(applied.trials[2].application_eligible,false);assert.equal(applied.trials[0].application_eligible,true);
-  assert.equal(f.store.get('research_report').optimization.application.parameter_set_id,'P3');
-});
-
-test('manual selection rejects old report IDs, incomplete results and changed account or risk context',async t=>{
-  const f=tuningContext(t,{result:selectableTuning()});
-  // Real settings supply publicValues; include every fixture field here too.
-  f.settings.publicValues=()=>Object.fromEntries(Object.entries(f.settings).filter(([,value])=>typeof value!=='function'));
-  f.research.start();await f.research.task;const id=f.research.status().report.optimization.report_id;
-  await assert.rejects(f.research.selectParameterSet('old','P2'),/no longer current/);
-  await assert.rejects(f.research.selectParameterSet(id,'P17'),/does not belong/);
-  delete f.research.state.report.optimization.trials[1].train;
-  await assert.rejects(f.research.selectParameterSet(id,'P2'),/not finished/);
-  f.settings.kite_user_id='DIFFERENT';await assert.rejects(f.research.selectParameterSet(id,'P3'),/changed/);delete f.settings.kite_user_id;
-  f.settings.risk_per_trade_pct=.001;await assert.rejects(f.research.selectParameterSet(id,'P3'),/changed/);
-  assert.equal(f.applications.length,0);
-});
-
-test('a queued manual choice survives automatic-apply disabled and can be cancelled before exposure clears',async t=>{
-  const f=tuningContext(t,{result:selectableTuning(),apply:()=>({status:'waiting',reason:'Managed position open.'})});f.settings.research_tuning_apply=false;
-  f.research.start();await f.research.task;const id=f.research.status().report.optimization.report_id;
-  const waiting=await f.research.selectParameterSet(id,'P2');assert.equal(waiting.report.optimization.application.status,'waiting');assert.equal(f.store.get('research_pending_tuning').source,'manual');
-  await f.research.cancel();await f.research.maybeStart();assert.equal(f.applications.length,1);assert.equal(f.settings.min_signal_score,60);assert.equal(f.store.get('research_pending_tuning'),null);
-});
-
-test('parallel worker settings and live activity are passed to the resource scheduler',async t=>{
-  const f=tuningContext(t);f.settings.research_tuning_workers=7;f.settings.analytics_reserve_cpus=2;f.engine.analytics={snapshot:()=>({active_jobs:3,live_workers:80})};
-  f.research.start();await f.research.task;
-  const options=f.worker.optimizations[0].options;assert.equal(options.parallelism,7);assert.equal(options.reserve_cpus,4);assert.equal(options.live_workers,3);
-});
-
-test('research downloads a balanced industry sample and preserves its coverage when one history is missing',async t=>{
-  const f=context(t,{settings:{research_symbols:20},broker:{async call(method,token){if(method==='quote')return {};if(token===missing)throw new Error('No history');return candles();}}});
-  f.engine.universe=Object.fromEntries(Array.from({length:60},(_,i)=>[i+1,{tradingsymbol:'STOCK'+i}]));
-  f.engine.market_context={forSymbol:symbol=>({classification_status:'fresh',industry:'Industry '+Number(symbol.slice(5))%5,index_membership:[]})};
-  const plan=f.research._selectionPlan(),missing=Number(plan.selected[0][0]);
-  assert.equal(plan.selected.length,20);assert.deepEqual(plan.diversification.industries.map(group=>group.symbols.length),[4,4,4,4,4]);
-  f.research.start();await f.research.task;
-  const result=f.research.status().report;assert.equal(result.metadata.diversification.status,'diversified');assert.equal(result.metadata.diversification.selected_count,20);assert.equal(result.dataset.symbols.length,19);assert.equal(result.metadata.unavailable_symbols.length,1);
-  assert.deepEqual(result.metadata.requested_symbols,plan.selected.map(([,i])=>i.tradingsymbol));
-});
-
-test('candidate calculation errors retain the report and healthy siblings but disable the failed set',async t=>{
-  const result=selectableTuning();result.status='completed_with_errors';result.failed_trials=1;result.reason='One candidate calculation failed; other results were retained.';
-  Object.assign(result.trials[1],{status:'error',error:{phase:'validation',interval:'5minute',code:'worker_exit',message:'Candidate worker exited unexpectedly.'},reason:'Validation calculation failed.'});
-  const f=tuningContext(t,{result});f.research.start();await f.research.task;
-  const complete=f.research.status(),optimization=complete.report.optimization;
-  assert.equal(complete.status,'complete');assert.equal(complete.error,null);assert.equal(f.store.get('research_failure'),null);assert.equal(optimization.status,'completed_with_errors');assert.equal(optimization.trials[1].train['5minute'].metrics.net_pnl,-100);
-  assert.equal(optimization.trials[1].application_eligible,false);assert.equal(optimization.trials[2].application_eligible,true);
-  await assert.rejects(f.research.selectParameterSet(optimization.report_id,'P2'),/calculation error/);
-  assert.equal(f.store.events().filter(event=>event.kind==='research.candidate_failed').length,1);assert.equal(f.store.get('research_report').optimization.failed_trials,1);
-  await f.research.selectParameterSet(optimization.report_id,'P3');assert.equal(f.settings.min_adx,21);assert.equal(f.research.status().report.optimization.status,'completed_with_errors');
-});
-
-test('a healthy validated winner can apply even when a different candidate had a calculation error',async t=>{
-  const result=selectableTuning();Object.assign(result,{status:'accepted',parameters:{min_adx:21},selected_id:'candidate_2',failed_trials:1,reason:'P3 passed every check; P2 had a calculation error.'});
-  Object.assign(result.trials[1],{status:'error',error:{phase:'train',code:'candidate_error',message:'Calculation failed.'}});result.trials[2].status='accepted';
-  const f=tuningContext(t,{result});f.research.start();await f.research.task;
-  const complete=f.research.status();assert.equal(complete.status,'complete');assert.equal(complete.report.optimization.application.status,'applied');assert.equal(complete.report.optimization.application.parameter_set_id,'P3');assert.deepEqual(f.applications,[{min_adx:21}]);assert.equal(complete.report.optimization.failed_trials,1);
 });

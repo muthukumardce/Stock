@@ -6,7 +6,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { once } from 'node:events';
 import http from 'node:http';
-import { ConfigManager } from '../src/config.js';
+import { ConfigManager, Settings } from '../src/config.js';
 import { createApp, defaultStrategies } from '../src/main.js';
 import { Fernet } from '../src/security.js';
 import { TradingEngine } from '../src/trading.js';
@@ -107,43 +107,6 @@ test('research cooldown is enforced over HTTP and background status carries safe
   assert.doesNotMatch(JSON.stringify(state),/testapisecret|DO_NOT_INCLUDE_LARGE_REPORT/);assert.equal(f.engine.starts,0);
 });
 
-test('research detail retains all 100 parameter sets and 96 active progress rows alongside background polling',async t=>{
-  const f=await fixture(t);await f.login();const research=f.app.state.research;
-  const trials=Array.from({length:100},(_,index)=>({id:index?'candidate_'+index:'incumbent',parameter_set_id:`P${index+1}`,
-    status:index<96?'training':'pending',parameters:index?{min_signal_score:60+index/10}:{},effective_parameters:{min_signal_score:60+index/10,min_adx:18,min_setup_volume:1.2,max_atr_extension:2.5}}));
-  const active=trials.slice(0,96).map((trial,index)=>({parameter_set_id:trial.parameter_set_id,phase:'tuning_train',interval:'5minute',process_id:10000+index,
-    progress:(500+index)/10000,processed_bars:500+index,total_bars:10000,completed_intervals:0,total_intervals:1,thread_limit:4,active_threads:4,
-    workers:Array.from({length:4},(_,thread)=>({process_id:10000+index,worker_id:thread+2,state:'busy',affinity:{status:'pinned',verified:true,group:Math.floor(index/32),cpu:(index%32)*2+thread%2,core:index}}))}));
-  const parallelism={worker_limit:96,active_workers:96,process_limit:96,active_processes:96,thread_limit:384,active_threads:384,
-    completed_tasks:0,total_tasks:100,failed_tasks:0,active_sets:active,workers:active.flatMap(set=>set.workers),memory_waiting:false,
-    available_memory_mib:60000,memory_reserve_mib:8000,startup_memory_mib:2176,initializing_processes:0,max_initializing:4};
-  const tuning={status:'running',phase:'tuning_train',progress:.03,trial:1,trial_count:100,trials,parallelism};
-  Object.assign(research.state,{status:'running',progress:17.8,message:'Training parameter sets',tuning,report:{marker:'previous-full-report'}});
-  const read=async url=>{const response=await f.request(url);assert.equal(response.status,200);return response.json();};
-  const expectedIds=trials.map(trial=>trial.parameter_set_id),activeIds=expectedIds.slice(0,96);
-  for(let round=0;round<3;round++){
-    const [detail,background,otherDetail]=await Promise.all([read('/api/research'),read('/api/state'),read('/api/research')]);
-    const summary=background.state.background.research;
-    for(const full of [detail,otherDetail]){
-      assert.equal(full.status,'running');assert.deepEqual(full.tuning.trials.map(trial=>trial.parameter_set_id),expectedIds);
-      assert.deepEqual(full.tuning.parallelism.active_sets.map(set=>set.parameter_set_id),activeIds);
-      assert.deepEqual(full.tuning.parallelism.active_sets,active);assert.equal(full.tuning.parallelism.workers.length,384);
-      assert.equal(full.tuning.parallelism.active_processes,96);assert.equal(full.tuning.parallelism.active_threads,384);
-      assert.deepEqual(full.tuning.trials.slice(96).map(trial=>trial.status),['pending','pending','pending','pending']);
-      assert.equal(full.report.marker,'previous-full-report');
-    }
-    assert.deepEqual(summary.tuning.parallelism.active_sets,active);assert.equal(summary.tuning.parallelism.workers.length,384);
-    assert.equal(Object.hasOwn(summary.tuning,'trials'),false);assert.equal(Object.hasOwn(summary,'report'),false);
-    // Summary and full status are independent snapshots, so consumers cannot
-    // truncate the live catalogue or its per-process progress through a read.
-    const localSummary=research.summary(),localDetail=research.status();
-    localSummary.tuning.parallelism.active_sets.length=0;localDetail.tuning.trials.length=0;
-    assert.equal(research.state.tuning.trials.length,100);assert.equal(research.state.tuning.parallelism.active_sets.length,96);
-    for(const set of active){set.processed_bars+=100;set.progress=set.processed_bars/set.total_bars;}
-  }
-  assert.equal(f.engine.starts,0);assert.equal(f.engine.connected,false);assert.equal(research.worker.worker,null);
-});
-
 test('research endpoints are authenticated read-only jobs with CSRF and no arbitrary dataset or credentials',async t=>{
   const f=await fixture(t);let starts=0,cancels=0;
   f.app.state.research.start=()=>{starts++;return {status:'collecting',progress:0,report:null};};
@@ -160,22 +123,12 @@ test('research endpoints are authenticated read-only jobs with CSRF and no arbit
   assert.doesNotMatch(JSON.stringify(f.store.events()),/must-not-be-accepted/);
 });
 
-test('manual research application requires authentication, CSRF and report/set identities only',async t=>{
-  const f=await fixture(t);let applied=0;const body={report_id:'12345678-1234-4321-8321-123456789012',parameter_set_id:'P2'};
-  f.app.state.research.selectParameterSet=async(report,set)=>{assert.equal(report,body.report_id);assert.equal(set,'P2');applied++;return {status:'complete',report:{optimization:{application:{status:'waiting'}}}};};
-  assert.equal((await f.request('/api/research/apply','POST',body)).status,401);await f.login();
-  assert.equal((await f.request('/api/research/apply','POST',body,{'x-csrf-token':'bad'})).status,403);
-  for(const invalid of [{...body,parameters:{min_adx:20}},{...body,parameter_set_id:'P101'},{...body,report_id:'old'},{parameter_set_id:'P2'}])assert.equal((await f.request('/api/research/apply','POST',invalid)).status,422);
-  assert.equal((await f.request('/api/research/apply','POST',body)).status,200);assert.equal(applied,1);assert.equal(f.engine.starts,0);
-  f.app.state.restartRequired=true;assert.equal((await f.request('/api/research/apply','POST',body)).status,409);assert.equal(applied,1);
-});
-
 test('Research page sizes persist without pausing trading or granting arbitrary settings access',async t=>{
-  const f=await fixture(t),values={research_symbols:150,research_tuning_trials:50};
+  const f=await fixture(t),values={research_symbols:150};
   assert.equal((await f.request('/api/research/settings','PUT',values)).status,401);await f.login();
   assert.equal((await f.request('/api/research/settings','PUT',values,{'x-csrf-token':'bad'})).status,403);
   assert.equal((await f.request('/api/research/settings','PUT',{...values,risk_per_trade_pct:.05})).status,422);
-  for(const invalid of [{...values,research_symbols:151},{...values,research_tuning_trials:101},{...values,research_symbols:0}])assert.equal((await f.request('/api/research/settings','PUT',invalid)).status,409);
+  for(const invalid of [{...values,research_symbols:1001},{...values,research_symbols:-1}])assert.equal((await f.request('/api/research/settings','PUT',invalid)).status,409);
   assert.equal((await f.request('/api/research/settings','PUT',{...values,research_symbols:'150'})).status,422);
   f.engine.status='running';f.engine.positions=[{symbol:'INFY'}];const risk=f.settings.risk_per_trade_pct;
   const saved=await f.request('/api/research/settings','PUT',values);assert.equal(saved.status,200);assert.deepEqual((await saved.json()).settings,values);
@@ -183,10 +136,10 @@ test('Research page sizes persist without pausing trading or granting arbitrary 
   const affinityValues={...values,research_cpu_affinity:'automatic'},affinitySaved=await f.request('/api/research/settings','PUT',affinityValues);
   assert.equal(affinitySaved.status,200);assert.deepEqual((await affinitySaved.json()).settings,affinityValues);
   assert.equal(f.settings.research_cpu_affinity,'automatic');assert.equal(f.manager.candidate({}).research_cpu_affinity,'automatic');
-  assert.equal(f.settings.research_symbols,150);assert.equal(f.manager.candidate({}).research_tuning_trials,50);assert.equal(f.settings.risk_per_trade_pct,risk);
+  assert.equal(f.settings.research_symbols,150);assert.equal(f.manager.candidate({}).research_tuning_trials,undefined);assert.equal(f.settings.risk_per_trade_pct,risk);
   assert.equal(f.engine.status,'running');assert.equal(f.engine.positions.length,1);assert.equal(f.app.state.restartRequired,false);assert.equal(f.engine.starts,0);
   f.app.state.research.state.status='running';assert.equal((await f.request('/api/research/settings','PUT',values)).status,409);f.app.state.research.state.status='idle';
-  f.store.set('research_pending_tuning',{id:'queued'});assert.equal((await f.request('/api/research/settings','PUT',values)).status,409);f.store.delete('research_pending_tuning');
+  assert.equal((await f.request('/api/research/settings','PUT',{research_symbols:0})).status,200);assert.equal(f.manager.candidate({}).research_symbols,0);
   f.app.state.restartRequired=true;assert.equal((await f.request('/api/research/settings','PUT',values)).status,409);
 });
 
@@ -200,6 +153,22 @@ test('all enhanced controls have editable defaults and invalid combinations are 
   assert.equal((await f.request('/api/config','PUT',{research_symbols:999999})).status,409);
   assert.equal((await f.request('/api/config','PUT',{min_signal_score:65,research_symbols:10})).status,200);
   assert.equal(f.manager.candidate({}).min_signal_score,65);assert.equal(f.settings.min_signal_score,60);
+});
+
+test('retired research parameter controls and apply endpoint cannot mutate strategy settings',async t=>{
+  const f=await fixture(t);await f.login();const before=f.settings.min_signal_score;
+  const config=await (await f.request('/api/config')).json();
+  assert.ok(config.fields.some(field=>field.key==='research_workers'));
+  for(const key of ['research_tuning','research_tuning_apply','research_tuning_trials','research_tuning_seconds','research_tuning_workers']){
+    assert.equal(Object.hasOwn(config.values,key),false);assert.ok(!config.fields.some(field=>field.key===key));
+    assert.equal((await f.request('/api/config','PUT',{[key]:true})).status,422);
+    assert.equal((await f.request('/api/research/settings','PUT',{research_symbols:20,[key]:true})).status,422);
+  }
+  assert.equal((await f.request('/api/research/apply','POST',{report_id:'old',parameter_set_id:'P2'})).status,404);
+  assert.equal(f.settings.min_signal_score,before);assert.equal(f.engine.starts,0);
+  const migrated=new Settings({research_tuning:true,research_tuning_apply:true,research_tuning_workers:6,min_signal_score:63});
+  assert.equal(migrated.research_workers,6);assert.equal(migrated.min_signal_score,63);assert.equal(migrated.research_tuning,undefined);
+  assert.equal(new Settings({research_workers:4,research_tuning_workers:6}).research_workers,4);
 });
 test('Cloudflare origin and secure cookies are automatic; untrusted hosts and spoofed proxy metadata fail',async t=>{
   const f=await fixture(t),headers={host:'my-tunnel.trycloudflare.com','cf-ray':'aabbccddeeff1234-BOM','x-forwarded-proto':'https','cf-connecting-ip':'203.0.113.8',origin:'https://my-tunnel.trycloudflare.com'};

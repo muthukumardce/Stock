@@ -23,12 +23,14 @@ const bounded=(value,fallback,min,max)=>finite(value)&&value>=min&&value<=max?va
 export const MARKET_CONTEXT_DEFAULTS=Object.freeze({event_risk_enabled:true,event_blackout_before_days:1,event_blackout_after_days:1,
   market_context_max_age_minutes:60,classification_max_age_days:7,benchmark_max_age_seconds:120});
 export const INDEX_SOURCES=Object.freeze([
+  ['niftytotalmarket','NIFTY TOTAL MARKET','totalmarket_'],
   ['nifty500','NIFTY 500','500'],['nifty50','NIFTY 50','50'],['niftybank','NIFTY BANK','bank'],
   ['niftyit','NIFTY IT','it'],['niftypharma','NIFTY PHARMA','pharma'],['niftyauto','NIFTY AUTO','auto'],
   ['niftyfmcg','NIFTY FMCG','fmcg'],['niftymetal','NIFTY METAL','metal'],
 ].map(([id,name,file])=>Object.freeze({id,name,url:`https://www.niftyindices.com/IndexConstituent/ind_nifty${file}list.csv`})));
-const CONSTITUENT_MINIMUM={nifty500:400,nifty50:40,niftybank:8,niftyit:7,niftypharma:10,niftyauto:8,niftyfmcg:8,niftymetal:8};
-export const BENCHMARKS=Object.freeze(INDEX_SOURCES.map(({name})=>Object.freeze({name,key:`NSE:${name}`})));
+const CONSTITUENT_MINIMUM={niftytotalmarket:700,nifty500:400,nifty50:40,niftybank:8,niftyit:7,niftypharma:10,niftyauto:8,niftyfmcg:8,niftymetal:8};
+export const BROAD_INDEX_NAMES=Object.freeze(['NIFTY 50','NIFTY 500','NIFTY TOTAL MARKET']);
+export const BENCHMARKS=Object.freeze(INDEX_SOURCES.filter(source=>source.id!=='niftytotalmarket').map(({name})=>Object.freeze({name,key:`NSE:${name}`})));
 const EVENT_SOURCES=Object.freeze({board:'https://www.nseindia.com/api/corporate-board-meetings',calendar:'https://www.nseindia.com/api/event-calendar'});
 class ContextError extends Error {constructor(code){super(code);this.name='ContextError';this.code=code;}}
 const fail=code=>{throw new ContextError(code);};
@@ -58,7 +60,7 @@ export function parseIndexConstituents(csv,{withMetadata=false}={}){
     // Index corporate-action placeholders are not tradable securities. The
     // official Nifty500 file currently includes a Dummy HEG/DUMMYHEG/DUM... row.
     // Exclude only this unambiguous marker combination; malformed real rows fail.
-    if(/^Dummy\s/i.test(name)&&symbol.startsWith('DUMMY')&&/^DUM[A-Z0-9]{9}$/.test(isin)){excluded.push({symbol,reason:'index_corporate_action_placeholder'});return [];}
+    if(/^Dummy\s/i.test(name)&&symbol.startsWith('DUMMY')&&/^DU[A-Z0-9]{9,10}$/.test(isin)){excluded.push({symbol,reason:'index_corporate_action_placeholder'});return [];}
     if(!ISIN.test(isin))fail('invalid_constituent_row');
     return [{symbol,industry,name,isin,series:record.Series}];
   });
@@ -130,7 +132,7 @@ export class MarketContext {
     for(const source of this.indexSources){try{
       const item=saved.indexes?.[source.id];if(!validMeta(item,now)||item.source!==source.url||!Array.isArray(item.records))continue;
       const csv='Company Name,Industry,Symbol,Series,ISIN Code\n'+item.records.map(r=>[r.name,r.industry,r.symbol,r.series||'EQ',r.isin].map(value=>'"'+String(value).replaceAll('"','""')+'"').join(',')).join('\n');
-      const records=parseIndexConstituents(csv);if(records.length<CONSTITUENT_MINIMUM[source.id])continue;
+      const records=parseIndexConstituents(csv);if(records.length<CONSTITUENT_MINIMUM[source.id]||source.id==='niftytotalmarket'&&records.length>1000)continue;
       this.cache.indexes[source.id]={...item,records};
     }catch{}}
     for(const source of Object.keys(EVENT_SOURCES)){try{
@@ -182,7 +184,7 @@ export class MarketContext {
       if(this.closed)return;
       const key='index:'+source.id,item=this.cache.indexes[source.id];
       if(!this._ready(key,force)||!force&&item&&age(this.now(),item.observed_at)<DAY)continue;
-      try{const parsed=parseIndexConstituents(await this._read(source.url,'csv'),{withMetadata:true});if(parsed.records.length<CONSTITUENT_MINIMUM[source.id])fail('constituent_coverage_incomplete');if(this.closed)return;
+      try{const parsed=parseIndexConstituents(await this._read(source.url,'csv'),{withMetadata:true});if(parsed.records.length<CONSTITUENT_MINIMUM[source.id]||source.id==='niftytotalmarket'&&parsed.records.length>1000)fail('constituent_coverage_incomplete');if(this.closed)return;
         this.cache.indexes[source.id]={source:source.url,observed_at:isoIST(this.now()),...parsed};this._success(key);
       }catch(error){this._failure(key,error);}
       if(!this.closed)this._persist();
@@ -307,6 +309,12 @@ export class MarketContext {
     });
     return {status:sources.every(source=>source.status==='fresh')?'fresh':sources.some(source=>source.status==='fresh')?'partial':sources.some(source=>source.status==='stale')?'stale':'unavailable',sources};
   }
+  researchConstituents(){
+    const source=INDEX_SOURCES.find(item=>item.id==='niftytotalmarket'),cached=this.cache.indexes[source.id];
+    return {name:source.name,source:source.url,observed_at:cached?.observed_at||null,
+      status:cached?(age(this.now(),cached.observed_at)<=this._options().classification_age?'fresh':'stale'):'unavailable',
+      records:copy(cached?.records||[]),excluded:copy(cached?.excluded||[])};
+  }
   forSymbol(symbol){
     this._lookups();const now=this.now(),opts=this._options(),matches=(this.classifications.get(symbol)||[]).map(row=>({...row,fresh:age(now,row.cache.observed_at)<=opts.classification_age}));
     const fresh=matches.filter(row=>row.fresh),industries=[...new Set(fresh.map(row=>row.record.industry))],classification=industries.length===1?'fresh':industries.length>1?'conflict':matches.length?'stale':'unknown';
@@ -328,7 +336,7 @@ export class MarketContext {
   }
   contextForSymbol(symbol,asOf=this.now()){
     const at=parseTime(asOf);if(!at||+at>+this.now()+5000)throw new TypeError('Market context requires a current or earlier as-of timestamp');
-    const info=this.forSymbol(symbol),sector=info.index_membership.filter(row=>row.status==='fresh'&&!['NIFTY 50','NIFTY 500'].includes(row.index)).sort((a,b)=>a.index.localeCompare(b.index))[0]?.index||null;
+    const info=this.forSymbol(symbol),sector=info.index_membership.filter(row=>row.status==='fresh'&&!BROAD_INDEX_NAMES.includes(row.index)).sort((a,b)=>a.index.localeCompare(b.index))[0]?.index||null;
     const barsFor=(name,type)=>{if(!this._brokerCurrent())return [];const benchmark=this.cache.benchmarks['NSE:'+name];if(!benchmark?.quote||type==='history'&&benchmark.history?.instrument_token!==benchmark.quote.raw.instrument_token)return [];const item=benchmark[type];return (item?.bars||[]).filter(row=>type==='intraday'?+parseTime(row.time)+300000<=+at&&dateIST(parseTime(row.time))===dateIST(at):dateIST(parseTime(row.time))<dateIST(at)).map(row=>({...row,time:parseTime(row.time)}));};
     const benchmark_bars=barsFor('NIFTY 50','intraday'),sector_bars=sector?barsFor(sector,'intraday'):[];
     const complete=bars=>bars.length>0&&+at-(+bars.at(-1).time+300000)<300000;

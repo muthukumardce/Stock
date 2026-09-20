@@ -10,7 +10,7 @@ const validCode=value=>typeof value==='string'&&/^[a-z][a-z_]{0,63}$/.test(value
 export class OptimizerPool{
   constructor(context,{workerLimit=1,workerHeapMiB=512,affinityPlan=null,guard=()=>{},onWorkerEvent=()=>{},workerFactory=(url,options)=>new Worker(url,options),maxWorkerRestarts,now=()=>performance.now(),setProgressTimer=setTimeout,clearProgressTimer=clearTimeout,staggerStartup=false,scheduleStartup=setImmediate,cancelStartup=clearImmediate}={}){
     this.workerLimit=Math.max(1,Math.min(100,Math.trunc(workerLimit)||1));
-    this.workerHeapMiB=Math.max(512,Math.min(4096,Number.isInteger(workerHeapMiB)?workerHeapMiB:512));
+    this.workerHeapMiB=Math.max(512,Math.min(12288,Number.isInteger(workerHeapMiB)?workerHeapMiB:512));
     this.restartsRemaining=Math.max(0,Math.min(this.workerLimit,Number.isInteger(maxWorkerRestarts)?maxWorkerRestarts:this.workerLimit));
     this.context=context;this.workerFactory=workerFactory;this.guard=guard;this.onWorkerEvent=onWorkerEvent;this.affinityPlan=affinityPlan;
     this.slots=[];this.batch=null;this.failure=null;this.closing=false;this.closePromise=null;this.nextTaskId=0;this.retirements=new Set();

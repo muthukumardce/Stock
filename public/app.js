@@ -13,9 +13,7 @@ let paperModeDirty=false, savedExecution=null, configSaving=false, configRestart
 let authorizationBusy=false, authorizationPending=false, authorizationWasRequired=false, authorizationLastCheck=0;
 let researchState=null,researchLoading=null,researchBusy=false,researchTimer=null,researchRequest=null,researchRetryUnverified=false;
 let selectedResearchInterval='';
-const tuningApplicationsSeen=new Set();
-const researchMarkup=new WeakMap(),tuningActiveRows=new Map();
-let tuningApplyError='',tuningApplyErrorReportId=null;
+const researchMarkup=new WeakMap();
 let researchSettingsLoaded=false,researchSettingsLoading=null,researchSettingsDirty=false,researchSettingsBusy=false;
 let startupLocal=null,startupLatest=null,startupRequestPending=false,startupRequestVersion=0,startupBaseline=null;
 let startupDismissal=null;
@@ -202,7 +200,6 @@ function renderBackground(){
   const batches=Array.isArray(performance.active_batches)?performance.active_batches:[];
   $('background-batches').innerHTML=batches.map(batch=>`<li><strong>${escape((batch.symbols||[]).join(', ')||'Symbols not reported')}</strong><span>${escape((batch.strategies||[]).map(strategy=>String(strategy).replaceAll('_',' ')).join(', ')||'Strategy not reported')}${numeric(batch.symbol_count)!==null?` · ${number(batch.symbol_count)} analyses`:''}${batch.started_at?` · started ${escape(clock(batch.started_at))} IST`:''}</span></li>`).join('')||`<li class="muted">${numeric(activeBatches)>0?'Workers are active; batch symbols have not been reported.':'No active analytics batches reported. Workers wait for usable completed candles.'}</li>`;
   const research=background.research;
-  observeTuningApplication(research?.tuning?.application).catch(showConfigError);
   const failure=researchFailure(research),retry=researchRetry(research),researchRunning=['running','collecting'].includes(research?.status);
   $('background-research-status').textContent=retry.waiting&&!researchRunning?(retry.rateLimited&&research?.automation?.status!=='retry_wait'?'API cooldown':'Waiting for retry'):research?String(research.status||'idle').replaceAll('_',' '):'Not reported';
   $('background-research-message').textContent=failure?.message||(!researchRunning&&research?.automation?.reason)||research?.message||'Open Research to view historical analysis and reports.';
@@ -299,44 +296,6 @@ function researchIssueText(issue){
   if(typeof issue==='string')return issue;
   return [issue?.symbol||issue?.tradingsymbol,issue?.message||issue?.reason||issue?.error,issue?.http_status?`HTTP ${issue.http_status}`:null,issue?.phase?`Phase: ${String(issue.phase).replaceAll('_',' ')}`:null,issue?.code?`Cause: ${String(issue.code).replaceAll('_',' ')}`:null].filter(Boolean).join(' · ');
 }
-function tuningParameterName(key){return ({min_signal_score:'Minimum evidence score',min_adx:'Minimum trend strength (ADX)',min_setup_volume:'Minimum relative volume',max_atr_extension:'Maximum ATR extension'})[key]||String(key).replaceAll('_',' ');}
-const tuningParameterKeys=['min_signal_score','min_adx','min_setup_volume','max_atr_extension'];
-function tuningSetLabel(trial,index){return trial?.parameter_set_id||`P${index+1}`;}
-function tuningEffectiveParameters(trial,incumbent={}){const values=trial?.effective_parameters||{...incumbent,...trial?.parameters};return Object.fromEntries(tuningParameterKeys.map(key=>[key,values[key]??null]));}
-function tuningPhaseLabel(phase){return ({tuning_train:'Training',tuning_validation:'Validation',tuning_test:'Final test',train:'Training',validation:'Validation',test:'Final test'})[phase]||String(phase||'Stage not reported').replaceAll('_',' ');}
-function tuningMessage(text,trials=[]){return String(text||'').replace(/\b(incumbent|candidate_\d+)\b/g,id=>{const index=trials.findIndex(trial=>trial.id===id);return index>=0?tuningSetLabel(trials[index],index):id==='incumbent'?'P1':`P${Number(id.slice(10))+1}`;});}
-function tuningTrialBadge(trial,applied=false){return trial.status==='error'?badge('Error','red'):applied?badge('Applied','green'):badge(trial.status==='final_test_pending'?'Waiting for final test':String(trial.status||'Pending').replaceAll('_',' '),trial.status==='accepted'?'green':['rejected','validation_failed','test_failed','final_test_pending'].includes(trial.status)?'amber':'');}
-function tuningTrialExplanation(trial,trials){
-  if(trial.status!=='error')return tuningMessage(trial.reason||'Evaluation is pending.',trials);
-  const error=trial.error||{};
-  return [error.phase?`Phase: ${tuningPhaseLabel(error.phase)}`:null,error.interval?({day:'Swing daily','5minute':'Intraday 5-minute'})[error.interval]||error.interval:null,`${error.code?`${String(error.code).replaceAll('_',' ')}: `:''}${error.message||trial.reason||'The candidate calculation failed.'}`].filter(Boolean).join(' · ');
-}
-function tuningSetTable(trials,optimization={},live=false){
-  if(!trials.length)return '';
-  const rows=trials.map((trial,index)=>{
-    const id=tuningSetLabel(trial,index),values=tuningEffectiveParameters(trial,optimization.incumbent_parameters),application=optimization.application||{},eligible=!live&&!!optimization.report_id&&trial.status!=='error'&&trial.application_eligible===true;
-    const disabled=researchBusy||!state.connected||['running','collecting'].includes(researchState?.status)||!eligible;
-    const applied=application.status==='applied'&&application.parameter_set_id===id;
-    const latest=['test','validation','train'].find(stage=>Object.keys(trial[stage]||{}).length),summary=latest?Object.entries(trial[latest]).map(([interval,stage])=>`${interval==='day'?'Swing':interval==='5minute'?'Intraday':interval} ${tuningPhaseLabel(latest).toLowerCase()}: ${numeric(stage.metrics?.net_return_pct)===null?'return not reported':`${decimal(stage.metrics.net_return_pct)}% net`} · ${numeric(stage.metrics?.trade_count)===null?'trades not reported':`${number(stage.metrics.trade_count)} trades`}`).join('; '):'No completed stage reported yet.';
-    const reason=live?'Results update as workers finish each stage.':trial.status==='error'?'A set with a calculation error cannot be applied.':!optimization.report_id?'Run analysis again to enable selection for this older report.':trial.application_reason||(trial.application_eligible===true?'Completed saved set is available for manual selection.':'The server has not marked this set eligible for manual application.');
-    return `<tr><th scope="row"><strong>${escape(id)}</strong>${index===0?'<small>Starting set</small>':''}</th>${Object.values(values).map(value=>`<td class="tuning-set-value">${escape(value??'Not reported')}</td>`).join('')}<td class="tuning-set-metrics">${escape(summary)}</td><td>${tuningTrialBadge(trial,applied)}<small>${escape(tuningTrialExplanation(trial,trials))}</small>${live?`<small>${escape(reason)}</small>`:''}</td>${!live?`<td><button class="button secondary small" type="button" data-apply-set="${escape(id)}" data-report-id="${escape(optimization.report_id||'')}" ${disabled?'disabled':''}>${researchBusy?'Please wait…':`Apply ${escape(id)}`}</button><small>${escape(reason)}</small></td>`:''}</tr>`;
-  }).join('');
-  return `<table class="tuning-set-table${live?' tuning-set-table-live':''}" aria-label="${live?'Parameter sets in progress':'Parameter sets'}"><thead><tr><th scope="col">Set</th>${tuningParameterKeys.map(key=>`<th scope="col" class="tuning-set-value">${escape(tuningParameterName(key))}</th>`).join('')}<th scope="col">Latest results</th><th scope="col">Status</th>${!live?'<th scope="col">Apply</th>':''}</tr></thead><tbody>${rows}</tbody></table>`;
-}
-async function observeTuningApplication(application){
-  if(application?.status!=='applied'||!application.applied_at||tuningApplicationsSeen.has(application.applied_at))return;
-  tuningApplicationsSeen.add(application.applied_at);if(tuningApplicationsSeen.size>32)tuningApplicationsSeen.delete(tuningApplicationsSeen.values().next().value);
-  if(configDirty){$('config-message').textContent='Research updated strategy thresholds. Your unsaved settings are unchanged; review them before saving.';return;}
-  if(!configLoaded&&!configLoading)return;
-  const previouslyLoaded=configLoaded;configLoaded=false;
-  try{if(configLoading)await configLoading.catch(()=>{});if(!configDirty)await loadConfig(true);}
-  finally{if(configDirty){configLoaded=previouslyLoaded;$('config-message').textContent='Research updated strategy thresholds. Your unsaved settings are unchanged; review them before saving.';}}
-}
-function tuningMetricCell(stage){
-  if(!stage||typeof stage!=='object')return '<span class="muted">Not evaluated</span>';
-  const metrics=stage.metrics||{},quality=stage.data_quality||{},pct=value=>numeric(value)===null?'Not reported':`${decimal(value)}%`;
-  return `<strong>${escape(pct(metrics.net_return_pct))} net</strong><small>${escape(pct(metrics.max_drawdown_pct))} drawdown<br>${numeric(metrics.trade_count)===null?'Trades not reported':`${number(metrics.trade_count)} trades`}</small>${quality.eligible===false||quality.completed_result===false?`<small class="negative">${escape(quality.reason||'Incomplete or ineligible data')}</small>`:''}`;
-}
 function affinityLocation(affinity){
   if(affinity?.cpu===null||affinity?.cpu===undefined)return 'Not reported';
   return [affinity.group!==null&&affinity.group!==undefined?`Group ${affinity.group}`:null,`CPU ${affinity.cpu}`].filter(Boolean).join(' · ');
@@ -351,128 +310,21 @@ function setResearchMarkup(id,markup){
 }
 function renderResearchAffinity(id,capacity,pool,active){
   const plan=capacity?.affinity,workers=Array.isArray(pool?.workers)?pool.workers:[],visible=active&&(!!plan||workers.length>0);
-  const processes=id==='tuning-affinity'&&(numeric(capacity?.process_limit)!==null||numeric(pool?.process_limit)!==null||workers.some(worker=>numeric(worker.process_id)!==null));
-  $(id).classList.toggle('research-process-affinity',processes);if(id==='tuning-affinity')$('tuning-affinity-identity').textContent=processes?'Process / thread':'Worker';
   $(id).hidden=!visible;
   if(!visible){$(`${id}-summary`).textContent='';setResearchMarkup(`${id}-workers`,'');$(`${id}-details`).hidden=true;return;}
   const currentWorkers=workers.filter(worker=>!['retiring','stopped'].includes(worker.state)),verified=currentWorkers.filter(worker=>worker.affinity?.status==='pinned'&&worker.affinity.verified===true).length,hasStates=workers.some(worker=>!!worker.state),retired=workers.length-currentWorkers.length;
   const mode=plan?.mode==='pinned'?'Pin workers to CPUs requested':plan?.mode==='automatic'?'Automatic scheduling requested':null;
-  const noun=processes?'analytics threads':'workers',planStatus=({planned:`Pinning planned; each ${processes?'analytics thread':'worker'} must verify its assignment.`,automatic:`The operating system schedules these ${noun}.`,unsupported:'Pinning is unsupported; using automatic scheduling.',unavailable:'CPU pinning is unavailable; using automatic scheduling.'})[plan?.status];
-  $(`${id}-summary`).textContent=[mode,workers.length?`${number(verified)} of ${number(currentWorkers.length)} ${hasStates?'current':'reported'} ${noun} verified pinned`:null,retired?`${number(retired)} retiring or stopped ${processes?'thread':'worker'} records`:null,planStatus,plan?.reason].filter(Boolean).join(' · ');
+  const noun='workers',planStatus=({planned:`Pinning planned; each worker must verify its assignment.`,automatic:`The operating system schedules these ${noun}.`,unsupported:'Pinning is unsupported; using automatic scheduling.',unavailable:'CPU pinning is unavailable; using automatic scheduling.'})[plan?.status];
+  $(`${id}-summary`).textContent=[mode,workers.length?`${number(verified)} of ${number(currentWorkers.length)} ${hasStates?'current':'reported'} ${noun} verified pinned`:null,retired?`${number(retired)} retiring or stopped worker records`:null,planStatus,plan?.reason].filter(Boolean).join(' · ');
   $(`${id}-details`).hidden=!workers.length;
-  setResearchMarkup(`${id}-workers`,workers.map(worker=>{const affinity=worker.affinity||{},verified=affinity.status==='pinned'&&affinity.verified===true,retired=['retiring','stopped'].includes(worker.state),workerState=({starting:'Starting',ready:'Ready',busy:'Busy',retiring:'Retiring',stopped:'Stopped'})[worker.state]||'Not reported',identity=processes?`PID ${worker.process_id??'not reported'} · Thread ${worker.worker_id??'not reported'}`:worker.worker_id??'Not reported';return `<tr><th scope="row">${escape(identity)}</th><td>${escape(workerState)}</td><td><span class="badge ${verified&&!retired?'green':affinity.status==='failed'?'red':'amber'}">${escape(retired&&verified?'Previously verified pinned':affinityStatus(affinity))}</span>${affinity.reason?`<small>${escape(affinity.reason)}</small>`:''}</td><td>${escape(affinityLocation(affinity))}${affinity.cpu!==null&&affinity.cpu!==undefined&&!verified?'<small>Reported assignment; pin not verified</small>':''}</td><td>${escape(affinity.core??'Not reported')}</td></tr>`;}).join(''));
-}
-function tuningActiveProgress(item){
-  const label=`${item.parameter_set_id||'Set not reported'} · ${tuningPhaseLabel(item.phase)}`,progress=numeric(item.progress),known=progress!==null&&progress>=0&&progress<=1;
-  const interval=item.interval?({day:'Swing daily','5minute':'Intraday 5-minute'})[item.interval]||item.interval:null;
-  const intervalDetail=[interval,numeric(item.processed_bars)!==null&&numeric(item.total_bars)>0?`${number(item.processed_bars)} of ${number(item.total_bars)} bars`:null].filter(Boolean).join(' · ');
-  const detail=[intervalDetail?`Current interval: ${intervalDetail}`:null,numeric(item.completed_intervals)!==null&&numeric(item.total_intervals)>0?`${number(item.completed_intervals)} of ${number(item.total_intervals)} intervals complete in this phase`:null].filter(Boolean).join(' · ');
-  const worker=item.worker_id!==null&&item.worker_id!==undefined?`Worker ${item.worker_id}`:null,affinity=item.affinity;
-  const process=numeric(item.process_id)!==null?`Process ${item.process_id}`:null,threads=[numeric(item.active_threads)!==null?`${number(item.active_threads)} active`:null,numeric(item.thread_limit)!==null?`${number(item.thread_limit)} capacity`:null].filter(Boolean).join(' / ');
-  const assignment=(process||threads?[process,threads?`${threads} analytics threads`:null]:[worker,affinity?affinityStatus(affinity):null,affinity?.cpu!==null&&affinity?.cpu!==undefined?affinityLocation(affinity):null,affinity?.reason]).filter(Boolean).join(' · ');
-  return {label,known,value:progress*100,percentage:`${tuningPhaseLabel(item.phase)} progress: ${known?`${decimal(Math.min(progress<1?99.9:100,progress*100),1)}%`:'Progress not reported'}`,assignment,assignmentClass:`tuning-worker-assignment${affinity?.status==='failed'?' negative':''}`,detail};
-}
-function renderTuningActiveSets(items){
-  const list=$('tuning-active-sets'),keyOf=(item,index)=>JSON.stringify([item.parameter_set_id??index,item.phase??'']),keys=new Set(items.map(keyOf));
-  for(const [key,{row}] of tuningActiveRows)if(!keys.has(key)){row.remove();tuningActiveRows.delete(key);}
-  const text=(node,value)=>{if(node.textContent!==value)node.textContent=value;};
-  const attribute=(node,name,value)=>{if(value===null){if(node.hasAttribute(name))node.removeAttribute(name);}else if(node.getAttribute(name)!==String(value))node.setAttribute(name,value);};
-  for(const [index,item] of items.entries()){
-    const key=keyOf(item,index),view=tuningActiveProgress(item);
-    let parts=tuningActiveRows.get(key);
-    if(!parts){
-      const create=tag=>document.createElement(tag),row=create('li'),heading=create('div'),title=create('strong'),percentage=create('span'),assignment=create('small'),bar=create('progress'),detail=create('small');
-      heading.className='tuning-active-heading';heading.append(title,percentage);bar.setAttribute('max','100');row.append(heading,assignment,bar,detail);
-      parts={row,title,percentage,assignment,bar,detail};tuningActiveRows.set(key,parts);
-    }
-    const {row,title,percentage,assignment,bar,detail}=parts;
-    text(title,view.label);text(percentage,view.percentage);text(assignment,view.assignment);text(detail,view.detail);
-    if(assignment.className!==view.assignmentClass)assignment.className=view.assignmentClass;
-    assignment.hidden=!view.assignment;detail.hidden=!view.detail;
-    attribute(bar,'aria-label',`${view.label} progress`);attribute(bar,'value',view.known?view.value:null);attribute(bar,'aria-valuetext',view.known?null:'Progress not reported');
-    // Keep active nodes in place across polling and unrelated live-state updates.
-    if(list.children[index]!==row)list.insertBefore(row,list.children[index]||null);
-  }
-}
-function renderResearchTuning(){
-  const research=researchState||{},tuning=research.tuning,primary=research.report||research.result;
-  const optimization=primary?.optimization||tuning?.result,active=['running','collecting'].includes(research.status)&&!!tuning;
-  $('research-tuning').hidden=!active&&!optimization;
-  $('tuning-running').hidden=!active;$('tuning-result').hidden=!optimization;
-  const verdicts={accepted:'Passed historical checks',no_improvement:'No validated improvement',completed_with_errors:'Completed with candidate errors',insufficient_data:'Not enough usable data',budget_exhausted:'Trial budget reached',waiting_for_fresh_data:'Waiting for fresh test dates',disabled:'Tuning disabled'};
-  $('tuning-status').textContent=active?'Trials in progress':verdicts[optimization?.status]||'Result unavailable';
-  $('tuning-status').className=`badge ${active?'blue':optimization?.status==='accepted'?'green':optimization?.status==='disabled'?'':'amber'}`;
-  const phase=({tuning_train:'Training candidates',tuning_validation:'Validating candidates',tuning_test:'Checking the final test',train:'Training candidates',training:'Training candidates',validation:'Validating candidates',test:'Checking the final test',final_test:'Checking the final test',preparing:'Preparing trials',complete:'Trials complete'})[tuning?.phase]||String(tuning?.phase||'Waiting for trial details').replaceAll('_',' ');
-  const trial=numeric(tuning?.trial),total=numeric(tuning?.trial_count);
-  const phaseFinished=numeric(tuning?.parallelism?.completed_tasks),phaseSets=numeric(tuning?.parallelism?.total_tasks);
-  $('tuning-phase').textContent=phaseFinished!==null&&phaseSets>0?`${phase} · ${number(phaseFinished)} of ${number(phaseSets)} sets finished in this phase`:[trial!==null&&trial>0?`Evaluation ${number(trial)}${total!==null&&total>0?` of ${number(total)}`:''}`:null,phase].filter(Boolean).join(' · ');
-  const liveTrials=Array.isArray(tuning?.trials)?tuning.trials:[];
-  $('tuning-message').textContent=tuningMessage(tuning?.message,liveTrials)||'Waiting for the server to report the current trial.';
-  const parallel=tuning?.parallelism,activeSets=active&&Array.isArray(parallel?.active_sets)?parallel.active_sets:[];
-  $('tuning-parallel').hidden=!active||!parallel;
-  const memoryWaiting=active&&parallel?.memory_waiting===true;
-  $('tuning-memory-status').hidden=!memoryWaiting;$('tuning-memory-status').textContent=memoryWaiting?({initializing:'Starting candidates in batches; running candidates continue.',free_memory:'Waiting for free RAM; running candidates continue.'})[parallel.memory_wait_reason]||'Waiting to start more candidates; running candidates continue.':'';
-  const processMode=numeric(parallel?.process_limit)!==null||numeric(parallel?.active_processes)!==null||numeric(tuning?.capacity?.process_limit)!==null;
-  const activeWorkers=numeric(processMode?parallel?.active_processes??parallel?.active_workers:parallel?.active_workers),workerLimit=numeric(processMode?parallel?.process_limit??tuning?.capacity?.process_limit??parallel?.worker_limit:parallel?.worker_limit);
-  $('tuning-worker-counts').textContent=[activeWorkers!==null?`${number(activeWorkers)} active ${processMode?'candidate processes':'workers'}`:null,workerLimit!==null?`${number(workerLimit)} ${processMode?'process':'worker'} capacity`:null,processMode&&numeric(parallel?.active_threads)!==null?`${number(parallel.active_threads)} active analytics threads`:null,processMode&&numeric(parallel?.thread_limit??tuning?.capacity?.analytics_thread_limit)!==null?`${number(parallel?.thread_limit??tuning.capacity.analytics_thread_limit)} analytics thread capacity`:null,numeric(parallel?.completed_tasks)!==null?`${number(parallel.completed_tasks)}${numeric(parallel.total_tasks)!==null?` of ${number(parallel.total_tasks)}`:''} tasks completed${numeric(parallel.failed_tasks)!==null?` (${number(parallel.failed_tasks)} failed)`:''}`:numeric(parallel?.failed_tasks)!==null?`${number(parallel.failed_tasks)} tasks failed`:null].filter(Boolean).join(' · ');
-  const capacity=tuning?.capacity,resourceLimits=processMode?[numeric(capacity?.physical_cpus)!==null?`Physical cores available: ${number(capacity.physical_cpus)}; up to one candidate process per core.`:null,numeric(capacity?.cpu_budget)!==null?capacity?.cpu_target_percent===100?`CPU eligibility: ${number(capacity.cpu_budget)} logical CPUs (100% allocation target, not a utilization guarantee).`:`Global CPU budget: ${number(capacity.cpu_budget)} logical CPUs shared by research and candidate coordinators and analytics threads.`:null,numeric(capacity?.threads_per_process)!==null?`Up to ${number(capacity.threads_per_process)} analytics threads per candidate process.`:null,numeric(capacity?.allocated_cpu_threads)!==null?`${number(capacity.allocated_cpu_threads)} planned coordinator and analytics threads share the eligible CPUs; thread counts are not core counts.`:null,numeric(capacity?.process_heap_mib)!==null?`Portfolio worker heap allowance: ${number(capacity.process_heap_mib)} MiB.`:null,numeric(capacity?.analytics_worker_heap_mib)!==null?`Analytics thread heap allowance: ${number(capacity.analytics_worker_heap_mib)} MiB.`:null,numeric(capacity?.process_relay_memory_mib)!==null?`Process relay memory reserve: ${number(capacity.process_relay_memory_mib)} MiB.`:null].filter(Boolean):[];
-  if(processMode){
-    const available=numeric(parallel?.available_memory_mib),reserve=numeric(parallel?.memory_reserve_mib??(capacity?.memory_policy==='pause_starts'?capacity.memory_reserve_mib:null));
-    if(available!==null&&available>=0)resourceLimits.push(`Free RAM reported: ${number(available)} MiB.`);
-    if(reserve!==null&&reserve>=0)resourceLimits.push(`Free RAM reserve: ${number(reserve)} MiB. Startup copies need additional memory.`);
-    const startupMemory=numeric(parallel?.startup_memory_mib??capacity?.startup_memory_mib);if(startupMemory!==null&&startupMemory>=0)resourceLimits.push(`Startup memory allowance per new process: ${number(startupMemory)} MiB.`);
-    if(numeric(parallel?.initializing_processes)!==null&&numeric(parallel?.max_initializing)!==null)resourceLimits.push(`Initializing processes: ${number(parallel.initializing_processes)} / ${number(parallel.max_initializing)} initialization limit.`);
-  }
-  $('tuning-resource-budget').hidden=!active||!resourceLimits.length;$('tuning-resource-details').textContent=resourceLimits.join(' ');
-  renderTuningActiveSets(activeSets);
-  renderResearchAffinity('tuning-affinity',tuning?.capacity,parallel,active);
-  setResearchMarkup('tuning-live-sets',active?tuningSetTable(liveTrials,{},true):'');
-  const finalTestSource=active?tuning:optimization,finalTestWaiting=!!finalTestSource&&(finalTestSource.final_test_allowed===false||!!finalTestSource.final_test_block||finalTestSource.status==='waiting_for_fresh_data');
-  $('tuning-final-test-wait').hidden=!finalTestWaiting;
-  const finalBlock=finalTestSource?.final_test_block||{},finalRanges=finalBlock.ranges||finalTestSource?.ranges||{};
-  $('tuning-final-test-reason').textContent=finalBlock.reason||(finalTestSource?.status==='waiting_for_fresh_data'?finalTestSource.reason:null)||'Final testing requires a fresh, unused date window.';
-  const blockedIntervals=Array.isArray(finalBlock.blocked_intervals)?finalBlock.blocked_intervals:Object.entries(finalBlock.consumed_test_dates||finalTestSource?.consumed_test_dates||{}).map(([interval,reserved_through])=>({interval,reserved_through,test_from:finalRanges[interval]?.test?.from,test_to:finalRanges[interval]?.test?.to}));
-  $('tuning-final-test-dates').innerHTML=blockedIntervals.map(item=>`<div><dt>${escape(({day:'Swing','5minute':'Intraday'})[item.interval]||item.interval||'Interval not reported')}</dt><dd>${item.reserved_through?`<span>Reserved through: ${escape(dateLabel(item.reserved_through))}</span>`:''}${item.test_from||item.test_to?`<span>This run's final-test dates: ${escape(item.test_from?dateLabel(item.test_from):'Not reported')} – ${escape(item.test_to?dateLabel(item.test_to):'Not reported')}</span>`:''}</dd></div>`).join('');
-  if(!optimization)return;
-  $('tuning-report-note').textContent=['running','collecting'].includes(research.status)?'Previous completed tuning result is shown below while the new research run is in progress.':'The historical verdict and the settings application are reported separately.';
-  if(numeric(optimization.failed_trials)>0)$('tuning-report-note').textContent+=` ${number(optimization.failed_trials)} candidate calculation error${optimization.failed_trials===1?'':'s'} recorded; other completed results remain available.`;
-  $('tuning-verdict').textContent=verdicts[optimization.status]||String(optimization.status||'Result unavailable').replaceAll('_',' ');
-  $('tuning-reason').textContent=optimization.reason||'No verdict explanation was reported.';
-  const application=optimization.application||{};
-  observeTuningApplication(application).catch(showConfigError);
-  $('tuning-application').textContent=({applied:'Settings applied',not_applied:'Settings not applied',stale:'Candidate no longer current',disabled:'Automatic application disabled',waiting:'Waiting to apply settings'})[application.status]||'Application not reported';
-  $('tuning-application').className=application.status==='applied'?'positive':'';
-  $('tuning-application-reason').textContent=application.reason||'Historical acceptance alone does not confirm a settings change.';
-  $('tuning-application-origin').textContent=[application.parameter_set_id,application.source==='manual'?'Manual selection':application.source==='automatic'?'Automatic selection':null].filter(Boolean).join(' · ');
-  $('tuning-applied-at').textContent=application.applied_at?`Applied ${dateLabel(application.applied_at)} · ${clock(application.applied_at)} IST`:'';
-  const trials=Array.isArray(optimization.trials)?optimization.trials:[],applicationTrial=trials.find((item,index)=>tuningSetLabel(item,index)===application.parameter_set_id);
-  const parameters=applicationTrial?tuningEffectiveParameters(applicationTrial,optimization.incumbent_parameters):optimization.parameters||{},incumbent=optimization.incumbent_parameters||{},changes=Array.isArray(application.changes)?application.changes:[],keys=[...new Set([...Object.keys(parameters),...changes.map(change=>change.key)])];
-  $('tuning-set-selection').hidden=!trials.length&&!finalTestWaiting&&optimization.status!=='waiting_for_fresh_data';setResearchMarkup('tuning-sets',tuningSetTable(trials,optimization));$('tuning-selection-help').hidden=!trials.length;
-  $('tuning-selection-note').textContent=!trials.length?(active?'No parameter results were saved for the previous run. The new analysis is in progress.':'No parameter results were saved for this run. Run analysis again to generate training and validation evidence.'):optimization.report_id?'Manual selection applies the full saved set in the current execution mode, independently of the automatic-application switch.':'This older report has no selection identifier. Run analysis again before applying a set.';
-  $('tuning-apply-error').textContent=tuningApplyErrorReportId===optimization.report_id?tuningApplyError:'';
-  $('tuning-parameters-panel').hidden=!keys.length;
-  $('tuning-parameters').innerHTML=keys.map(key=>{const change=changes.find(item=>item.key===key),before=change?.before??(application.status==='applied'?'Not reported':incumbent[key]),candidate=parameters[key]??change?.after,applied=application.status==='applied'?(change?.after??(applicationTrial?parameters[key]:null)??'Not reported'):'Not applied';return `<tr><td>${escape(tuningParameterName(key))}</td><td>${escape(before??'Not reported')}</td><td>${escape(candidate??'Not reported')}</td><td>${escape(applied)}</td></tr>`;}).join('');
-  $('tuning-ranges').innerHTML=Object.entries(optimization.ranges||{}).flatMap(([interval,ranges])=>['train','validation','test'].filter(stage=>ranges?.[stage]).map(stage=>`<div><dt>${escape(({day:'Swing','5minute':'Intraday'})[interval]||interval)} · ${({train:'Training dates',validation:'Validation dates',test:'Final-test dates'})[stage]}</dt><dd>${escape(dateLabel(ranges[stage].from))} – ${escape(dateLabel(ranges[stage].to))}</dd></div>`)).join('');
-  const limits=optimization.limits||{};
-  $('tuning-limits').textContent=[numeric(limits.max_candidates)!==null?`Set limit: ${number(limits.max_candidates)}`:null,numeric(limits.max_runtime_ms)!==null?`Time budget: ${decimal(limits.max_runtime_ms/1000,0)} seconds`:null,numeric(optimization.elapsed_ms)!==null?`Elapsed: ${decimal(optimization.elapsed_ms/1000,1)} seconds`:null,optimization.holdout_consumed===true?'Final-test dates consumed; overlapping dates cannot be reused for automatic application.':null].filter(Boolean).join(' · ');
-  $('tuning-trials-panel').hidden=!trials.length;$('tuning-trials-title').textContent=`Trial evidence (${number(trials.length)})`;
-  $('tuning-trials').innerHTML=trials.flatMap((item,index)=>{
-    const intervals=[...new Set(['train','validation','test'].flatMap(stage=>Object.keys(item[stage]||{})))];
-    const trialParameters=tuningEffectiveParameters(item,incumbent);
-    return (intervals.length?intervals:[null]).map(interval=>`<tr><td><strong>${escape(tuningSetLabel(item,index))}${item.id===optimization.selected_id?' · finalist':''}</strong><details><summary>All four parameters</summary><dl>${Object.entries(trialParameters).map(([key,value])=>`<div><dt>${escape(tuningParameterName(key))}</dt><dd>${escape(value??'Not reported')}</dd></div>`).join('')}</dl></details></td><td>${escape(({day:'Swing · daily', '5minute':'Intraday · 5-minute'})[interval]||interval||'Not reported')}</td>${['train','validation','test'].map(stage=>`<td>${tuningMetricCell(item[stage]?.[interval])}</td>`).join('')}<td>${tuningTrialBadge(item)}<small>${escape(tuningTrialExplanation(item,trials))}</small></td></tr>`);
-  }).join('');
+  setResearchMarkup(`${id}-workers`,workers.map(worker=>{const affinity=worker.affinity||{},verified=affinity.status==='pinned'&&affinity.verified===true,retired=['retiring','stopped'].includes(worker.state),workerState=({starting:'Starting',ready:'Ready',busy:'Busy',retiring:'Retiring',stopped:'Stopped'})[worker.state]||'Not reported',identity=worker.worker_id??'Not reported';return `<tr><th scope="row">${escape(identity)}</th><td>${escape(workerState)}</td><td><span class="badge ${verified&&!retired?'green':affinity.status==='failed'?'red':'amber'}">${escape(retired&&verified?'Previously verified pinned':affinityStatus(affinity))}</span>${affinity.reason?`<small>${escape(affinity.reason)}</small>`:''}</td><td>${escape(affinityLocation(affinity))}${affinity.cpu!==null&&affinity.cpu!==undefined&&!verified?'<small>Reported assignment; pin not verified</small>':''}</td><td>${escape(affinity.core??'Not reported')}</td></tr>`;}).join(''));
 }
 function researchCurrentTask(research){
-  const task=research.current_task,phase=research.tuning?.phase,message=research.tuning?.message||research.message||'';
-  const phaseTitle=({tuning_train:'Training parameter sets',train:'Training parameter sets',training:'Training parameter sets',tuning_validation:'Validating parameter sets',validation:'Validating parameter sets',tuning_test:'Final-testing parameter sets',test:'Final-testing parameter sets',final_test:'Final-testing parameter sets',preparing:'Preparing parameter evaluations'})[phase];
-  const usefulMessage=message&&!/^(?:Historical analysis|Historical research|Research) is in progress\.?$/i.test(message);
-  const title=task?.title||phaseTitle||(usefulMessage?message:research.status==='collecting'?'Collecting historical candles':'Research in progress');
-  const reportedSets=research.tuning?.parallelism?.active_sets,active=Array.isArray(reportedSets)?reportedSets:[],sets=active.slice(0,4).map(item=>item.parameter_set_id).filter(Boolean);
-  const detail=task?.detail||(message!==title&&usefulMessage?message:sets.length?`Active sets: ${sets.join(', ')}${active.length>sets.length?` and ${number(active.length-sets.length)} more`:''}.`:'Waiting for the next task update.');
-  return {title,detail};
+  if(research.current_task?.title)return research.current_task;
+  return {title:research.status==='collecting'?'Collecting historical candles':'Comparing baseline and enhanced rules',detail:research.message||'Historical comparison is running.'};
 }
 function renderResearchComparison(research){
-  const comparison=research.comparison,active=research.status==='running'&&!!comparison&&!research.tuning?.phase&&['validating','baseline','enhanced'].includes(comparison.phase);
+  const comparison=research.comparison,active=research.status==='running'&&!!comparison&&['validating','baseline','enhanced'].includes(comparison.phase);
   $('research-comparison').hidden=!active;
   renderResearchAffinity('comparison-affinity',comparison?.capacity,comparison?.parallelism,active);
   $('research-comparison-title').textContent=({validating:'Preparing comparison workers',baseline:'Baseline comparison workers',enhanced:'Enhanced comparison workers'})[comparison?.phase]||'Comparison workers';
@@ -511,9 +363,8 @@ function renderResearchStatus(){
   $('research-start').disabled=researchBusy||running||retry.waiting||!state.connected;
   $('research-start').textContent=researchBusy?'Please wait…':retry.waiting?'Waiting for retry':research.report||research.result?'Run again':'Run analysis';
   const pendingRetry=['failed','cancelled'].includes(status)&&automation?.enabled&&['ready','waiting','retry_wait'].includes(automation.status);
-  const pendingApplication=(research.report||research.result)?.optimization?.application?.status==='waiting'||research.tuning?.application?.status==='waiting';
-  $('research-cancel').disabled=researchBusy||!(running||pendingRetry||pendingApplication);
-  $('research-cancel').textContent=pendingApplication&&!running?'Cancel queued change':'Cancel research';
+  $('research-cancel').disabled=researchBusy||!(running||pendingRetry);
+  $('research-cancel').textContent='Cancel research';
   $('research-refresh').disabled=researchBusy||!!researchLoading;
   $('research-failure').hidden=!failure;
   $('research-failure-title').textContent=({rate_limit:'Zerodha request limit reached',authentication:'Zerodha connection needs renewal',permission:'Historical data access denied',network:'Broker connection unavailable',data_coverage:'Usable history is missing',worker:'Historical simulation could not finish',worker_timeout:'Historical simulation timed out',cpu_affinity:'Research CPU assignment failed',error:'Research could not complete'})[failure?.code]||'Research could not complete';
@@ -528,22 +379,23 @@ function renderResearchStatus(){
   const issues=Array.isArray(research.issues)?research.issues:[];
   $('research-issues').hidden=!issues.length;$('research-issues-title').textContent=`Collection issues (${number(issues.length)})`;
   $('research-issues-list').innerHTML=issues.map(issue=>`<li>${escape(researchIssueText(issue))}</li>`).join('');
-  renderResearchTuning();
   renderResearchSettings();
 }
-function researchSettingsLocked(){return ['running','collecting'].includes(researchState?.status)||(researchState?.report||researchState?.result)?.optimization?.application?.status==='waiting'||researchState?.tuning?.application?.status==='waiting'||state.maintenance||state.restart_required||configRestartRequired;}
+function researchSettingsLocked(){return ['running','collecting'].includes(researchState?.status)||state.maintenance||state.restart_required||configRestartRequired;}
 function renderResearchSettings(){
   const disabled=!researchSettingsLoaded||researchSettingsBusy||researchBusy||researchSettingsLocked();
-  $('research-sample-size').disabled=disabled;$('research-set-count').disabled=disabled;$('research-cpu-affinity').disabled=disabled;$('research-settings-save').disabled=disabled;
+  $('research-all-symbols').disabled=disabled;$('research-sample-size').disabled=disabled||$('research-all-symbols').checked;$('research-cpu-affinity').disabled=disabled;$('research-settings-save').disabled=disabled;
+  const scope=researchState?.universe;
+  $('research-universe-message').textContent=scope?.status==='fresh'?`Nifty Total Market: ${number(scope.constituent_count)} constituents; ${number(scope.eligible_count)} match eligible broker instruments. ${scope.mode==='all'?'All eligible constituents selected.':`${number(scope.selected_count)} stocks selected across industries.`}`:scope?.message||'Nifty Total Market only. Connect Zerodha to verify the current constituent list.';
   $('research-settings-save').textContent=researchSettingsBusy?'Saving…':'Save research settings';
-  if(researchSettingsLocked())$('research-settings-status').textContent='Wait for active research to finish, cancel any queued parameter change, and resolve a required restart before changing this scope.';
+  if(researchSettingsLocked())$('research-settings-status').textContent='Wait for active research to finish or cancel it, and apply any required restart before changing this scope.';
   else if(researchSettingsDirty)$('research-settings-status').textContent='Unsaved research settings. Save to use them on the next manual or automatic research run.';
   else if($('research-settings-status').textContent.startsWith('Wait for active research'))$('research-settings-status').textContent='Saved scope applies to the next manual or automatic research run.';
 }
 function acceptResearchSettings(values){
-  if(!Number.isInteger(values?.research_symbols)||!Number.isInteger(values?.research_tuning_trials))return;
+  if(!Number.isInteger(values?.research_symbols))return;
   researchSettingsLoaded=true;
-  if(!researchSettingsDirty){$('research-sample-size').value=String(values.research_symbols);$('research-set-count').value=String(values.research_tuning_trials);$('research-cpu-affinity').value=values.research_cpu_affinity||'pinned';$('research-settings-status').textContent='Saved scope applies to the next manual or automatic research run. Save does not start a run immediately.';}
+  if(!researchSettingsDirty){$('research-all-symbols').checked=values.research_symbols===0;$('research-sample-size').value=String(values.research_symbols||20);$('research-cpu-affinity').value=values.research_cpu_affinity||'pinned';$('research-settings-status').textContent='Saved scope applies to the next manual or automatic research run. Save does not start a run immediately.';}
   renderResearchSettings();
 }
 async function loadResearchSettings(force=false){
@@ -552,18 +404,18 @@ async function loadResearchSettings(force=false){
   researchSettingsLoading=(async()=>{try{const data=await api('/api/config');acceptResearchSettings(data.values);$('research-settings-error').textContent=researchSettingsLoaded?'':'Saved research settings were not reported.';}catch(error){$('research-settings-error').textContent=error.message;throw error;}finally{researchSettingsLoading=null;renderResearchSettings();}})();
   return researchSettingsLoading;
 }
+$('research-all-symbols').addEventListener('change',()=>{researchSettingsDirty=true;renderResearchSettings();});
 $('research-settings-form').addEventListener('input',()=>{researchSettingsDirty=true;renderResearchSettings();});
 $('research-settings-form').addEventListener('submit',async event=>{
   event.preventDefault();if(researchSettingsBusy||researchBusy||!researchSettingsLoaded||researchSettingsLocked()||!csrf||!liveAllowed)return;
-  const values={research_symbols:Number($('research-sample-size').value),research_tuning_trials:Number($('research-set-count').value),research_cpu_affinity:$('research-cpu-affinity').value};
-  if(!Number.isInteger(values.research_symbols)||values.research_symbols<1||values.research_symbols>150||!Number.isInteger(values.research_tuning_trials)||values.research_tuning_trials<3||values.research_tuning_trials>100){$('research-settings-error').textContent='Choose 1–150 stocks and 3–100 parameter sets, using whole numbers.';return;}
+  const values={research_symbols:$('research-all-symbols').checked?0:Number($('research-sample-size').value),research_cpu_affinity:$('research-cpu-affinity').value};
+  if(!Number.isInteger(values.research_symbols)||values.research_symbols<0||(!$('research-all-symbols').checked&&values.research_symbols===0)||values.research_symbols>1000){$('research-settings-error').textContent='Choose a whole-number stock count from 1 to 1000, or select All constituents.';return;}
   if(!['pinned','automatic'].includes(values.research_cpu_affinity)){$('research-settings-error').textContent='Choose Pin workers to CPUs or Automatic scheduling.';return;}
   researchSettingsBusy=true;researchBusy=true;$('research-settings-error').textContent='';renderResearchStatus();
   try{
     if(researchLoading)await researchLoading.catch(()=>{});
     if(researchSettingsLocked())return;
     const result=await api('/api/research/settings','PUT',values);researchSettingsDirty=false;acceptResearchSettings(result.settings);
-    const optimization=(researchState?.report||researchState?.result)?.optimization;for(const trial of optimization?.trials||[])Object.assign(trial,{application_eligible:false,application_reason:'Research settings changed. Refresh status before selecting a saved set.'});
     if(configDirty)$('config-message').textContent='Research scope changed. Your unsaved Settings form is unchanged; review its research values before saving.';
     else if(configLoaded){configLoaded=false;loadConfig(true).catch(showConfigError);}
     await loadResearch().catch(()=>{});$('research-settings-status').textContent='Research settings saved for the next manual or automatic run. Select Run analysis to request it now.';
@@ -594,7 +446,7 @@ function renderResearchReport(){
   const points=value=>numeric(value)===null?'—':`${decimal(value)}%`;
   $('research-splits').innerHTML=splits.map(row=>`<tr><td>${escape(row.name)}</td><td>${escape(dateLabel(row.from))} – ${escape(dateLabel(row.to))}</td><td>${row.label}</td><td>${decimal(row.values.trade_count,0)}</td><td>${points(row.values.net_return_pct)}</td><td>${points(row.values.max_drawdown_pct)}</td><td>${points(row.values.win_rate_pct)}</td></tr>`).join('')||empty(7,'No separate chronological periods were included in this report.');
   const dataset=report.dataset||{},metadata=report.metadata||{},range=`${dateLabel(dataset.from)} – ${dateLabel(dataset.to)}`;
-  $('research-scope').innerHTML=[['Candle interval',dataset.interval??'—'],['Instruments',decimal(dataset.symbol_count,0)],['Candles',decimal(dataset.bar_count,0)],['Actual candle range',range],...(dataset.requested_from||dataset.requested_to?[['Requested range',`${dateLabel(dataset.requested_from)} – ${dateLabel(dataset.requested_to)}`]]:[]),...(numeric(dataset.session_count)!==null?[['Sessions',decimal(dataset.session_count,0)]]:[]),...(numeric(dataset.excluded_intraday_symbol_sessions)!==null?[['Excluded incomplete symbol-sessions',decimal(dataset.excluded_intraday_symbol_sessions,0)]]:[]),...(metadata.scope||dataset.strategy?[['Strategy scope',metadata.scope||dataset.strategy]]:[]),...(dataset.source||metadata.source?[['Source',dataset.source||metadata.source]]:[])].map(([label,value])=>`<div><dt>${escape(label)}</dt><dd>${escape(value)}</dd></div>`).join('');
+  $('research-scope').innerHTML=[...(metadata.universe?[["Stock universe",metadata.universe.name],["Index constituents",number(metadata.universe.constituent_count)],["Selection",metadata.universe.mode==='all'?'All eligible constituents':'Diversified sample'],["Membership observed",dateLabel(metadata.universe.observed_at)]]:[]),['Candle interval',dataset.interval??'—'],['Instruments',decimal(dataset.symbol_count,0)],['Candles',decimal(dataset.bar_count,0)],['Actual candle range',range],...(dataset.requested_from||dataset.requested_to?[['Requested range',`${dateLabel(dataset.requested_from)} – ${dateLabel(dataset.requested_to)}`]]:[]),...(numeric(dataset.session_count)!==null?[['Sessions',decimal(dataset.session_count,0)]]:[]),...(numeric(dataset.excluded_intraday_symbol_sessions)!==null?[['Excluded incomplete symbol-sessions',decimal(dataset.excluded_intraday_symbol_sessions,0)]]:[]),...(metadata.scope||dataset.strategy?[['Strategy scope',metadata.scope||dataset.strategy]]:[]),...(dataset.source||metadata.source?[['Source',dataset.source||metadata.source]]:[])].map(([label,value])=>`<div><dt>${escape(label)}</dt><dd>${escape(value)}</dd></div>`).join('');
   const symbols=dataset.symbols||dataset.instruments||[];
   $('research-symbols').innerHTML=symbols.length?symbols.map(item=>`<span class="badge">${escape(typeof item==='string'?item:item.symbol||item.tradingsymbol||'Unnamed instrument')}</span>`).join(''):'<p class="muted">The report does not list individual instruments.</p>';
   const diversification=metadata.diversification;
@@ -605,7 +457,7 @@ function renderResearchReport(){
     const classified=included.filter(item=>item.industry&&item.classification_status==='fresh'),industries=new Map();
     for(const item of classified){const group=industries.get(item.industry)||[];group.push(item.symbol);industries.set(item.industry,group);}
     const known=new Set(classified.map(item=>item.symbol)),unclassified=[...actual].filter(symbol=>!known.has(symbol));
-    $('research-diversification-status').textContent=({diversified:'Industry sample selected',limited:'Limited industry coverage',unclassified:'Classification unavailable'})[diversification.status]||'Coverage reported';
+    $('research-diversification-status').textContent=({diversified:metadata.universe?.mode==='all'?'All eligible stocks selected':'Industry sample selected',limited:'Limited industry coverage',unclassified:'Classification unavailable'})[diversification.status]||'Coverage reported';
     $('research-diversification-status').className=`badge ${diversification.status==='diversified'?'blue':'amber'}`;
     $('research-diversification-summary').textContent=[numeric(diversification.requested_count)!==null?`${number(diversification.requested_count)} requested`:null,numeric(diversification.selected_count)!==null?`${number(diversification.selected_count)} selected`:null,reported?`${number(actual.size)} instruments in this report across ${number(industries.size)} classified industries`:'Actual report instruments were not listed'].filter(Boolean).join(' · ');
     $('research-industries').innerHTML=[...industries].map(([industry,names])=>`<div><dt>${escape(industry)}</dt><dd>${names.map(escape).join(', ')}</dd></div>`).join('');
@@ -620,7 +472,9 @@ function renderResearchReport(){
   }
   const notes=[...new Set(assumptions.map(item=>typeof item==='string'?item:JSON.stringify(item)).filter(Boolean))];
   $('research-assumptions').innerHTML=(notes.length?notes:['No additional assumptions were supplied in this report.']).map(item=>`<li>${escape(item)}</li>`).join('');
-  const errors=[...(dataset.errors||[]),...(report.errors||[]),...(report.metadata?.issues||[])];
+  const exclusionReasons={broker_instrument_unavailable:'No matching broker instrument. Check Background → NSE security universe.',not_entry_eligible:'Excluded from new-entry research by stock eligibility checks. Check Background → NSE security universe.',index_corporate_action_placeholder:'Corporate-action placeholder excluded; this is not a tradable stock.'};
+  const exclusions=[...(metadata.universe?.excluded_symbols||[]),...(metadata.universe?.excluded_placeholders||[])].map(item=>({...item,message:exclusionReasons[item.reason]||item.reason}));
+  const errors=[...(dataset.errors||[]),...(report.errors||[]),...(report.metadata?.issues||[]),...exclusions];
   $('research-errors-panel').hidden=!errors.length;
   $('research-errors').innerHTML=errors.map(item=>`<li>${escape(typeof item==='string'?item:(!item.http_status&&!item.code?`${item.symbol||item.tradingsymbol||'Data'}: ${item.message||item.error||item.reason||JSON.stringify(item)}`:researchIssueText(item)))}</li>`).join('');
   const tradeRows=[],openRows=[],gapNotes=[];
@@ -671,19 +525,6 @@ async function researchAction(action){
 $('research-refresh').addEventListener('click',()=>{loadResearch().catch(()=>{});loadResearchSettings(true).catch(()=>{});});
 $('research-start').addEventListener('click',()=>researchAction('start'));
 $('research-cancel').addEventListener('click',()=>researchAction('cancel'));
-async function applyResearchSet(reportId,parameterSetId){
-  const eligible=()=>{const optimization=(researchState?.report||researchState?.result)?.optimization;return !!reportId&&optimization?.report_id===reportId&&optimization.trials?.some((trial,index)=>tuningSetLabel(trial,index)===parameterSetId&&trial.status!=='error'&&trial.application_eligible===true);};
-  if(researchBusy||!csrf||!liveAllowed||!state.connected||['running','collecting'].includes(researchState?.status)||!eligible())return;
-  researchBusy=true;tuningApplyError='';tuningApplyErrorReportId=reportId;stopResearchPolling();renderResearchStatus();
-  try{
-    if(researchLoading)await researchLoading.catch(()=>{});
-    if(['running','collecting'].includes(researchState?.status)||!eligible())return;
-    researchState=await api('/api/research/apply','POST',{report_id:reportId,parameter_set_id:parameterSetId});
-    renderResearchReport();await loadResearch();
-  }catch(error){tuningApplyError=error.message;}
-  finally{researchBusy=false;renderResearchStatus();scheduleResearchPolling();}
-}
-$('tuning-sets').addEventListener('click',event=>{const button=event.target.closest('[data-apply-set]');if(button&&!button.disabled)applyResearchSet(button.dataset.reportId,button.dataset.applySet);});
 function renderActivity(){
   $('clear-activity').disabled=clearingActivity;
   $('recent-activity').innerHTML=events.slice(-4).reverse().map(e=>`<div class="timeline-item"><span class="dot ${e.level==='error'?'red':e.level==='warning'?'amber':'green'}"></span><div><p>${escape(e.message)}</p></div><time>${escape(clock(e.timestamp))}</time></div>`).join('') || '<p class="empty-copy">Waiting for activity.</p>';

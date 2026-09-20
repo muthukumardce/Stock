@@ -12,7 +12,7 @@ function send(message,callback){
 process.on('message',message=>{
   if(message?.type==='cancel'){stopping=true;if(cancellation)Atomics.store(cancellation,0,1);if(!running)shutdown();return;}
   if(message?.type!=='run'||message.protocol!==1||running||!Number.isSafeInteger(message.task_id)||message.task_id<1
-    ||!Number.isInteger(message.coordinator_heap_mib)||message.coordinator_heap_mib<512||message.coordinator_heap_mib>4096){
+    ||!Number.isInteger(message.coordinator_heap_mib)||message.coordinator_heap_mib<512||message.coordinator_heap_mib>12288){
     send({type:'failed',task_id:taskId,code:'worker_protocol',error:'Invalid candidate process request.'},shutdown);return;
   }
   running=true;taskId=message.task_id;cancellation=new Int32Array(new SharedArrayBuffer(4));

@@ -9,7 +9,6 @@ import { ProcessLock, LoginLimiter, Fernet, digest_token, randomSecret, constant
 import { Mutex, isoIST, dateIST, parseTime } from './util.js';
 import { ResourceMonitor } from './resources.js';
 import { HistoricalResearch } from './historical-research.js';
-import { createResearchApplier } from './research-application.js';
 import { requestContext } from './http-context.js';
 import { settingsBlocker } from './settings-access.js';
 import { setImmediate as yieldIO } from 'node:timers/promises';
@@ -64,7 +63,6 @@ export async function createApp(options={}){
       return true;
     }
     engine.runtime_health=()=>state.resources.snapshot();
-    research.applyParameters=createResearchApplier({settings:cfg,manager,engine,store,canApply:()=>!closing&&!state.restartRequired&&!fs.existsSync(path.join(cfg.data_dir,'maintenance.lock'))});
     app.state=state;state.research=research;
     const fingerprint=digest_token(cfg.admin_username+':'+cfg.admin_password_hash,cfg.session_secret);
     if(store.get('admin_fingerprint')!==fingerprint){store.revoke_sessions();store.set('admin_fingerprint',fingerprint);}
@@ -90,7 +88,7 @@ export async function createApp(options={}){
     app.use((req,res,next)=>{if(req.body?.length){try{req.body=strictJSON(req.body);}catch{return next(failure(400,'Invalid JSON payload'));}}else req.body={};next();});
     function authenticated(req,mutation=false){const value=cookie(req),session=value?store.session(digest_token(value,cfg.session_secret)):null;if(!session)throw failure(401,'Sign in to continue');if(mutation&&!constantEqual(req.get('x-csrf-token')||'',session.csrf))throw failure(403,'Invalid session protection token');return session;}
     function ready(){if(state.restartRequired)throw failure(409,'Settings saved. Restart the server before trading.');if(fs.existsSync(path.join(cfg.data_dir,'maintenance.lock')))throw failure(409,'Server maintenance is in progress');if(!cfg.configured)throw failure(409,'Set KITE_API_KEY, KITE_API_SECRET and KITE_USER_ID in .env first');if(cfg.trading_mode==='live'&&!cfg.live_trading_enabled)throw failure(409,'Open Settings → Paper trading, turn it off, save the execution setting and restart StockPilot to enable live execution.');}
-    function snapshot(){const view=engine.snapshot(),researchView=research.summary?.()||research.status();return {...store.redact(view),settings_blocker:store.redact(settingsBlocker(view,state.restartRequired)),startup:store.redact(state.startup),background:{...store.redact(view.background||{}),research:store.redact({status:researchView.status,progress:researchView.progress,message:researchView.message,error:researchView.error,issues:researchView.issues,cooldown:researchView.cooldown,tuning:researchView.tuning,started_at:researchView.started_at,completed_at:researchView.completed_at,automation:researchView.automation})},configured:cfg.configured,resources:state.resources.snapshot(),strategy_settings:view.strategy_settings||store.get('strategy_settings'),holdings_authorization:view.mode==='live'?engine.holdings_authorization?.snapshot():null,limits:{capital:view.capital||0,risk_per_trade_pct:cfg.risk_per_trade_pct,daily_loss_pct:cfg.daily_loss_pct,max_positions:cfg.max_positions,max_position_pct:cfg.max_position_pct,entry_cutoff:cfg.entry_cutoff,exit_time:cfg.exit_time},server_time:isoIST(),maintenance:state.restartRequired||fs.existsSync(path.join(cfg.data_dir,'maintenance.lock')),restart_required:state.restartRequired};}
+    function snapshot(){const view=engine.snapshot(),researchView=research.summary?.()||research.status();return {...store.redact(view),settings_blocker:store.redact(settingsBlocker(view,state.restartRequired)),startup:store.redact(state.startup),background:{...store.redact(view.background||{}),research:store.redact({status:researchView.status,progress:researchView.progress,message:researchView.message,error:researchView.error,issues:researchView.issues,cooldown:researchView.cooldown,universe:researchView.universe,started_at:researchView.started_at,completed_at:researchView.completed_at,automation:researchView.automation})},configured:cfg.configured,resources:state.resources.snapshot(),strategy_settings:view.strategy_settings||store.get('strategy_settings'),holdings_authorization:view.mode==='live'?engine.holdings_authorization?.snapshot():null,limits:{capital:view.capital||0,risk_per_trade_pct:cfg.risk_per_trade_pct,daily_loss_pct:cfg.daily_loss_pct,max_positions:cfg.max_positions,max_position_pct:cfg.max_position_pct,entry_cutoff:cfg.entry_cutoff,exit_time:cfg.exit_time},server_time:isoIST(),maintenance:state.restartRequired||fs.existsSync(path.join(cfg.data_dir,'maintenance.lock')),restart_required:state.restartRequired};}
     app.get('/health',(_req,res)=>res.json({status:'ok',safe_to_stop:engine.snapshot().safe_to_stop===true}));
     app.get('/api/readiness',(req,res)=>{authenticated(req);res.json({configured:cfg.configured,restart_required:state.restartRequired,...engine.readiness?.()});});
     app.get(['/','/settings'],(req,res)=>{try{authenticated(req);}catch{return res.redirect(303,'/login');}res.sendFile(path.join(STATIC,'index.html'));});
@@ -174,23 +172,18 @@ export async function createApp(options={}){
       authenticated(req,true);if(!plainObject(req.body)||Object.keys(req.body).length)throw failure(422,'No inputs are needed to cancel research');
       const result=await state.control.run(()=>{authenticated(req,true);return research.cancel();});res.json(store.redact(result));
     });
-    app.post('/api/research/apply',async(req,res)=>{
-      authenticated(req,true);
-      if(!plainObject(req.body)||Object.keys(req.body).length!==2||Object.keys(req.body).some(key=>!['report_id','parameter_set_id'].includes(key))||typeof req.body.report_id!=='string'||!/^[0-9a-f-]{36}$/i.test(req.body.report_id)||typeof req.body.parameter_set_id!=='string'||!/^P(?:[1-9]|[1-9][0-9]|100)$/.test(req.body.parameter_set_id))throw failure(422,'Choose a parameter set from the current research report; custom parameter values are not accepted here');
-      const result=await state.control.run(()=>{authenticated(req,true);if(state.restartRequired)throw failure(409,'Restart after the saved Settings change');return research.selectParameterSet(req.body.report_id,req.body.parameter_set_id);});res.json(store.redact(result));
-    });
     app.put('/api/research/settings',async(req,res)=>{
       authenticated(req,true);
-      const numericKeys=['research_symbols','research_tuning_trials'],keys=[...numericKeys,'research_cpu_affinity'];
-      if(!plainObject(req.body)||Object.keys(req.body).some(key=>!keys.includes(key))||numericKeys.some(key=>!Number.isInteger(req.body[key]))||Object.hasOwn(req.body,'research_cpu_affinity')&&!['pinned','automatic'].includes(req.body.research_cpu_affinity))throw failure(422,'Provide research stock count, parameter set count, and an optional CPU scheduling choice');
+      const numericKeys=['research_symbols'],keys=[...numericKeys,'research_cpu_affinity'];
+      if(!plainObject(req.body)||Object.keys(req.body).some(key=>!keys.includes(key))||numericKeys.some(key=>!Number.isInteger(req.body[key]))||Object.hasOwn(req.body,'research_cpu_affinity')&&!['pinned','automatic'].includes(req.body.research_cpu_affinity))throw failure(422,'Provide the research stock count (0 for all constituents) and an optional CPU scheduling choice');
       if(!manager)throw failure(409,'Settings storage is unavailable');
       const values=Object.fromEntries(keys.filter(key=>Object.hasOwn(req.body,key)).map(key=>[key,req.body[key]]));
       await state.control.run(()=>{
         authenticated(req,true);
         if(closing||state.restartRequired||fs.existsSync(path.join(cfg.data_dir,'maintenance.lock')))throw failure(409,'Wait for maintenance or restart before changing research settings');
-        if(['collecting','running'].includes(research.status().status)||research.applying||store.get('research_pending_tuning'))throw failure(409,'Wait for research and any pending parameter application to finish, or cancel them first');
+        if(['collecting','running'].includes(research.status().status))throw failure(409,'Wait for active research to finish, or cancel it first');
         manager.candidate(values);manager.save(values);Object.assign(cfg,values);
-        store.event('research.settings_changed','Research sample size, candidate count and CPU scheduling saved for the next manual or automatic run.',values);
+        store.event('research.settings_changed','Research stock count and CPU scheduling saved for the next manual or automatic run.',values);
       });
       res.json({ok:true,settings:values});
     });

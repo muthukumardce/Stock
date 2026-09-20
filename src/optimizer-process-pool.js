@@ -23,7 +23,7 @@ export class OptimizerProcessPool{
     memoryReserveMiB,startupMemoryMiB=workerHeapMiB,freeMemory=freemem,maxInitializing=4}={}){
     if(!integer(workerLimit,1,100)||!integer(threadsPerProcess,1,100)||workerLimit*threadsPerProcess>400)throw new RangeError('Candidate processes and analytics threads exceed their bounded capacity');
     this.context=context;this.workerLimit=workerLimit;this.threadsPerProcess=threadsPerProcess;
-    this.workerHeapMiB=Math.max(512,Math.min(4096,Number.isInteger(workerHeapMiB)?workerHeapMiB:512));
+    this.workerHeapMiB=Math.max(512,Math.min(12288,Number.isInteger(workerHeapMiB)?workerHeapMiB:512));
     this.analyticsWorkerHeapMiB=Math.max(64,Math.min(512,Number.isInteger(analyticsWorkerHeapMiB)?analyticsWorkerHeapMiB:128));
     this.affinityPlan=affinityPlan;this.guard=guard;this.onWorkerEvent=onWorkerEvent;this.forkFactory=forkFactory;
     this.scheduleStartup=scheduleStartup;this.cancelStartup=cancelStartup;this.setTimer=setTimer;this.clearTimer=clearTimer;this.now=now;

@@ -30,6 +30,30 @@ function fixture(handler = () => success({})) {
   return {broker, requests};
 }
 
+test('fractional and invalid share quantities never reach broker order or GTT endpoints', async () => {
+  const {broker, requests} = fixture(() => success({order_id:'whole-share-order',trigger_id:1}));
+  for (const quantity of [0.5, 2.75, 0, -1, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '2', null, undefined]) {
+    const operations = [
+      () => broker.buy_cover('INFY', quantity, 100, 98, 'whole-shares'),
+      () => broker.sell_cover('INFY', quantity, 100, 102, 'whole-shares'),
+      () => broker.call('place_order', {variety:'regular',transaction_type:'BUY',quantity}),
+      () => broker.call('modify_order', {variety:'regular',order_id:'existing',quantity}),
+      ...['place_gtt','modify_gtt'].map(method => () => broker.call(method, {trigger_id:1,orders:[{quantity:1},{quantity}]})),
+    ];
+    for (const operation of operations) await assert.rejects(operation(), error => {
+      assert.equal(error.definitive_rejection,true);
+      assert.equal(error.local_rejection,true);assert.equal(error.http_status,null,'A local rejection must not invent a broker HTTP response');
+      assert.equal(orderRejectionReason(error).code,'invalid_quantity');
+      return true;
+    });
+  }
+  assert.equal(requests.length,0);
+  assert.equal(await broker.buy_cover('INFY',2,100,98,'whole-shares'),'whole-share-order');
+  assert.equal(new URLSearchParams(requests[0].options.body).get('quantity'),'2');
+  await broker.call('modify_order',{variety:'regular',order_id:'existing',price:101});
+  assert.equal(requests.length,2,'A price-only modification preserves the existing quantity');
+});
+
 test('REST requests are serialized with independent quote rate limiting', async () => {
   const {broker, requests} = fixture();
   await Promise.all([broker.call('quote', ['NSE:INFY']), broker.call('holdings'), broker.call('quote', ['NSE:TCS']), broker.call('orders')]);
@@ -123,7 +147,7 @@ test('repeated throttling backs off within bounds and only successful calls rese
 
 test('rate limited order mutations are never replayed and malformed acknowledgements stay ambiguous', async () => {
   const f=rateFixture(()=>limitedResponse({retryAfter:'60',nonJSON:true}));
-  await assert.rejects(f.broker.call('place_order',{variety:'regular',tradingsymbol:'INFY'}),error=>error.http_status===429&&error.rate_limit_category==='orders'&&!error.definitive_rejection);
+  await assert.rejects(f.broker.call('place_order',{variety:'regular',tradingsymbol:'INFY',quantity:1}),error=>error.http_status===429&&error.rate_limit_category==='orders'&&!error.definitive_rejection);
   await assert.rejects(f.broker.call('modify_order',{variety:'regular',order_id:'existing',price:100}),error=>error.http_status===429);
   assert.equal(f.requests.length,1);assert.equal(f.requests[0].options.method,'POST');
   f.advance(60);assert.equal(f.requests.length,1,'Cooldown expiration must not automatically replay a mutation');
@@ -347,7 +371,7 @@ test('holdings authorisation network failure is not automatically retried', asyn
 
 test('ambiguous mutations are not retried and errors redact credentials and URLs', async () => {
   const {broker, requests} = fixture(() => { throw new Error('Lost response private-key private-token https://api.kite.trade?access_token=private-token'); });
-  await assert.rejects(broker.call('place_order', {variety: 'regular', tradingsymbol: 'INFY'}), error => {
+  await assert.rejects(broker.call('place_order', {variety: 'regular', tradingsymbol: 'INFY', quantity: 1}), error => {
     assert.equal(error.kind, 'Error');
     assert(!error.detail.includes('private-key'));
     assert(!error.detail.includes('private-token'));
@@ -413,7 +437,7 @@ test('verified Kite HTTP 428 rejection retains authorization metadata through re
   const {broker, requests} = fixture(() => ({ok: false, status: 428, json: async () => ({
     status: 'error', error_type: 'InputException', message: 'Holdings require authorisation private-token', data: null,
   })}));
-  await assert.rejects(broker.call('place_order', {variety: 'regular', tradingsymbol: 'INFY'}), error => {
+  await assert.rejects(broker.call('place_order', {variety: 'regular', tradingsymbol: 'INFY', quantity: 1}), error => {
     assert.equal(error.kind, 'InputException');
     assert.equal(error.http_status, 428);
     assert.equal(error.auth_required, true);
@@ -433,7 +457,7 @@ test('HTTP 428 is not definitive authorization rejection with malformed data or 
   ];
   for (const body of cases) {
     const {broker, requests} = fixture(() => ({ok: false, status: 428, json: async () => body}));
-    await assert.rejects(broker.call('place_order', {variety: 'regular'}), error => {
+    await assert.rejects(broker.call('place_order', {variety: 'regular', quantity: 1}), error => {
       assert.equal(error.http_status, 428);
       assert.equal(error.auth_required, false);
       return true;
@@ -444,13 +468,13 @@ test('HTTP 428 is not definitive authorization rejection with malformed data or 
 
 test('parse failures and network failures do not acquire definitive authorization metadata', async () => {
   const malformed = fixture(() => ({ok: false, status: 428, json: async () => { throw new SyntaxError('Invalid JSON'); }}));
-  await assert.rejects(malformed.broker.call('place_order', {variety: 'regular'}), error => {
+  await assert.rejects(malformed.broker.call('place_order', {variety: 'regular', quantity: 1}), error => {
     assert.equal(error.http_status, 428);
     assert.equal(error.auth_required, false);
     return true;
   });
   const disconnected = fixture(() => { throw Object.assign(new Error('Connection lost'), {http_status: 428, auth_required: true}); });
-  await assert.rejects(disconnected.broker.call('place_order', {variety: 'regular'}), error => {
+  await assert.rejects(disconnected.broker.call('place_order', {variety: 'regular', quantity: 1}), error => {
     assert.equal(error.http_status, null);
     assert.equal(error.auth_required, false);
     assert.equal(error.definitive_rejection, false);

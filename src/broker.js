@@ -20,16 +20,17 @@ export function jsonable(value) {
 }
 
 export class BrokerError extends Error {
-  constructor(kind, detail = '', {http_status = null, auth_required = false, definitive_rejection = false,
+  constructor(kind, detail = '', {http_status = null, auth_required = false, definitive_rejection = false, local_rejection = false,
     rate_limit_category = null, retry_after_seconds = null, retry_at = null} = {}) {
-    super(http_status === 429 ? 'Zerodha API rate limit reached. Requests of this type are temporarily paused.' :
+    super(local_rejection ? detail : http_status === 429 ? 'Zerodha API rate limit reached. Requests of this type are temporarily paused.' :
       `Zerodha request failed (${kind}). Check account activity and reconnect if needed.`);
     this.name = 'BrokerError';
     this.kind = kind;
     this.detail = detail;
     this.http_status = Number.isInteger(http_status) && http_status >= 100 && http_status <= 599 ? http_status : null;
     this.auth_required = this.http_status === 428 && auth_required === true;
-    this.definitive_rejection = definitive_rejection === true && REJECTION_STATUSES.has(this.http_status) && REJECTION_KINDS.has(kind);
+    this.local_rejection = local_rejection === true && kind === 'InputException';
+    this.definitive_rejection = definitive_rejection === true && (this.local_rejection || REJECTION_STATUSES.has(this.http_status) && REJECTION_KINDS.has(kind));
     this.rate_limited = this.http_status === 429;
     this.rate_limit_category = this.rate_limited && RATE_CATEGORIES.includes(rate_limit_category) ? rate_limit_category : null;
     this.retry_after_seconds = this.rate_limited && Number.isFinite(retry_after_seconds) ? Math.min(RATE_RETRY_MAX_SECONDS, Math.max(RATE_RETRY_MIN_SECONDS, retry_after_seconds)) : null;
@@ -41,6 +42,7 @@ export class BrokerError extends Error {
  * account identifiers or request URLs. Classification never changes retry safety. */
 export function orderRejectionReason(error) {
   const detail = error instanceof BrokerError ? String(error.detail || '') : '';
+  if (detail === 'Order quantity must be a positive whole number of shares.') return {code:'invalid_quantity',message:'The app blocked an invalid share quantity before contacting Zerodha. Orders require positive whole shares; review the order size in Activity log.'};
   if (error?.http_status === 429) return {code:'rate_limit',message:'Zerodha rate-limited order requests. Wait for the API cooldown before trying again.'};
   if (error?.kind === 'TokenException') return {code:'session_expired',message:'Zerodha rejected the API session. Reconnect Zerodha before starting trading again.'};
   if (/\bIP\b.*(?:whitelist|white.list|allowlist|not allowed|mismatch|invalid)|(?:whitelist|white.list|allowlist|static IP)/i.test(detail))
@@ -230,7 +232,7 @@ export class KiteBroker {
         const rawKind = error.kind || error.name || 'Error';
         const kind = /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(rawKind) ? rawKind : 'BrokerException';
         throw new BrokerError(kind, detail, error instanceof BrokerError ? {
-          http_status: error.http_status, auth_required: error.auth_required, definitive_rejection: error.definitive_rejection,
+          http_status: error.http_status, auth_required: error.auth_required, definitive_rejection: error.definitive_rejection, local_rejection: error.local_rejection,
           rate_limit_category: error.rate_limit_category, retry_after_seconds: error.retry_after_seconds, retry_at: error.retry_at,
         } : {});
       }
@@ -241,6 +243,16 @@ export class KiteBroker {
     let path, verb = 'GET', payload = null, transform = value => value;
     const plain = value => value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date);
     const kwargs = plain(args.at(-1)) ? {...args.at(-1)} : {};
+    const wholeShares = quantity => {
+      if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+        throw new BrokerError('InputException', 'Order quantity must be a positive whole number of shares.', {local_rejection:true, definitive_rejection:true});
+      }
+    };
+    if (method === 'place_order' || method === 'modify_order' && Object.hasOwn(kwargs, 'quantity')) wholeShares(kwargs.quantity);
+    if (['place_gtt', 'modify_gtt'].includes(method)) {
+      if (!Array.isArray(kwargs.orders) || !kwargs.orders.length) wholeShares(undefined);
+      for (const order of kwargs.orders) wholeShares(order?.quantity);
+    }
     const simple = {profile: '/user/profile', margins: '/user/margins', holdings: '/portfolio/holdings',
       positions: '/portfolio/positions', orders: '/orders', trades: '/trades', get_gtts: '/gtt/triggers'};
     if (method in simple) {

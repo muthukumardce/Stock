@@ -82,6 +82,8 @@ test('position sizing respects cash, capital, risk and two-sided fee allowance',
   assert.equal(position_size(100000, 100000, NaN, 95, 0.0025, 0.1), 0);
   assert.equal(position_size(100000, 100000, 100, 98, 0.0002, 0.1), 9);
   assert.equal(position_size(100000, 100000, 100, 98, 0.01, 0.001), 0);
+  assert.equal(position_size(100000, 275, 100, 98, 0.0025, 0.1), 2, 'An affordable fractional quantity rounds down');
+  assert.equal(position_size(100000, 99, 100, 98, 0.0025, 0.1), 0, 'Less than one affordable share skips the order');
 });
 
 test('swing uses completed long history and rejects split-like discontinuities', () => {
