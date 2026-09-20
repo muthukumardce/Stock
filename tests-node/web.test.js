@@ -9,6 +9,7 @@ import http from 'node:http';
 import { ConfigManager } from '../src/config.js';
 import { createApp, defaultStrategies } from '../src/main.js';
 import { Fernet } from '../src/security.js';
+import { TradingEngine } from '../src/trading.js';
 
 const PASSWORD='a-long-test-password-only';
 const HASH='$argon2id$v=19$m=65536,t=3,p=4$VMU0lS4iHSmQ1iYO3vilQw$STATLHnZvG42lqShST2dJnmzbG52cNmgNoqnIzjGfiE';
@@ -356,21 +357,65 @@ test('malformed postbacks, other accounts and bad checksums are rejected',async 
   for(const p of [postback({user_id:'OTHER'}),{...postback(),checksum:'0'.repeat(64)}])assert.equal((await f.request('/api/kite/postback','POST',p)).status,403);
   assert.equal(f.engine.notifications,0);
 });
-test('strategy allocations use percentages without a configured rupee capital and block changes during exposure',async t=>{
+test('strategy allocations use percentages without a configured rupee capital and block changes during live exposure',async t=>{
   const f=await fixture(t);await f.login();const values={...defaultStrategies(),intraday_allocation_pct:.7,swing_enabled:true,swing_allocation_pct:.3};
   assert.equal((await f.request('/api/settings','PUT',values)).status,200);assert.deepEqual(f.store.get('strategy_settings'),values);
   assert.equal((await f.request('/api/settings','PUT',{...values,swing_allocation_pct:.5})).status,422);
   assert.equal((await f.request('/api/settings','PUT','{"__proto__":{}}')).status,422);
-  f.engine.positions=[{symbol:'ABC'}];assert.equal((await f.request('/api/settings','PUT',values)).status,409);
+  f.engine.settings.trading_mode='live';f.engine.positions=[{symbol:'ABC'}];assert.equal((await f.request('/api/settings','PUT',values)).status,409);
 });
 
-test('ignore existing stocks policy persists and cannot be enabled over active managed exposure',async t=>{
+test('ignore existing stocks policy persists and cannot be enabled over pending orders or managed live exposure',async t=>{
   const f=await fixture(t);await f.login();const values={...defaultStrategies(),manage_existing_holdings:'ignore',managed_symbols:['TEST']};
   assert.equal((await f.request('/api/settings','PUT',values)).status,200);
   assert.deepEqual(f.store.get('strategy_settings'),values);
   assert.equal((await f.request('/api/settings','PUT',{...values,manage_existing_holdings:'invalid'})).status,422);
   f.engine.pending=[{symbol:'TEST'}];assert.equal((await f.request('/api/settings','PUT',values)).status,409);
-  f.engine.pending=[];f.engine.positions=[{symbol:'TEST'}];assert.equal((await f.request('/api/settings','PUT',values)).status,409);
+  f.engine.pending=[];f.engine.settings.trading_mode='live';f.engine.positions=[{symbol:'TEST'}];assert.equal((await f.request('/api/settings','PUT',values)).status,409);
+});
+
+test('settings report the current blocker consistently in state and both save endpoints',async t=>{
+  const f=await fixture(t);await f.login();
+  const base=f.engine.snapshot.bind(f.engine);
+  for(const [extra,restart,code,expected] of [
+    [{entries_enabled:true},false,'entries_enabled',/Automatic entries are still enabled/],
+    [{mode:'live',positions:[{symbol:'LIVE1'}]},false,'live_positions',/LIVE1/],
+    [{delivery:{positions:{DELIVERY1:{status:'protected'}}}},false,'live_positions',/DELIVERY1/],
+    [{pending_orders:[{symbol:'PENDING1'}]},false,'pending_orders',/PENDING1/],
+    [{unmanaged_live_exposure:true},false,'saved_live_exposure',/Saved live positions or orders/],
+    [{},true,'restart_required',/earlier application-settings change/],
+  ]){
+    f.engine.snapshot=()=>({...base(),...extra});f.app.state.restartRequired=restart;
+    const {state}=await (await f.request('/api/state')).json();
+    assert.equal(state.settings_blocker.code,code);assert.match(state.settings_blocker.message,expected);
+    for(const [endpoint,payload] of [['/api/settings',defaultStrategies()],['/api/config',{min_signal_score:64}]]){
+      const response=await f.request(endpoint,'PUT',payload);assert.equal(response.status,409,code);
+      assert.equal((await response.json()).detail,state.settings_blocker.message);
+    }
+    assert.equal(f.engine.status,'disconnected');
+  }
+});
+
+test('paused paper journals survive strategy changes, application saves, migration and mode changes',async t=>{
+  for(const config of [{min_signal_score:64},{data_dir:'retained-paper',trading_mode:'live',live_trading_enabled:true}])await t.test(JSON.stringify(config),async t=>{
+    const f=await fixture(t,{engineFactory:TradingEngine});await f.login();
+    const positions={TEST:{symbol:'TEST',token:123,quantity:15,entry:100,last:102,stop:98,strategy:'intraday',mode:'paper',side:'BUY'}};
+    Object.assign(f.engine,{positions:structuredClone(positions),realised:47,capital:75000,status:'paused'});f.engine._persist();
+    const journal=f.store.get('bot_state_paper');
+    const {state}=await (await f.request('/api/state')).json();assert.equal(state.entries_enabled,false);assert.equal(state.settings_blocker,null);
+    const values={...defaultStrategies(),manage_existing_holdings:'ignore'};
+    assert.equal((await f.request('/api/settings','PUT',values)).status,200);assert.deepEqual(f.store.get('bot_state_paper'),journal);
+    assert.equal((await f.request('/api/config','PUT',config)).status,200);assert.deepEqual(f.store.get('bot_state_paper'),journal);
+    assert.equal(f.engine.broker,null);assert.equal(f.engine.running,false);
+    await f.close();
+    const g=await fixture(t,{root:f.root,engineFactory:TradingEngine});
+    try{
+      assert.deepEqual(g.store.get('bot_state_paper'),journal);assert.deepEqual(g.store.get('strategy_settings'),values);
+      assert.equal(g.engine.running,false);assert.equal(g.engine.broker,null);
+      if(config.trading_mode==='live')assert.deepEqual(g.engine.positions,{});
+      else assert.deepEqual(g.engine.positions,positions);
+    }finally{await g.close();}
+  });
 });
 test('Settings persist defaults, reject old env-only fields and require restart without trading exposure',async t=>{
   const f=await fixture(t);await f.login();

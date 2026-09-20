@@ -14,7 +14,7 @@ const decisionHelp = {
   insufficient_risk_or_cash_budget: ['Review available cash in Overview and Settings → Risk per trade (fraction) and Maximum allocation per stock (fraction).','config-risk_per_trade_pct'],
   aggregate_risk_limit: ['Open positions and pending entries use the available risk budget. Review Overview → Risk used and Settings → Daily loss limit (fraction).','config-daily_loss_pct'],
   existing_holdings_ignored: ['This stock is excluded by Settings → Existing holdings → Ignore stocks I already own.','holding-policy'],
-  live_execution_disabled: ['Review Settings → Paper trading. Saving a mode change requires paused entries with managed exposure resolved, then a server restart.','paper-trading'],
+  live_execution_disabled: ['Review Settings → Paper trading. Saving a mode change requires paused entries with managed live positions and pending orders resolved, then a server restart. Simulated positions are retained.','paper-trading'],
   strategy_disabled: ['This strategy is disabled in Settings → Trading strategies.','settings-form'],
   spread_too_wide: ['The bid/ask spread exceeds Settings → Maximum spread (fraction). The scanner waits for an eligible quote.','config-max_spread_pct'],
   turnover_too_low: ['Trading turnover is below Settings → Minimum daily turnover (₹).','config-min_daily_turnover'],
@@ -50,7 +50,7 @@ export function activityHelp({kind='',level='',message='',data={}} = {}) {
   }
   if (decisionHelp[code]) return help([decisionHelp[code][0]],[settings('Review relevant setting',decisionHelp[code][1])]);
   if (kind === 'risk_halt' && /daily loss limit/i.test(message)) return help([decisionHelp.daily_loss_limit[0]],[settings('Review daily loss limit','config-daily_loss_pct')]);
-  if (kind === 'analytics_error') return help(['Open Background → Live analytics to inspect workers and queued jobs.','Review Settings → Analytics workers (0 = automatic), CPU reserve and Analysis batch size. Application changes require a server restart after managed exposure is resolved.'],[background,settings('Review analytics settings','config-analytics_workers')]);
+  if (kind === 'analytics_error') return help(['Open Background → Live analytics to inspect workers and queued jobs.','Review Settings → Analytics workers (0 = automatic), CPU reserve and Analysis batch size. Pause entries and resolve managed live positions and pending orders before saving, then restart the server. Simulated positions are retained.'],[background,settings('Review analytics settings','config-analytics_workers')]);
   if (exception === 'NetworkException' || Number(error.http_status) >= 500)
     return help(['Check the trading server’s internet connection and Zerodha service availability. Open Background for the affected operation and retry status.','For order submission or exit failures, check Kite → Orders and Positions before attempting another order.'],[background,orders,support]);
   if (kind === 'session.wrong_account' || kind === 'connection_error' || kind === 'session.start_failed' || kind === 'session.restore_failed')

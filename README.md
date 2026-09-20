@@ -61,7 +61,7 @@ Keep the host's automatic time synchronization enabled. The app compares the sys
 
 All non-Kite configuration has defaults and is managed from the dashboard. No extra environment variables are needed for ports, admin credentials, risk limits, worker counts or security keys. The dashboard detects its public address from the current browser request through the local tunnel; there is no `PUBLIC_URL` or development/production mode to maintain.
 
-The **Paper trading** switch is at the top of Settings. On means simulated buys and sells; off selects real order execution. The card shows the current mode and labels unsaved changes separately. Choose the mode, click **Save settings**, then restart with `npm start` after stopping the server with **Ctrl+C**. Pause entries and resolve managed exposure and pending orders before saving. Paper trading is on by default.
+The **Paper trading** switch is at the top of Settings. On means simulated buys and sells; off selects real order execution. The card shows the current mode and labels unsaved changes separately. Choose the mode, click **Save settings**, then restart with `npm start` after stopping the server with **Ctrl+C**. Pause entries before saving. Simulated positions are retained; managed live positions and unresolved orders must be resolved first. Paper trading is on by default.
 
 | Settings area | Controls and defaults |
 |---|---|
@@ -90,11 +90,11 @@ Trading capital comes from the connected account's cash information; there is no
 
 An initially unfunded account can still start. The dashboard shows **Waiting for funds**, keeps monitoring, and uses subsequent verified balance updates without another Start click. Authorized existing holdings and previously managed positions can still be managed. New long and short entries wait for funding and all other checks. Adding funds never overrides Pause entries or a risk halt. Paper capital is seeded only once; later real deposits or withdrawals do not replace its existing simulated bankroll.
 
-Strategy/holding settings apply without a server restart after entries are paused and managed exposure and pending orders are resolved. Application settings require the same checks; saving them stops the engine and marks the server for restart. Stop with **Ctrl+C**, wait for shutdown, then run `npm start` again. The UI tells you when a restart is required. Administrator/password changes take effect immediately and require another dashboard login.
+Strategy/holding settings apply without a server restart after entries are paused and managed live positions and pending orders are resolved. Paused paper positions and their results are retained and do not block settings changes. Saved live exposure from another mode still blocks changes. Application settings require the same checks; saving them stops the engine and marks the server for restart. Stop with **Ctrl+C**, wait for shutdown, then run `npm start` again. Settings displays the specific reason when saving is blocked. Administrator/password changes take effect immediately and require another dashboard login.
 
 Settings are stored in `config/settings.json`; strategy permissions and journals are in the SQLite database under the selected data directory. Keep both directories and `.env` private and backed up. Generated encryption keys are necessary to read saved broker sessions; rotate them using Settings instead of replacing them by hand.
 
-**Ignore stocks I already own** uses the latest verified account holdings, including unsettled and pledged shares and today's delivery buys. It overrides any saved symbol selection. Ignored holdings remain visible and count toward account risk. Pause entries and resolve managed positions and pending orders before changing this setting; it does not remove existing order protection.
+**Ignore stocks I already own** uses the latest verified account holdings, including unsettled and pledged shares and today's delivery buys. It overrides any saved symbol selection. Ignored holdings remain visible and count toward account risk. Pause entries and resolve managed live positions and pending orders before changing this setting; it does not remove existing order protection. Simulated positions are retained.
 
 ## Connect through Cloudflare Tunnel
 

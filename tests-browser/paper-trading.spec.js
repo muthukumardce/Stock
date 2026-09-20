@@ -153,7 +153,8 @@ test('server rejection while trading leaves saved mode unchanged and shows the t
   await page.locator('#paper-trading').uncheck();
   const response=await saveFromTop(page,application);
   expect(response.status()).toBe(409);
-  await expect(page.locator('#paper-trading-error')).toContainText('Pause entries and resolve managed exposure');
+  await expect(page.locator('#paper-trading-error')).toContainText('Automatic entries are still enabled');
+  await expect(page.locator('#paper-trading-error')).toContainText('Overview → Pause entries');
   await expect(page.locator('#paper-trading-error')).toBeVisible();
   await expect(page.locator('#paper-trading')).toBeEnabled();
   await expect(page.locator('#paper-trading-save')).toBeEnabled();
@@ -164,6 +165,30 @@ test('server rejection while trading leaves saved mode unchanged and shows the t
   expect(application.app.state.restartRequired).toBe(false);
   expect(application.app.state.engine.running).toBe(true);
   await page.locator('.paper-trading-panel').screenshot({path:testInfo.outputPath('paper-trading-save-rejected.png')});
+  expect(errors).toEqual([]);
+});
+
+test('paused simulated positions allow holding and application settings to be saved without closing trades',async({page,application},testInfo)=>{
+  const engine=application.app.state.engine,store=application.app.state.store;
+  engine.positions={TEST:{symbol:'TEST',token:123,quantity:15,entry:100,last:102,stop:98,strategy:'intraday',mode:'paper',side:'BUY'}};
+  engine.realised=47;engine.capital=75000;engine.status='paused';engine._persist();
+  const journal=store.get('bot_state_paper'),errors=await settingsPage(page,application);
+  await expect(page.locator('#settings-note')).toContainText('Existing simulated positions and results are retained');
+  await page.locator('#holding-policy').selectOption('ignore');
+  const saving=page.waitForResponse(result=>result.url()===application.origin+'/api/settings'&&result.request().method()==='PUT');
+  await page.locator('#settings-form [type=submit]').click();
+  expect((await saving).status()).toBe(200);
+  await expect(page.locator('#settings-error')).toBeEmpty();
+  expect(store.get('strategy_settings').manage_existing_holdings).toBe('ignore');
+  expect(store.get('bot_state_paper')).toEqual(journal);
+  await page.locator('#config-min_signal_score').fill('64');
+  expect((await saveFromTop(page,application)).status()).toBe(200);
+  await expectRestartRequired(page);
+  expect(application.saved().min_signal_score).toBe(64);
+  expect(store.get('bot_state_paper')).toEqual(journal);
+  expect(engine.positions).toEqual(journal.positions);
+  expect(engine.broker).toBeNull();expect(engine.running).toBe(false);
+  await page.locator('.paper-trading-panel').screenshot({path:testInfo.outputPath('paused-paper-settings-saved.png')});
   expect(errors).toEqual([]);
 });
 

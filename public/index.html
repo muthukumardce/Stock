@@ -104,7 +104,7 @@
       </article>
       <article class="panel settings-panel"><div class="panel-heading"><div><h2>Existing holdings</h2><p>Choose whether the program can trade stocks you already own.</p></div></div><div class="settings-content"><label for="holding-policy">How to handle existing stocks</label><select id="holding-policy" name="manage_existing_holdings" aria-describedby="holding-policy-hint"><option value="ignore">Ignore stocks I already own</option><option value="selected">Only sell the holdings I select</option><option value="all">Allow selling all existing NSE holdings</option></select><p id="holding-policy-hint" class="field-hint">Ignore blocks new buys and sells for stocks in your current holdings, including unsettled and pledged shares and today's delivery buys, in both paper and live mode. Holdings remain visible and count toward account risk.</p><label for="managed-symbols">Selected NSE symbols</label><textarea id="managed-symbols" name="managed_symbols" rows="4" placeholder="For example: INFY, HDFCBANK"></textarea><p class="field-hint">Separate symbols with commas. The selection applies only to “Only sell the holdings I select”. Paper mode simulates sales.</p><div class="notice subtle">Unattended delivery sales require suitable demat authorisation. The engine checks this before placing real delivery orders.</div></div></article>
     </div>
-    <div class="settings-actions"><p id="settings-note">Pause trading and close managed positions before changing allocations.</p><button class="button primary" type="submit">Save strategy settings</button></div><p id="settings-error" class="form-error" role="alert"></p>
+    <div class="settings-actions"><p id="settings-note">Pause entries before changing allocations. Simulated positions are retained; live exposure must be resolved.</p><button class="button primary" type="submit">Save strategy settings</button></div><p id="settings-error" class="form-error" role="alert"></p>
   </form>
   <article class="panel space-top">
     <div class="panel-heading"><div><h2>Zerodha app URLs</h2><p>These addresses follow the URL you used to open this dashboard.</p></div></div>
@@ -119,7 +119,7 @@
   <article class="panel space-top">
     <div class="panel-heading"><div><h2>Application settings</h2><p>Risk limits, analytics capacity and local server preferences.</p></div></div>
     <form id="config-form" class="settings-content">
-      <div class="notice subtle">Pause trading and resolve all managed positions and pending orders before saving. Restart the program to apply changes.</div>
+      <div class="notice subtle">Pause entries before saving. Simulated positions are retained; managed live positions and unresolved orders must be resolved. Restart the program to apply changes.</div>
       <div id="config-fields" class="config-grid"><p class="muted">Loading application settings…</p></div>
       <div class="settings-actions"><p id="config-message" role="status">Defaults are ready to use. Changing these values does not require editing environment variables.</p><button id="config-submit" class="button primary" type="submit" disabled>Save application settings</button></div>
       <p id="config-error" class="form-error" role="alert"></p>

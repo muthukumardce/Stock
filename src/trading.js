@@ -1338,7 +1338,7 @@ export class TradingEngine {
   snapshot() {
     const positions = values(this.positions).map(p => ({ ...p, side:sideOf(p), unrealised: round(markedProfit(p)) }));
     const pending = values(this.intents).some(i => !['closed', 'rejected'].includes(i.state)), delivery = this.delivery?.snapshot() || {}, deliveryBusy = values(delivery.positions || {}).some(p => p.status !== 'closed'), unrealised = this._unrealised();
-    return jsonable({ mode: this.mode, status: this.status, connected: this.connected, user_id: this.user_id, capital: this.capital, waiting_for_funds: this._waiting_for_funds(), broker_clock: this.broker?.clock_health?.() || null,api_limits:this.broker?.rate_limit_health?.()||null,
+    return jsonable({ mode: this.mode, status: this.status, entries_enabled:this.running, connected: this.connected, user_id: this.user_id, capital: this.capital, waiting_for_funds: this._waiting_for_funds(), broker_clock: this.broker?.clock_health?.() || null,api_limits:this.broker?.rate_limit_health?.()||null,
       equity: round(this.capital + this.realised - this._capital_accounted_pnl + unrealised), realised_pnl: round(this.realised), unrealised_pnl: round(unrealised), daily_pnl: round(this._daily_pnl()), pnl_fees_estimated: true,
       capital_source: this.mode === 'paper' ? 'persisted_paper_balance_seeded_from_broker_cash' : 'verified_broker_cash', broker_available_cash: this._broker_available_cash,
       risk_used: round(sum(values(this.positions).map(plannedRisk))), universe_count: count(this.universe), universe_classification:this.universe_summary,
