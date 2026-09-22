@@ -7,6 +7,8 @@ const developer = {label:'Kite Connect developer account',url:'https://developer
 const support = {label:'Zerodha support',url:'https://support.zerodha.com/'};
 const help = (steps, links = []) => ({steps,links});
 const decisionHelp = {
+  entry_reward_risk_too_low: ['Remaining target profit after estimated costs is too small relative to the planned stop loss at the executable entry. Review Latest analysis and Minimum entry reward/risk after estimated costs.','config-min_entry_reward_risk'],
+  invalid_entry_economics: ['Entry prices or cost assumptions could not be validated. Review Latest analysis and the entry reward/risk setting.','config-min_entry_reward_risk'],
   maximum_positions: ['The bot position limit is reached. Review open positions in Overview and Settings → Maximum positions.','config-max_positions'],
   daily_trade_limit: ['The daily symbol-attempt limit is reached. Review Settings → Maximum new symbols attempted per day.','config-max_trades_per_day'],
   daily_loss_limit: ['Review today’s P&L in Overview and Settings → Daily loss limit (fraction). This risk stop pauses new entries.','config-daily_loss_pct'],

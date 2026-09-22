@@ -127,7 +127,7 @@ test('confirming authorization while paused preserves pause and does not adopt s
 });
 test('intraday cover entry and DDPI existing-holding management never request CDSL permission', async t => {
   const intraday = await fixture(t, { selected: [] }); assert.equal(intraday.engine.holdings_authorization.snapshot().required, false);
-  assert.equal(await intraday.engine._enter_locked(2, new Signal('intraday', 100, 98, 104, 'eligible intraday candle', 2)), 'cover_order_pending');
+  assert.equal(await intraday.engine._enter_locked(2, new Signal('intraday', 100, 98, 104.5, 'eligible intraday candle', 2)), 'cover_order_pending');
   assert.equal(intraday.broker.calls.some(([method]) => method === 'authorise_holdings'), false); assert.equal(intraday.broker.calls.some(([method]) => method === 'buy_cover'), true);
   const ddpi = await fixture(t, { physical: true }); await ddpi.engine._run_once();
   assert.equal(ddpi.engine.holdings_authorization.snapshot().required, false); assert.equal(ddpi.broker.calls.some(([method]) => method === 'authorise_holdings'), false); assert.equal(sales(ddpi.broker).length, 1);
@@ -153,7 +153,7 @@ test('CNC fill absent from settled holdings preserves verified authorization rej
   f.store.set('strategy_settings', { intraday_enabled: false, swing_enabled: true, intraday_allocation_pct: 0, swing_allocation_pct: 1, manage_existing_holdings: 'selected', managed_symbols: [] });
   f.broker.rejectGttAuthorization = true;
   f.engine.daily[2]=Array.from({length:21},(_,i)=>new Candle(new Date(NOW-(21-i)*86400000),100,101,99,100,1000));
-  const result = await f.engine._enter_locked(2, new Signal('swing', 100, 98, 104, 'confirmed delivery candidate', 2));
+  const result = await f.engine._enter_locked(2, new Signal('swing', 100, 98, 104.5, 'confirmed delivery candidate', 2));
   assert.match(result, /^delivery_authorization_required/);
   assert.equal(f.broker.netPositions[0].tradingsymbol, 'NEW'); assert.ok(f.broker.netPositions[0].quantity > 0); assert.equal(f.broker.holdings.some(h => h.tradingsymbol === 'NEW'), false);
   assert.equal(f.engine.delivery.snapshot().positions.NEW.source, 'swing'); assert.equal(f.engine.holdings_authorization.isBlocked('NEW'), true);

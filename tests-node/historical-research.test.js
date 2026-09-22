@@ -531,10 +531,20 @@ test('real worker consumes fixture candles from read-only collector and persists
   t.after(async () => { await research.close(); store.close(); rmSync(dir, { recursive: true, force: true }); });
   research.start(); await research.task;
   assert.equal(research.status().status, 'complete'); assert.equal(research.status().progress, 100);
-  assert.equal(research.status().report.baseline.metrics.trade_count, 1);
+  assert.equal(research.status().report.baseline.metrics.trade_count, 0);
+  assert.ok(research.status().report.baseline.decisions.entry_reward_risk_too_low>0);
+  assert.equal(research.status().report.baseline.options.min_entry_reward_risk,1.5);
   assert.equal(research.status().report.dataset.bar_count, 75);
   assert.ok(store.get('research_report').caveats.length > 0);
   assert.deepEqual(calls.map(c => c[0]), ['historical_data']);
+});
+
+test('research propagates the entry reward/risk setting and refreshes its comparison signature',async t=>{
+  const {research,settings,worker}=context(t);
+  const previous=research.signature();settings.min_entry_reward_risk=1.75;
+  assert.notEqual(research.signature(),previous);
+  research.start();await research.task;
+  assert.equal(worker.inputs[0].options.min_entry_reward_risk,1.75);
 });
 
 test('automatic scheduler observes connected funds, eligible instruments and next-day comparisons without manual starts',async t=>{

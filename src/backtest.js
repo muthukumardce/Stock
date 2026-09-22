@@ -2,6 +2,8 @@
 import * as rules from './strategy.js';
 import { parseTime, dateIST, timeIST } from './util.js';
 import {evaluateComparisonTask} from './backtest-analytics.js';
+import {entryRewardRisk, DEFAULT_MIN_ENTRY_REWARD_RISK} from './entry-risk.js';
+import {validPreviousIntradaySeed} from './intraday-seed.js';
 
 const MINUTE = 60000, DAY = 86400000;
 // Full Total Market membership across up to 60 calendar days of five-minute
@@ -14,6 +16,7 @@ export const MAX_RESEARCH_RUNTIME_MS = 600000;
 export const MAX_COMPARISON_RUNTIME_MS = 1800000;
 const DEFAULTS = Object.freeze({ initial_capital: 100000, risk_per_trade_pct: 0.0025,
   max_position_pct: 0.1, max_positions: 5, fee_rate: 0.001, slippage_rate: 0.0005,
+  min_entry_reward_risk: DEFAULT_MIN_ENTRY_REWARD_RISK,
   entry_cutoff: '14:45', exit_time: '15:10', split_fractions: [0.6, 0.2, 0.2],
   max_bars: 250000, max_runtime_ms: 45000, max_equity_points: 2000,
   strategy_options: {}, score_from:null, score_to:null });
@@ -42,6 +45,7 @@ function configuration(options = {}) {
   if (!finite(cfg.initial_capital) || cfg.initial_capital <= 0 || cfg.initial_capital > 1e12) throw new RangeError('Initial capital must be positive and at most 1e12');
   for (const key of ['risk_per_trade_pct', 'max_position_pct']) if (!finite(cfg[key]) || cfg[key] <= 0 || cfg[key] > 1) throw new RangeError(`${key} must be a fraction in (0, 1]`);
   for (const key of ['fee_rate', 'slippage_rate']) if (!finite(cfg[key]) || cfg[key] < 0 || cfg[key] > 0.05) throw new RangeError(`${key} must be a fraction between 0 and 0.05`);
+  if (!finite(cfg.min_entry_reward_risk) || cfg.min_entry_reward_risk<1 || cfg.min_entry_reward_risk>10) throw new RangeError('min_entry_reward_risk must be between 1 and 10');
   if (!Number.isInteger(cfg.max_positions) || cfg.max_positions < 1 || cfg.max_positions > 100) throw new RangeError('Maximum positions must be between 1 and 100');
   if (!Number.isInteger(cfg.max_bars) || cfg.max_bars < 1 || cfg.max_bars > LIMIT_BARS) throw new RangeError(`Maximum bars must be between 1 and ${LIMIT_BARS}`);
   if (!Number.isInteger(cfg.max_runtime_ms) || cfg.max_runtime_ms < 100 || cfg.max_runtime_ms > MAX_COMPARISON_RUNTIME_MS) throw new RangeError(`Maximum runtime must be between 100 and ${MAX_COMPARISON_RUNTIME_MS} ms`);
@@ -159,7 +163,7 @@ export function* backtestSteps(dataset, options = {}, hooks = {}) {
     const trade = { symbol, strategy, side: p.side, setup: p.setup, signal_time: p.signal_time, entry_time: p.entry_time, exit_time: timestamp(time),
       entry: round(p.entry), exit: round(price), quantity: p.quantity, entry_fee: round(p.entry_fee), exit_fee: round(fee),
       pnl: round(pnl), return_pct: round(pnl / (p.entry * p.quantity + p.entry_fee) * 100), reason, score: p.score,
-      data_gap: Boolean(p.data_gap) };
+      data_gap: Boolean(p.data_gap), entry_risk:p.entry_risk };
     trades.push(trade); overall.trades.push(trade); activePeriod?.acc.trades.push(trade); positions.delete(symbol);
   }
   function recordGap(symbol, expected, observed, reason) {
@@ -209,7 +213,7 @@ export function* backtestSteps(dataset, options = {}, hooks = {}) {
     if (data.intraday) for (const event of batch) {
       const {symbol,bar} = event, prior = sessions.get(symbol), history = data.histories.get(symbol);
       if (!prior || prior.date !== date) {
-        previousBars.set(symbol, prior && !prior.gapped && history.length === 75 && timeIST(history.at(-1).time) === '15:25' ? [...history] : []);
+        previousBars.set(symbol, prior && !prior.gapped && validPreviousIntradaySeed(history,date) ? [...history] : []);
         history.length = 0;
         const gapped = timeIST(bar.time) !== '09:15';
         sessions.set(symbol,{date,last:at,gapped});
@@ -255,13 +259,16 @@ export function* backtestSteps(dataset, options = {}, hooks = {}) {
       if (traded.has(key)) { count('already_traded_this_session'); continue; }
       if (!finite(signal.stop) || !finite(signal.target) || signal.stop <= 0 || signal.target <= 0 || sign * (entry - signal.stop) <= 0 || sign * (signal.target - entry) <= 0) { count('opening_gap_invalidates_signal'); continue; }
       if(!data.intraday){const dailyGate=rules.swing_entry_gate(data.histories.get(symbol),signal,entry);if(dailyGate){count(dailyGate);continue;}}
+      const entry_risk=entryRewardRisk({side,entry,stop:signal.stop,target:signal.target,fee_rate:cfg.fee_rate,
+        exit_slippage_rate:cfg.slippage_rate,min_reward_risk:cfg.min_entry_reward_risk});
+      if(!entry_risk.ok){count(entry_risk.reason);continue;}
       const capital = Math.max(0, equityValue()), perShareRisk = Math.abs(entry - signal.stop) + entry * cfg.fee_rate * 2;
       const quantity = Math.max(0, Math.floor(Math.min(capital * cfg.risk_per_trade_pct / perShareRisk,
         capital * cfg.max_position_pct / (entry * (1 + cfg.fee_rate)), cash / (entry * (1 + cfg.fee_rate)))));
       if (!Number.isSafeInteger(quantity) || !quantity) { count('insufficient_cash_or_risk_budget'); continue; }
       const fee = entry * quantity * cfg.fee_rate;
       cash -= entry * quantity + fee; charge(fee); traded.add(key);
-      const position = { strategy, symbol, side, entry, quantity, stop: signal.stop, target: signal.target,
+      const position = { strategy, symbol, side, entry, entry_risk, quantity, stop: signal.stop, target: signal.target,
         setup: signal.setup ?? 'breakout', score: signal.score, entry_fee: fee, entry_time: timestamp(at), signal_time: timestamp(decision.signal_time) };
       positions.set(symbol,position); updateDailyProtection(position,data.histories.get(symbol));
       marks.set(symbol, bar.open);

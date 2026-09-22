@@ -55,6 +55,8 @@ export function strategy_snapshot(bars,strategy='intraday',context={},options={}
   if(!indicators.data_valid)return fail(indicators.data_issue);
   const higher=aggregate_15minute(combined),closes=higher.map(bar=>bar.close),fast=ema_series(closes,3).at(-1)??null,slow=ema_series(closes,9).at(-1)??null;
   const higherEnd=higher.length?+at(higher.at(-1))+3*FIVE:null;
+  // CAS history ending at 15:10 is useful for indicators, but its last traded
+  // price is not the subsequent auction close. Keep gap setups unavailable.
   const priorClose=previous.length&&timeIST(at(previous.at(-1)))==='15:25'?previous.at(-1).close:null;
   const benchmark=relativeContext(bars,context.benchmark_bars,lastTime),sector=relativeContext(bars,context.sector_bars,lastTime);
   if(benchmark.reason==='future_context'||sector.reason==='future_context')return fail('future_context');

@@ -9,6 +9,8 @@ import { BrokerError, KiteBroker } from '../src/broker.js';
 import { CandleBook, Candle, Signal } from '../src/strategy.js';
 import { marketBreadth } from '../src/decision-controls.js';
 import { monotonic, dateIST, isoIST } from '../src/util.js';
+import { NiftyTradingUniverse } from '../src/nifty-trading-universe.js';
+import { entryRewardRisk } from '../src/entry-risk.js';
 
 const NOW = new Date('2026-09-17T12:00:00+05:30');
 const clone = value => structuredClone(value);
@@ -39,8 +41,64 @@ function ready(t, mode = 'paper') {
   engine._account_at = monotonic(); engine._profile_verified = engine._recovery_account_verified = true; Object.assign(engine.recovery, { phase: 'ready', blocked: false }); engine.day = dateIST(NOW);
   return [engine, store];
 }
-const signal = (strategy = 'intraday') => new Signal(strategy, 100, 98, 104, 'test', 2);
+// Leave enough reward after spread, tick rounding and estimated costs for tests
+// whose subject is a later execution/lifecycle gate.
+const signal = (strategy = 'intraday') => new Signal(strategy, 100, 98, 104.5, 'test', 2);
 const entryDailyBars = () => Array.from({length:21},(_,i)=>new Candle(new Date(NOW-(21-i)*86400000),100,101,99,100,1000));
+
+for(const mode of ['paper','live'])for(const side of ['BUY','SELL'])test(`${mode} ${side} rejects deteriorated entry reward before reserving cash or submitting orders`,async t=>{
+  const [engine,store]=ready(t,mode),decision={};engine.settings.intraday_short_enabled=true;
+  const entrySignal=side==='BUY'?signal():shortSignal(),before=clone(entrySignal);
+  engine.quotes[1].depth={buy:[{price:side==='BUY'?100.4:99.55,quantity:10000}],sell:[{price:side==='BUY'?100.45:99.6,quantity:10000}]};
+  engine.broker={buy_cover:()=>assert.fail('Rejected entry must never reach broker'),sell_cover:()=>assert.fail('Rejected entry must never reach broker')};
+  assert.equal(await engine._enter_locked(1,entrySignal,null,decision),'entry_reward_risk_too_low');
+  assert.ok(decision.entry_risk.reward_risk<1.5);assert.ok(decision.entry_risk.reward_per_share>0);
+  assert.equal(decision.entry_risk.side,side);assert.deepEqual(clone(entrySignal),before);
+  assert.deepEqual(engine.positions,{});assert.deepEqual(engine.intents,{});assert.equal(engine.traded.size,0);
+  assert.equal(store.log.some(e=>['order_intent','paper_fill'].includes(e.kind)),false);
+});
+
+test('entry and stop tick rounding can independently disqualify a borderline long',async t=>{
+  const [engine]=ready(t),decision={},entrySignal=new Signal('intraday',100,98,104,'borderline',2);
+  const inputs={side:'BUY',entry:100.05*1.0005,stop:98,target:104,fee_rate:.001,exit_slippage_rate:.0005};
+  assert.equal(entryRewardRisk(inputs).ok,true);
+  assert.equal(await engine._enter_locked(1,entrySignal,null,decision),'entry_reward_risk_too_low');
+  assert.equal(decision.entry_risk.entry,100.15);
+  entrySignal.stop=98.099;entrySignal.target=103.92;
+  assert.equal(entryRewardRisk({...inputs,entry:100.15,stop:entrySignal.stop,target:entrySignal.target}).ok,true);
+  assert.equal(await engine._enter_locked(1,entrySignal,null,decision),'entry_reward_risk_too_low');
+  assert.equal(decision.entry_risk.stop,98.05);
+});
+
+test('acceptable entry economics are journalled and the configurable threshold fails closed',async t=>{
+  const [engine,store]=ready(t);engine.settings.min_entry_reward_risk=2;
+  assert.equal(await engine._enter_locked(1,signal()),'entry_reward_risk_too_low');
+  engine.settings.min_entry_reward_risk=null;
+  assert.equal(await engine._enter_locked(1,signal()),'invalid_entry_economics');
+  engine.settings.min_entry_reward_risk=1.5;
+  assert.equal(await engine._enter_locked(1,signal()),'paper_buy_filled');
+  const risk=engine.positions.TEST.entry_risk;
+  assert.equal(risk.ok,true);assert.ok(risk.reward_risk>=1.5);
+  assert.deepEqual(store.get(engine.state_key).positions.TEST.entry_risk,risk);
+});
+
+test('swing delivery entry also blocks insufficient executable reward before broker submission',async t=>{
+  const [engine,store]=ready(t,'live');
+  store.set('strategy_settings',{intraday_enabled:false,swing_enabled:true,intraday_allocation_pct:0,swing_allocation_pct:1});
+  engine.daily[1]=entryDailyBars();engine.delivery.submit_entry=()=>assert.fail('Low reward must not reach delivery');
+  assert.equal(await engine._enter_locked(1,new Signal('swing',100,98,104,'borderline',2)),'entry_reward_risk_too_low');
+});
+
+test('scanner reports the executable ratio and counts rejected entries',async t=>{
+  const [engine]=ready(t),entrySignal=new Signal('intraday',100,98,104,'borderline',2);
+  engine.books[1]=new CandleBook();engine.books[1].bars=[new Candle(new Date(NOW-300000),100,101,99,100,1000)];
+  engine._queue_analysis(1,'intraday',engine.books[1].bars);
+  engine._analysis_finished([{...engine._analysis_pending.get('intraday:1'),signal:entrySignal,reason:'test'}]);
+  const record=engine._candidates[0][3];engine._last_holdings_scan=engine._last_summary=monotonic();
+  await engine._run_once();
+  assert.equal(record.status,'entry_reward_risk_too_low');assert.match(record.reason,/1\.499:1; requires 1.5:1/);
+  assert.equal(engine._stats['decision:entry_reward_risk_too_low'],1);assert.ok(record.entry_risk.reward_risk<1.5);
+});
 
 test('startup cancellation while account data is pending never arms entries',async t=>{
   const [engine]=ready(t);engine.running=false;engine.status='paused';let release,cancelled=false;
@@ -212,6 +270,34 @@ function priorSessionRows(){
   return Array.from({length:75},(_,i)=>({date:new Date(+new Date('2026-09-16T09:15:00+05:30')+i*300000),open:100,high:101,low:99,close:100,volume:100}));
 }
 function currentSessionRows(){return priorSessionRows().slice(0,33).map(row=>({...row,date:new Date(+row.date+86400000)}));}
+
+for(const source of ['download','cache','memory'])test(`CAS previous-session seed from ${source} warms early-session candles without repeatedly downloading seven days`,async t=>{
+  const [engine,store]=ready(t);engine.settings.enhanced_signals=true;engine.books[1]=new CandleBook();
+  engine._now=()=>new Date('2026-09-17T09:30:00+05:30');
+  const previous=priorSessionRows().slice(0,72),today=currentSessionRows().slice(0,3),requests=[];
+  if(source==='cache')store.set('intraday_seed:1',{date:dateIST(NOW),symbol:'TEST',bars:previous});
+  if(source==='memory')engine.previous_intraday[1]=previous.map(r=>new Candle(r.date,r.open,r.high,r.low,r.close,r.volume));
+  engine.broker={call:async(method,token,from)=>{requests.push(from);return [...previous,...today];}};
+  await engine._intraday_history_pass();
+  assert.equal(engine._intraday_history_loaded.has(1),true);assert.equal(engine._intraday_history_progress().completed,1);
+  assert.equal(engine.previous_intraday[1].length,72);assert.equal(engine.books[1].bars.length,3);
+  assert.equal(dateIST(requests[0]),source==='download'?'2026-09-10':'2026-09-17');
+  if(source==='download')assert.equal(store.get('intraday_seed:1').bars.length,72);
+  await engine._intraday_history_pass();assert.equal(requests.length,1,'A valid CAS seed must not trigger the retry loop');
+});
+
+test('unwarmed stocks precede routine refreshes while managed exposure keeps first priority',async t=>{
+  const [engine]=ready(t),requests=[];
+  for(let token=1;token<=8;token++){
+    engine.universe[token]={tradingsymbol:`STOCK${token}`};engine.books[token]=new CandleBook();
+    engine.quotes[token]={last_price:100,volume_traded:100000/token,received_at:monotonic()};
+  }
+  engine._intraday_history_progress();for(const token of [1,2,3,4,5,6,8])engine._intraday_warmup.completed.add(token);
+  engine.positions.STOCK8={symbol:'STOCK8',token:8};
+  engine.broker={call:async(method,token)=>{requests.push(token);return currentSessionRows();}};
+  await engine._intraday_history_pass();
+  assert.deepEqual(requests,[8,7,1,2,3,4,5,6]);assert.equal(engine._intraday_history_progress().completed,8);
+});
 
 test('intraday warmup overlaps six downloads, refills completed slots and keeps progress accurate out of order',async t=>{
   const [engine]=ready(t),requests=[];
@@ -786,6 +872,38 @@ test('connection classifies the full broker master before applying the streaming
   assert.equal(engine.connected,true);assert.deepEqual(subscribed,[1]);assert.equal(engine.snapshot().universe_count,1);
   assert.equal(engine.readiness().checks.find(c=>c.key==='equity_universe').ok,true);
   assert.equal(engine.snapshot().universe_classification.excluded_counts.outside_equity_directory,10110);
+});
+
+test('default trading universe restricts feed and history to index stocks plus existing exposure',async t=>{
+  const broker=new RecoveryBroker(),members=['TEST'],master=[cashInstrument('TEST',22),cashInstrument('OUTSIDE',23),cashInstrument('HELD',24)];
+  const context={tradingConstituents:async()=>({status:'fresh',observed_at:isoIST(NOW),records:members.map(symbol=>({symbol}))}),close:()=>{},snapshot:()=>({})};
+  const engine=new TradingEngine(settings(temp(t)),new MemoryStore(),options({equityUniverse:undefined,marketContextFactory:()=>context}));
+  t.after(()=>engine.shutdown());assert.ok(engine.equity_universe instanceof NiftyTradingUniverse);
+  engine.equity_universe.directory={resolve:async()=>({instruments:master.map(row=>({...row,entry_eligible:true,security_kind:'equity'})),summary:{status:'verified'}})};
+  engine.broker=broker;engine.connected=true;engine.running=true;
+  engine.account.holdings=[{exchange:'NSE',product:'CNC',tradingsymbol:'HELD',quantity:2}];
+  engine.store.set('strategy_settings',{intraday_enabled:true,swing_enabled:false,manage_existing_holdings:'selected',managed_symbols:['HELD']});
+  let subscribed=[];broker.stream=async tokens=>{subscribed=tokens;};
+  await engine._refresh_universe_locked(master);
+  assert.deepEqual(subscribed,[22,24]);assert.equal(engine.universe[23],undefined);
+  assert.equal(engine.universe[24].entry_eligible,false);assert.equal(engine._authorized_holdings()[0].tradingsymbol,'HELD');
+  assert.equal(await engine._enter_locked(24,signal()),'instrument_not_entry_eligible');
+  const downloaded=[];broker.call=async(method,token)=>{assert.equal(method,'historical_data');downloaded.push(token);return [];};
+  engine.quotes={22:{last_price:100},24:{last_price:100}};
+  await engine._intraday_history_pass();assert.deepEqual(downloaded.sort((a,b)=>a-b),[22,24]);
+  engine._refresh_account_locked=async()=>{engine.account.holdings.push({exchange:'NSE',tradingsymbol:'OUTSIDE',quantity:1});};
+  engine._universe_retry_at=0;const controller=new AbortController();engine._wait_reconciliation=async()=>controller.abort();
+  await engine._monitor(controller.signal);
+  assert.deepEqual(subscribed,[22,23,24],'new manual exposure joins monitoring on the next account refresh');
+  assert.equal(engine.universe[23].entry_eligible,false);
+  assert.deepEqual(engine._authorized_holdings().map(row=>row.tradingsymbol),['HELD'],'monitoring never grants holding-management permission');
+  // Membership changes retain an already-managed position, but it cannot be
+  // selected for a new entry or contribute to the index breadth denominator.
+  engine.positions.TEST={symbol:'TEST',token:22,strategy:'intraday',side:'BUY',quantity:1,entry:100,last:100,stop:98,target:104,entry_fee:.1,opened_at:isoIST(NOW),protection:'simulated'};members.splice(0,1,'OUTSIDE');
+  await engine._refresh_universe_locked(master);
+  assert.equal(engine.universe[22].entry_eligible,false);assert.equal(engine.positions.TEST.token,22);
+  assert.equal(engine.universe[23].entry_eligible,true);assert.equal(engine.snapshot().universe_classification.entry_eligible_count,1);
+  assert.equal(marketBreadth(engine.universe,{23:{received_at:monotonic()}},engine.settings,monotonic()).coverage,1);
 });
 
 test('unavailable equity directory blocks entries and automatically recovers through bounded monitoring retry',async t=>{

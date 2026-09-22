@@ -5,6 +5,7 @@ import {selectIndexResearchSymbols} from './research-selection.js';
 import {BROAD_INDEX_NAMES} from './market-context.js';
 import {MAX_RESEARCH_BARS} from './backtest.js';
 import {STRATEGY_VERSION} from './strategy.js';
+import {DEFAULT_MIN_ENTRY_REWARD_RISK} from './entry-risk.js';
 import {validate_bars} from './indicators.js';
 import {dateIST,timeIST,isoIST,parseTime,sleep} from './util.js';
 
@@ -100,7 +101,7 @@ export class HistoricalResearch {
     const {intraday_capital,swing_capital,...strategies}=this.engine.strategy_settings?.()||{};
     return createHash('sha256').update(JSON.stringify([STRATEGY_VERSION,RESEARCH_WORKFLOW_VERSION,this.settings.kite_user_id||this.engine.user_id||null,this.settings.publicValues?.(),dateIST(this.now()),this.settings.research_symbols,this.settings.research_days,this.engine._strategy_options?.(),strategies,this._backtestOptions(0),this._selectionPlan()])).digest('hex');
   }
-  _backtestOptions(capital){return {initial_capital:capital,risk_per_trade_pct:this.settings.risk_per_trade_pct,max_position_pct:this.settings.max_position_pct,max_positions:this.settings.max_positions,fee_rate:this.settings.research_fee_rate,slippage_rate:this.settings.research_slippage_rate,entry_cutoff:this.settings.entry_cutoff,exit_time:this.settings.exit_time,max_bars:MAX_RESEARCH_BARS};}
+  _backtestOptions(capital){return {initial_capital:capital,risk_per_trade_pct:this.settings.risk_per_trade_pct,max_position_pct:this.settings.max_position_pct,max_positions:this.settings.max_positions,min_entry_reward_risk:this.settings.min_entry_reward_risk===undefined?DEFAULT_MIN_ENTRY_REWARD_RISK:this.settings.min_entry_reward_risk,fee_rate:this.settings.research_fee_rate,slippage_rate:this.settings.research_slippage_rate,entry_cutoff:this.settings.entry_cutoff,exit_time:this.settings.exit_time,max_bars:MAX_RESEARCH_BARS};}
   _retry(signature){const saved=this.store.get('research_auto_retry');return saved?.signature===signature?saved:{signature,failures:0,next_retry_at:null,cancelled:false};}
   _retryDelay(failures){return Math.min(this.retryMax,this.retryBase*2**Math.min(20,Math.max(0,failures)));}
   _accessSignature(){

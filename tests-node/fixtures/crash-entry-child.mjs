@@ -21,7 +21,7 @@ export function settings(directory){return {
 export function options(broker){return {now:()=>NOW,backgroundLoops:false,brokerFactory:()=>broker,
   equityUniverse:{resolve:async instruments=>({instruments:instruments.map(i=>({...i,entry_eligible:true})),summary:{status:'verified'}})},
   analyticsFactory:()=>({worker_limit:1,batch_size:1,snapshot:()=>({}),close:async()=>{},analyze:async()=>[]})};}
-export function entrySignal(side){const signal=new Signal('intraday',100,side==='SELL'?102:98,side==='SELL'?96:104,'Synthetic crash recovery setup',2);signal.side=side;return signal;}
+export function entrySignal(side){const signal=new Signal('intraday',100,side==='SELL'?102:98,side==='SELL'?96:104.5,'Synthetic crash recovery setup',2);signal.side=side;return signal;}
 export function emptyAccount(){return {orders:[],trades:[],holdings:[],positions:{net:[]},margins:{equity:{available:{cash:100000,live_balance:100000}}}};}
 export function instrument(){return {instrument_token:TOKEN,exchange:'NSE',segment:'NSE',instrument_type:'EQ',tradingsymbol:SYMBOL,tick_size:.05};}
 export function freshTick(){return {instrument_token:TOKEN,exchange_timestamp:NOW,last_price:100,volume_traded:100000,

@@ -9,7 +9,8 @@ import {ENHANCED_DEFAULTS} from '../src/strategy.js';
 const breakout={...ENHANCED_DEFAULTS,enhanced_signals:true,enable_breakout:true,enable_pullback:false,enable_reversion:false,
   enable_opening_range:false,enable_opening_drive:false,enable_gap_continuation:false,enable_gap_reversal:false,
   enable_vwap_reclaim:false,enable_vwap_rejection:false,enable_volatility_squeeze:false,enable_relative_strength:false,higher_timeframe_filter:false};
-const options={initial_capital:10000,max_runtime_ms:60000,fee_rate:.001,slippage_rate:.0005,max_position_pct:.6,risk_per_trade_pct:.02,strategy_options:breakout};
+// Small explicit costs leave narrow-range synthetic trades eligible for parity checks.
+const options={initial_capital:10000,max_runtime_ms:60000,fee_rate:.0001,slippage_rate:.00005,max_position_pct:.6,risk_per_trade_pct:.02,strategy_options:breakout};
 const automatic={mode:'automatic',status:'automatic',reason:'Offline test uses OS scheduling.',assignments:[]};
 function session(day='2026-09-14',short=false){
   const start=Date.parse(day+'T09:15:00+05:30'),bars=[];

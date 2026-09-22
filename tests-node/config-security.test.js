@@ -35,6 +35,20 @@ test('research CPU scheduling defaults safely, persists either mode and rejects 
   assert.equal((await new ConfigManager(dir,{}).load()).research_cpu_affinity,'pinned');
 });
 
+test('entry reward/risk defaults, validates and persists without weakening the minimum',async t=>{
+  const dir=temp(t),manager=new ConfigManager(dir,{}),settings=await manager.load({password:'Entry-risk-config-test!'});
+  assert.equal(settings.min_entry_reward_risk,1.5);
+  assert.equal(settings.publicValues().min_entry_reward_risk,1.5);
+  assert.equal(FIELDS.find(field=>field.key==='min_entry_reward_risk').type,'number');
+  manager.save({min_entry_reward_risk:1.75});
+  assert.equal((await new ConfigManager(dir,{}).load()).min_entry_reward_risk,1.75);
+  const before=fs.readFileSync(manager.filename,'utf8');
+  for(const value of [0,.99,10.1,NaN,Infinity,null,'1.5'])assert.throws(()=>manager.save({min_entry_reward_risk:value}),/min_entry_reward_risk/);
+  assert.equal(fs.readFileSync(manager.filename,'utf8'),before);
+  const legacy=JSON.parse(before);delete legacy.min_entry_reward_risk;fs.writeFileSync(manager.filename,JSON.stringify(legacy));
+  assert.equal((await new ConfigManager(dir,{}).load()).min_entry_reward_risk,1.5);
+});
+
 test('old research settings preserve the stock count and worker limit without restoring refinement',async t=>{
   const dir=temp(t),manager=new ConfigManager(dir,{ADMIN_PASSWORD_HASH:HASH});await manager.load();
   const legacy=JSON.parse(fs.readFileSync(manager.filename,'utf8'));delete legacy.research_workers;

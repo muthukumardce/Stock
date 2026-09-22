@@ -61,7 +61,7 @@ async function harness(){
 function report(){
   const metrics={initial_capital:100000,ending_equity:101250,net_pnl:1250,net_return_pct:1.25,trade_count:12,win_rate_pct:50,expectancy:104.166,profit_factor:null,max_drawdown_pct:2.5,costs_paid:190,open_positions:0};
   return {strategy_version:'2.0.0',dataset:{interval:'5minute',symbol_count:2,bar_count:3000,from:'2026-08-01',to:'2026-09-16',symbols:['INFY','<script>stock</script>'],errors:[{symbol:'MISSING',message:'Unavailable <data>'}]},
-    baseline:{metrics,period_metrics:[{name:'train',from:'2026-08-01',to:'2026-08-21',metrics}],cost_model:{fee_rate:.0003,slippage_rate:.0005},caveats:['Current universe may introduce selection bias.']},
+    baseline:{metrics,period_metrics:[{name:'train',from:'2026-08-01',to:'2026-08-21',metrics}],cost_model:{fee_rate:.0003,slippage_rate:.0005},options:{min_entry_reward_risk:1.5},decisions:{entry_reward_risk_too_low:7},caveats:['Current universe may introduce selection bias.']},
     enhanced:{metrics:{...metrics,net_return_pct:-.75,net_pnl:-750},period_metrics:[{name:'test',from:'2026-09-01',to:'2026-09-16',metrics}],caveats:['Current universe may introduce selection bias.']},
     caveats:['Historical simulation only. <Never a guarantee>'],
   };
@@ -146,6 +146,7 @@ test('report shows actual percent-point metrics, chronological periods, data gap
   assert.match(h.elements.get('research-symbols').innerHTML,/&lt;script&gt;/);assert.doesNotMatch(h.elements.get('research-symbols').innerHTML,/<script>/);
   assert.equal(h.elements.get('research-errors-panel').hidden,false);assert.match(h.elements.get('research-errors').innerHTML,/MISSING: Unavailable &lt;data&gt;/);
   const assumptions=h.elements.get('research-assumptions').innerHTML;assert.match(assumptions,/0\.03% per fill/);assert.match(assumptions,/0\.05% per fill/);assert.equal(assumptions.match(/selection bias/g).length,1);
+  assert.match(assumptions,/minimum entry reward\/risk after estimated costs: 1\.5:1/);assert.match(assumptions,/Entries rejected by this check: 7/);
   assert.equal(h.elements.get('research-progress').value,100);assert.match(h.elements.get('research-completed').textContent,/Finished/);
 });
 

@@ -5,7 +5,7 @@ import {strategy_snapshot} from './strategy-context.js';
 export {indicator_snapshot,validate_bars} from './indicators.js';
 export {strategy_snapshot,aggregate_15minute} from './strategy-context.js';
 
-export const STRATEGY_VERSION='3.0.0';
+export const STRATEGY_VERSION='3.1.1';
 export const STRATEGY_FAMILIES=Object.freeze({breakout:'enable_breakout',trend_pullback:'enable_pullback',range_reversion:'enable_reversion',
   opening_range:'enable_opening_range',opening_drive:'enable_opening_drive',gap_continuation:'enable_gap_continuation',gap_reversal:'enable_gap_reversal',
   vwap_reclaim:'enable_vwap_reclaim',vwap_rejection:'enable_vwap_rejection',volatility_squeeze:'enable_volatility_squeeze',relative_strength:'enable_relative_strength'});

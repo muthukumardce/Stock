@@ -37,12 +37,12 @@ function enhancedBreakoutSession({short=false,technical=false}={}) {
 }
 
 test('closed-bar signal enters at next candle open and closes intraday on schedule', () => {
-  const bars = session('2026-09-14', { 21: { open: 100.8, high: 100.9, low: 100.5, close: 100.6 } });
+  const bars = session('2026-09-14', { 21: { open: 100.65, high: 100.9, low: 100.5, close: 100.6 } });
   const result = runBacktest(dataset(bars), zeroCosts);
   assert.equal(result.trades.length, 1);
   const trade = result.trades[0];
   assert.equal(trade.signal_time, bars[21].time); assert.equal(trade.entry_time, bars[21].time);
-  assert.equal(trade.entry, 100.8); assert.equal(trade.reason, 'intraday_scheduled_close');
+  assert.equal(trade.entry, 100.65); assert.equal(trade.reason, 'intraday_scheduled_close');
   assert.equal(trade.exit_time, new Date('2026-09-14T15:10:00+05:30').toISOString());
   assert.equal(result.open_positions.length, 0);
 });
@@ -66,13 +66,44 @@ test('a stop gapping below its boundary fills at the worse open', () => {
 });
 
 test('costs are charged on both fills and slippage is adverse', () => {
-  const clean = runBacktest(dataset(), zeroCosts), costly = runBacktest(dataset(), { fee_rate: .001, slippage_rate: .0005 });
+  // Small explicit costs keep this narrow-range fixture eligible; default
+  // costs disqualify it, covered separately by the entry-economics tests.
+  const clean = runBacktest(dataset(), zeroCosts), costly = runBacktest(dataset(), { fee_rate: .0001, slippage_rate: .00005 });
   const t = costly.trades[0];
   assert.ok(t.entry > clean.trades[0].entry); assert.ok(t.exit < clean.trades[0].exit);
   assert.ok(t.entry_fee > 0 && t.exit_fee > 0);
   assert.ok(Math.abs(t.pnl - ((t.exit - t.entry) * t.quantity - t.entry_fee - t.exit_fee)) < 1e-5);
   assert.ok(costly.metrics.net_pnl < clean.metrics.net_pnl);
   assert.ok(Math.abs(costly.metrics.costs_paid - t.entry_fee - t.exit_fee) < 1e-5);
+});
+
+test('research rejects remaining reward after an adverse next open even while the target stays ahead',()=>{
+  const bars=session('2026-09-14',{21:{open:100.8,high:100.9,low:100.5,close:100.6}});
+  const result=runBacktest(dataset(bars),zeroCosts);
+  assert.equal(result.trades.length,0);assert.equal(result.open_positions.length,0);
+  assert.ok(result.decisions.entry_reward_risk_too_low>0);
+  assert.equal(result.decisions.opening_gap_invalidates_signal,undefined);
+  assert.equal(result.metrics.costs_paid,0);
+});
+
+test('research uses net costs and the configured minimum for both signal modes',()=>{
+  const data=dataset(),clean=runBacktest(data,zeroCosts),costly=runBacktest(data);
+  assert.equal(clean.trades.length,1);assert.ok(clean.trades[0].entry_risk.reward_risk>=1.5);
+  assert.equal(costly.trades.length,0);assert.ok(costly.decisions.entry_reward_risk_too_low>0);
+  assert.equal(runBacktest(data,{...zeroCosts,min_entry_reward_risk:2.1}).trades.length,0);
+  const comparison=compareStrategies(data,{...zeroCosts,min_entry_reward_risk:2.1});
+  assert.equal(comparison.baseline.options.min_entry_reward_risk,2.1);
+  assert.equal(comparison.enhanced.options.min_entry_reward_risk,2.1);
+  for(const value of [0,null,NaN,Infinity,10.1])assert.throws(()=>runBacktest(data,{min_entry_reward_risk:value}),/min_entry_reward_risk/);
+});
+
+test('short research rejects an adverse next-open move without relying on future candles',()=>{
+  const bars=enhancedBreakoutSession({short:true}),strategy_options={...breakoutOnly,technical_exit_enabled:false};
+  const reference=runBacktest(dataset(bars),{...zeroCosts,strategy_options});assert.equal(reference.trades.length,1);
+  bars[34].open-=.2;bars[34].low=Math.min(bars[34].low,bars[34].open);
+  const result=runBacktest(dataset(bars),{...zeroCosts,strategy_options});
+  assert.equal(result.trades.length,0);assert.ok(result.decisions.entry_reward_risk_too_low>0);
+  assert.equal(result.decisions.opening_gap_invalidates_signal,undefined);
 });
 
 test('one bankroll is shared by simultaneous symbol candidates with deterministic tie breaks', () => {
@@ -374,7 +405,7 @@ test('benchmark and sector context are validated and count toward the shared mem
 
 test('short entries sell at the next open and buy back with adverse slippage and both fill costs',()=>{
   const bars=enhancedBreakoutSession({short:true}),strategy_options={...breakoutOnly,technical_exit_enabled:false};
-  const clean=runBacktest(dataset(bars),{...zeroCosts,strategy_options}),costly=runBacktest(dataset(bars),{fee_rate:.001,slippage_rate:.0005,strategy_options});
+  const clean=runBacktest(dataset(bars),{...zeroCosts,strategy_options}),costly=runBacktest(dataset(bars),{fee_rate:.0001,slippage_rate:.00005,strategy_options});
   assert.equal(clean.trades.length,1); const trade=clean.trades[0],charged=costly.trades[0];
   assert.equal(trade.side,'SELL');assert.equal(trade.entry_time,bars[34].time.toISOString());
   assert.ok(Math.abs(trade.entry-bars[34].open)<1e-8);assert.equal(trade.reason,'intraday_scheduled_close');
@@ -443,21 +474,21 @@ test('shared daily SMA trend failure schedules swing liquidation at the followin
   assert.equal(trade.exit_time,new Date(bars[76].time+'T09:15:00+05:30').toISOString());assert.equal(trade.exit,bars[76].open);
 });
 
-test('completed previous-session context enables early opening-drive analysis without future bar access',()=>{
+for(const previousCount of [75,72])test(`${previousCount}-candle previous-session context enables early opening-drive analysis without future bar access`,()=>{
   const previousStart=+new Date('2026-09-16T09:15:00+05:30'),start=+new Date('2026-09-17T09:15:00+05:30');
-  const closes=Array.from({length:75},(_,i)=>100+(i-74)*.005+Math.sin(i*.8)*.2),adjustment=closes.at(-1)-100;
+  const closes=Array.from({length:75},(_,i)=>100+(i-74)*.005+Math.sin(i*.8)*.2).slice(-previousCount),adjustment=closes.at(-1)-100;
   const previous=closes.map((value,i)=>{const close=value-adjustment,open=i?closes[i-1]-adjustment:close-.02;
     return new Candle(new Date(previousStart+i*300000),open,Math.max(open,close)+.05,Math.min(open,close)-.05,close,1000);});
   const today=[];
   for(let i=0;i<75;i++){const close=[100.22,100.34,100.46][i]??100.46,open=i?today.at(-1).close:100.1;
     today.push(new Candle(new Date(start+i*300000),open,Math.max(open,close)+.02,Math.min(open,close)-.02,close,i<3?2500:1000));}
   const strategy_options={...breakoutOnly,enable_breakout:false,enable_opening_drive:true,intraday_short_enabled:false,higher_timeframe_filter:true,technical_exit_enabled:false};
-  const full=dataset([...previous,...today]),result=runBacktest(full,{...zeroCosts,strategy_options});
+  const full=dataset([...previous.slice(0,previousCount),...today]),result=runBacktest(full,{...zeroCosts,strategy_options});
   const entry=result.trades.find(t=>t.entry_time===today[3].time.toISOString());
   assert.ok(entry,'The shared strategy must receive yesterday’s completed indicator and15-minute context');
   assert.equal(entry.setup,'opening_drive');
   assert.equal(runBacktest(dataset(today),{...zeroCosts,strategy_options}).trades.some(t=>t.entry_time===entry.entry_time),false);
-  const changed=structuredClone(full);Object.assign(changed.symbols.INFY[85],{open:101,high:102,low:100.9,close:101.5});
+  const changed=structuredClone(full);Object.assign(changed.symbols.INFY[previousCount+10],{open:101,high:102,low:100.9,close:101.5});
   const altered=runBacktest(changed,{...zeroCosts,strategy_options}).trades.find(t=>t.entry_time===entry.entry_time);
   for(const field of ['entry_time','entry','quantity','side','score'])assert.equal(altered[field],entry[field]);
 });

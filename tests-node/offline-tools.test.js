@@ -119,7 +119,8 @@ test('offline research requires explicit capital and exports exclusively without
   const directory=temporary(t),input=path.join(directory,'candles.json'),output=path.join(directory,'report.json');fs.writeFileSync(input,JSON.stringify(candles()));
   await assert.rejects(runOfflineResearch(input,output,undefined),/explicit positive capital/);assert.equal(fs.existsSync(output),false);
   const result=await runOfflineResearch(input,output,25000),report=JSON.parse(fs.readFileSync(output,'utf8'));
-  assert.equal(result.baseline_trades,1);assert.equal(report.baseline.metrics.initial_capital,25000);
+  assert.equal(result.baseline_trades,0);assert.equal(report.baseline.metrics.initial_capital,25000);
+  assert.ok(report.baseline.decisions.entry_reward_risk_too_low>0);assert.equal(report.baseline.options.min_entry_reward_risk,1.5);
   assert.equal(report.enhanced.metrics.initial_capital,25000);assert.equal(fs.existsSync(path.join(directory,'config')),false);
   const bytes=fs.readFileSync(output);await assert.rejects(runOfflineResearch(input,output,25000),/must not already exist/);
   assert.deepEqual(fs.readFileSync(output),bytes);

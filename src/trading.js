@@ -13,9 +13,11 @@ import { Candle, CandleBook, Signal, position_size, STRATEGY_VERSION, technical_
 import { marketBreadth, portfolioExposure, portfolioEntryGate, returnCorrelation, pendingDeliveryQuantity } from './decision-controls.js';
 import { sideOf, directionOf, exitSideOf, plannedRisk, markedProfit } from './direction.js';
 import { MarketContext } from './market-context.js';
-import { EquityUniverse } from './equity-universe.js';
+import { NiftyTradingUniverse } from './nifty-trading-universe.js';
 import { BackgroundActivity } from './background-activity.js';
 import { activityHelp } from './activity-help.js';
+import { entryRewardRisk, DEFAULT_MIN_ENTRY_REWARD_RISK } from './entry-risk.js';
+import { validPreviousIntradaySeed } from './intraday-seed.js';
 import { validate_bars } from './indicators.js';
 import { Mutex, sleep, monotonic, nowIST, parseTime, dateIST, timeIST, isoIST, marketHours } from './util.js';
 
@@ -76,7 +78,6 @@ export class TradingEngine {
     }
     this._delivery_accounted = Number(saved.delivery_accounted || 0);
     this.universe = {}; this.books = {}; this.quotes = {}; this.streams = {};
-    this.equity_universe = options.equityUniverse || new EquityUniverse(store,{now:()=>this._now()});
     this.universe_summary=null;this._universe_date='';this._universe_generation=0;this._universe_retry_at=0;this._instrument_master=null;this._instrument_master_date='';
     this.account = store.get('account_snapshot', { margins: {}, holdings: [], positions: {}, orders: [], trades: [] });
     this._account_at = -Infinity; this._heartbeat = null; this._tasks = []; this._retiringTasks = [];
@@ -102,6 +103,7 @@ export class TradingEngine {
     this._correlation_wanted = new Set(); this._candidate_batch_at = null;
     this.previous_intraday={};
     this.market_context=options.marketContextFactory?options.marketContextFactory(store,settings):new MarketContext(store,settings,{now:()=>this._now()});
+    this.equity_universe=options.equityUniverse||new NiftyTradingUniverse(store,{marketContext:this.market_context,now:()=>this._now()});
     this._loss_control = saved.loss_control || {day:this.day,last_realised:this.realised,loss_events:0,until:null};
     this._profile_verified = false; this._recovery_account_verified = false; this._recovery_holdings_checked = false; this._clock_seen = null;
     this.recovery = { phase: 'awaiting_session', message: 'Sign in to Zerodha to verify the current account before trading.', started_at: null, completed_at: null, blocked: true };
@@ -158,7 +160,7 @@ export class TradingEngine {
     return (this.account.holdings || []).filter(h => h.exchange === 'NSE' && (h.product || 'CNC') === 'CNC' && !h.discrepancy && Number(h.quantity || 0) - Number(h.used_quantity || 0) - Number(h.collateral_quantity || 0) > 0 && (config.manage_existing_holdings === 'all' || selected.has(h.tradingsymbol)));
   }
   _authorized_holdings() {
-    const eligible=new Set(values(this.universe).filter(i=>i.entry_eligible!==false).map(i=>i.tradingsymbol));
+    const eligible=new Set(values(this.universe).filter(i=>(i.holding_eligible??i.entry_eligible)!==false).map(i=>i.tradingsymbol));
     return this._selected_holdings().filter(h=>eligible.has(h.tradingsymbol));
   }
   _holding_management_settings(){
@@ -167,18 +169,27 @@ export class TradingEngine {
     for(const [symbol,p] of entries(this.delivery?.snapshot().positions||{}))if(p.status!=='closed'&&(config.manage_existing_holdings==='all'||selected.has(symbol)))symbols.add(symbol);
     return {...config,manage_existing_holdings:'selected',managed_symbols:[...symbols]};
   }
+  _universe_exposure_symbols(){
+    const accountExposure=[...(this.account.holdings||[]).filter(h=>Number(h.quantity)>0||Number(h.t1_quantity)>0||Number(h.collateral_quantity)>0),
+      ...(this.account.positions?.net||[]).filter(p=>Number(p.quantity||0)!==0),
+      ...(this.account.orders||[]).filter(o=>!['COMPLETE','CANCELLED','REJECTED'].includes(o.status))]
+      .filter(row=>row.exchange==='NSE'&&typeof row.tradingsymbol==='string').map(row=>row.tradingsymbol);
+    return [...new Set([...Object.keys(this.positions),...values(this.intents).filter(i=>!['closed','rejected'].includes(i.state)).map(i=>i.symbol),
+      ...entries(this.delivery?.snapshot().positions||{}).filter(([,p])=>p.status!=='closed').map(([symbol])=>symbol),...accountExposure])];
+  }
   async _refresh_universe_locked(instruments=null,onStage=null){
     const activity=this._activity.begin('universe',{message:'Downloading NSE instruments.',total:3});
     try {
     const today=dateIST(this._now());
     this._universe_retry_at=monotonic()+60;
     const master=instruments||(this._instrument_master_date===today&&this._instrument_master?this._instrument_master:await this.broker.call('instruments','NSE'));
-    activity({message:'Verifying official NSE stock and ETF lists.',completed:1});
-    const managedSymbols=[...new Set([...Object.keys(this.positions),...values(this.intents).filter(i=>!['closed','rejected'].includes(i.state)).map(i=>i.symbol),...entries(this.delivery?.snapshot().positions||{}).filter(([,p])=>p.status!=='closed').map(([symbol])=>symbol)])];
+    activity({message:'Verifying Nifty Total Market constituents and NSE security lists.',completed:1});
+    const managedSymbols=this._universe_exposure_symbols();
     const result=await this.equity_universe.resolve(master,{managedSymbols});
     if(result.instruments.length>9000)throw new Error('Verified NSE shares plus managed exposure exceed the streaming capacity. No symbols were silently removed.');
     const before=this.universe,next=Object.fromEntries(result.instruments.map(i=>[Number(i.instrument_token),i]));
     this._instrument_master=master;this._instrument_master_date=today;this.universe=next;this.universe_summary=result.summary;
+    this._universe_tracked_symbols=new Set([...managedSymbols,...result.instruments.map(i=>i.tradingsymbol)]);
     const generation=++this._universe_generation;
     // Classification alone cannot complete refresh: an unsuccessful stream
     // replacement must remain eligible for the monitor's bounded retry.
@@ -196,14 +207,14 @@ export class TradingEngine {
     this.quotes={};this.streams={};this._last_tick_received=-Infinity;this._heartbeat=null;
     this._intraday_history_loaded.clear();this._intraday_history_retry={};this._history_date='';
     this._reconcile_authorization();
-    this._event('universe_classified',result.summary.status==='verified'?'NSE stock and ETF universe verified against official security lists.':'NSE security lists unavailable. New entries are blocked; managed exposure remains monitored.',result.summary,result.summary.status==='verified'?'info':'warning');
+    this._event('universe_classified',result.summary.status==='verified'?'Nifty Total Market trading universe verified against official constituent and security lists.':'Nifty Total Market membership or NSE security lists unavailable. New entries are blocked; existing exposure remains monitored.',result.summary,result.summary.status==='verified'?'info':'warning');
     const activeBroker=this.broker;
     const current=()=>this.broker===activeBroker&&generation===this._universe_generation&&!this._shutdown;
     onStage?.('stream');
     activity({message:`Subscribing to ${Object.keys(next).length} NSE instruments.`,completed:2});
     await activeBroker.stream(Object.keys(next).map(Number),ticks=>{if(current())this._on_ticks(ticks);},order=>{if(current())this._on_order(order);},(...args)=>{if(current())this._on_stream(...args);});
     if(current()&&dateIST(this._now())===today)this._universe_date=result.summary.status==='verified'?today:'';
-    activity({status:result.summary.status==='verified'?'idle':'waiting',message:result.summary.status==='verified'?`${Object.keys(next).length} NSE instruments classified; feed subscriptions requested.`:'Official NSE lists unavailable. Entries wait for verification.',completed:3});
+    activity({status:result.summary.status==='verified'?'idle':'waiting',message:result.summary.status==='verified'?`${result.summary.entry_eligible_count??Object.keys(next).length} Nifty Total Market stocks eligible; ${Object.keys(next).length} instruments monitored including existing exposure.`:'Nifty Total Market membership or NSE security lists unavailable. Entries wait for verification.',completed:3});
     } catch (error) { activity({status:'failed',message:'NSE universe refresh failed. Reconnect if startup failed; connected monitoring retries refreshes.',failed:1});throw error; }
   }
   _has_managed_or_authorized_exposure() {
@@ -215,7 +226,7 @@ export class TradingEngine {
     if (!this.connected) { reason = 'Sign in to Zerodha to restore verified account monitoring.'; phase = 'awaiting_session'; }
     else if (!this._profile_verified || !this._recovery_account_verified) { reason = 'Waiting for complete broker account verification.'; phase = 'reconciling'; }
     else if (this._unresolved_intents()) { reason = 'An order, quantity or protection is unresolved. Inspect Zerodha; no duplicate orders will be sent.'; phase = 'blocked'; }
-    else if (this.universe_summary&&(this.universe_summary.status!=='verified'||this._universe_date!==dateIST(this._now()))) { reason='NSE stock and ETF lists are unavailable or stale. New entries wait while account and managed-position monitoring continue.';phase='blocked'; }
+    else if (this.universe_summary&&(this.universe_summary.status!=='verified'||this._universe_date!==dateIST(this._now()))) { reason='Nifty Total Market membership or NSE security lists are unavailable or stale. New entries wait while account and managed-position monitoring continue.';phase='blocked'; }
     else if (this.mode==='live'&&this.holdings_authorization.snapshot().required) { reason='Complete the required holdings authorization on Zerodha/CDSL. Existing positions remain monitored.';phase='awaiting_authorization'; }
     else {
       const symbols = this._managed_recovery_symbols(), tokens = Object.fromEntries(entries(this.universe).map(([t, i]) => [i.tradingsymbol, Number(t)]));
@@ -260,7 +271,7 @@ export class TradingEngine {
         try {instruments=await this.broker.call('instruments','NSE');}
         catch(error){universeActivity({status:'failed',message:'NSE instrument download failed. Reconnect to retry startup.',failed:1});throw error;}
         this.connected = true;
-        onProgress?.({phase:'universe',message:'Verifying NSE stock and ETF lists.',completed:8,total:10});
+        onProgress?.({phase:'universe',message:'Verifying Nifty Total Market constituents and NSE security lists.',completed:8,total:10});
         await this._refresh_universe_locked(instruments, value => { stage = value; onProgress?.({phase:value,message:'Subscribing to the live NSE market feed.',completed:9,total:10}); });
         stage = 'readiness';
         if (!this._unresolved_intents()) { this.status = 'monitoring'; this.error = null; this.message = 'Monitoring Zerodha. Entries wait for completed strategy candles, prior-session context and fresh risk checks.'; }
@@ -571,7 +582,7 @@ export class TradingEngine {
     const checks=[
       {key:'broker_session',ok:this.connected&&this._profile_verified,detail:'Authenticated account identity verified.'},
       ...(brokerClock?[{key:'system_clock',ok:!this._clock_block(),detail:brokerClock.blocked?'The broker and system clocks disagree. Synchronize the operating-system clock; new entries wait.':brokerClock.status!=='aligned'||brokerClock.stale?'Waiting for a recent, bounded broker clock check.':'Recent broker response time agrees with the system clock within the freshness tolerance.'}]:[]),
-      {key:'equity_universe',ok:this.universe_summary?.status==='verified'&&this._universe_date===dateIST(this._now()),detail:this.universe_summary?.status==='verified'?`${values(this.universe).filter(i=>i.entry_eligible!==false).length} stocks and ETFs verified against NSE security lists; managed instruments outside that scope remain exit-only.`:'Waiting for current NSE stock and ETF lists. Managed exposure stays monitored; new entries are blocked.'},
+      {key:'equity_universe',ok:this.universe_summary?.status==='verified'&&this._universe_date===dateIST(this._now()),detail:this.universe_summary?.status==='verified'?`${values(this.universe).filter(i=>i.entry_eligible!==false).length} Nifty Total Market stocks eligible; existing exposure outside the index stays monitored without new entries.`:'Waiting for current Nifty Total Market membership and NSE security lists. Existing exposure stays monitored; new entries are blocked.'},
       {key:'account_snapshot',ok:this.connected&&clock-this._account_at<=45,detail:'Orders, positions, holdings and cash observed within 45 seconds.'},
       {key:'trading_cash',ok:this.capital>0&&(this.mode==='paper'||this._available_cash()>0),detail:'Positive trading budget required; live entries also require verified available Zerodha cash.'},
       {key:'reconciliation',ok:this.recovery.phase==='ready'&&!this._unresolved_intents(),detail:this.recovery.message},
@@ -598,7 +609,7 @@ export class TradingEngine {
     const regime=marketBreadth(this.universe,this.quotes,this.settings,monotonic()),portfolio=this._portfolio(),blocked_reasons=[];
     const until=parseTime(this._loss_control.until),cooling=until&&until>this._now();
     if(['warming_up','defensive'].includes(regime.status))blocked_reasons.push(regime.message);
-    if(this.universe_summary&&(this.universe_summary.status!=='verified'||this._universe_date!==dateIST(this._now())))blocked_reasons.push('Current NSE stock and ETF eligibility is unverified.');
+    if(this.universe_summary&&(this.universe_summary.status!=='verified'||this._universe_date!==dateIST(this._now())))blocked_reasons.push('Current Nifty Total Market trading eligibility is unverified.');
     if(cooling)blocked_reasons.push('New entries are in a loss cooldown.');
     if(this.settings.portfolio_risk_enabled&&(portfolio.unpriced_symbols.length||portfolio.unsupported_symbols.length))blocked_reasons.push('Some account exposure cannot be valued safely.');
     if(this.settings.max_trades_per_day&&this.traded.size>=this.settings.max_trades_per_day)blocked_reasons.push('Daily new-symbol limit reached.');
@@ -673,13 +684,15 @@ export class TradingEngine {
     for (let left = batchReady?Math.min(10, this._candidates.length):0; left > 0; left--) {
       const [token, signal, received, record] = this._candidates.shift();
       if (monotonic() - received <= 30) {
-        const reason = record.source ? await this._enter_locked(token, signal,record.source) : 'signal_source_missing'; record.status = reason;
+        const reason = record.source ? await this._enter_locked(token, signal,record.source,record) : 'signal_source_missing'; record.status = reason;
+        if (reason === 'entry_reward_risk_too_low') record.reason = `Entry reward/risk after estimated costs is ${record.entry_risk.reward_risk.toFixed(3)}:1; requires ${record.entry_risk.min_reward_risk}:1.`;
+        if (reason === 'invalid_entry_economics') record.reason = 'Executable entry prices or cost assumptions could not be validated.';
         const rejection = reason === 'cover_order_rejected' ? values(this.intents).findLast(intent=>intent.symbol===record.symbol && intent.rejection)?.rejection : null;
         if (rejection) record.reason = `${rejection.message} (${rejection.kind}, HTTP ${rejection.http_status})`;
         if (reason === 'existing_holdings_ignored') record.reason = 'This stock is already owned and excluded by your existing-holdings setting.';
         this._stats['decision:'+reason] = (this._stats['decision:'+reason] || 0) + 1;
         if (/^(cover_order_|delivery_|paper_(buy|short)_filled)/.test(reason))
-          this._event('decision', `${record.symbol}: ${reason}${rejection ? `. ${record.reason}` : ''}`, { symbol: record.symbol, strategy: signal.strategy,side:sideOf(signal),setup:signal.setup,score:signal.score, decision: reason, ...(rejection ? {rejection} : {}) }, rejection ? 'error' : 'info');
+          this._event('decision', `${record.symbol}: ${reason}${rejection ? `. ${record.reason}` : ''}`, { symbol: record.symbol, strategy: signal.strategy,side:sideOf(signal),setup:signal.setup,score:signal.score, decision: reason, ...(record.entry_risk ? {entry_risk:record.entry_risk} : {}), ...(rejection ? {rejection} : {}) }, rejection ? 'error' : 'info');
       }
     }
     if(!this._candidates.length)this._candidate_batch_at=null;
@@ -720,7 +733,8 @@ export class TradingEngine {
         await this._lock.run(async () => {
           if(signal?.aborted||this._shutdown)return;
           await this._refresh_account_locked();
-          if(this.connected&&this._universe_date!==dateIST(this._now())&&monotonic()>=this._universe_retry_at){stage='universe';await this._refresh_universe_locked(null,value=>{stage=value;});stage='recovery';this._advance_recovery();}
+          const newExposure=this.universe_summary?.index&&this._universe_exposure_symbols().some(symbol=>!this._universe_tracked_symbols?.has(symbol));
+          if(this.connected&&(this._universe_date!==dateIST(this._now())||newExposure)&&monotonic()>=this._universe_retry_at){stage='universe';await this._refresh_universe_locked(null,value=>{stage=value;});stage='recovery';this._advance_recovery();}
         });
         stage = 'waiting';
         await this._wait_reconciliation(signal);
@@ -869,7 +883,7 @@ export class TradingEngine {
     return positions + pending + delivery;
   }
 
-  async _enter_locked(token, signal, source = null) {
+  async _enter_locked(token, signal, source = null, decision = null) {
     if (!this.running) return 'entries_paused';
     if(!this.universe[token]||this.universe[token].entry_eligible===false)return 'instrument_not_entry_eligible';
     if(this.universe_summary&&(this.universe_summary.status!=='verified'||this._universe_date!==dateIST(this._now())))return 'equity_directory_unavailable';
@@ -923,6 +937,10 @@ export class TradingEngine {
     const stop=round((direction===1?Math.floor(signal.stop/tick_size):Math.ceil(signal.stop/tick_size))*tick_size,4);
     if(![entry,stop,signal.target].every(Number.isFinite)||Math.min(entry,stop,signal.target)<=0||direction*(entry-stop)<=0||direction*(signal.target-entry)<=0)return 'invalid_executable_reward';
     if(signal.strategy==='swing'){const gate=swing_entry_gate(this.daily[token]||[],{...signal,tick_size},entry);if(gate)return gate;}
+    const entry_risk=entryRewardRisk({side,entry,stop,target:signal.target,fee_rate:FEE_RATE,exit_slippage_rate:.0005,
+      min_reward_risk:this.settings.min_entry_reward_risk===undefined?DEFAULT_MIN_ENTRY_REWARD_RISK:this.settings.min_entry_reward_risk});
+    if(decision)decision.entry_risk=entry_risk;
+    if(!entry_risk.ok)return entry_risk.reason;
     let remaining = Math.min(allocation - this._exposure(signal.strategy), this.capital + Math.min(0, this.realised - this._capital_accounted_pnl) - this._exposure());
     if (this.mode === 'live') {
       if (!this.settings.live_trading_enabled) return 'live_execution_disabled';
@@ -941,7 +959,7 @@ export class TradingEngine {
     if (riskUsed + plannedRisk({entry,stop,quantity,side}) > this.capital * this.settings.daily_loss_pct) return 'aggregate_risk_limit';
     if (this._maintenance() || !this.running) return 'entries_paused';
     if (this.mode === 'paper') {
-      this.positions[symbol] = { symbol, token: Number(token), strategy: signal.strategy, setup:signal.setup, side, tick_size,quantity, entry, last: Number(quote.last_price), stop, target: signal.target, entry_fee: entry * quantity * FEE_RATE, opened_at: isoIST(now), protection: 'simulated', mode: 'paper' };
+      this.positions[symbol] = { symbol, token: Number(token), strategy: signal.strategy, setup:signal.setup, side, tick_size,quantity, entry, entry_risk, last: Number(quote.last_price), stop, target: signal.target, entry_fee: entry * quantity * FEE_RATE, opened_at: isoIST(now), protection: 'simulated', mode: 'paper' };
       this.traded.add(symbol); this._persist(); this._event('paper_fill', `Simulated ${side} ${quantity} ${symbol} at ${entry.toFixed(2)}.`, this.positions[symbol]); return side==='SELL'?'paper_short_filled':'paper_buy_filled';
     }
     if (signal.strategy === 'swing') {
@@ -950,7 +968,7 @@ export class TradingEngine {
       this._sync_delivery(); this._persist(); this.request_reconciliation(); return `delivery_${result.status || 'unknown'}${result.reason ? ': ' + result.reason : ''}`;
     }
     const tag = 'EB' + randomUUID().replaceAll('-', '').slice(0, 18);
-    const intent = { tag, symbol, token: Number(token), strategy: signal.strategy, setup:signal.setup, side, quantity, entry, stop, target: signal.target, created_at: isoIST(now), state: 'submitting', filled: 0, exit_requested: [], pnl_accounted: 0 };
+    const intent = { tag, symbol, token: Number(token), strategy: signal.strategy, setup:signal.setup, side, quantity, entry, entry_risk, stop, target: signal.target, created_at: isoIST(now), state: 'submitting', filled: 0, exit_requested: [], pnl_accounted: 0 };
     this.intents[tag] = intent; this.traded.add(symbol); this._persist();
     this._event('order_intent', `Submitting protected cover ${side} ${quantity} ${symbol}.`, intent);
     try { intent.order_id = String(await this.broker[side==='SELL'?'sell_cover':'buy_cover'](symbol, quantity, entry, stop, tag)); intent.state = 'pending'; }
@@ -1193,10 +1211,7 @@ export class TradingEngine {
     }
   }
   _valid_intraday_seed(rows,today){
-    if(!Array.isArray(rows)||rows.length<34||!validate_bars(rows,{interval:'intraday'}).valid)return false;
-    const last=parseTime(rows.at(-1).time??rows.at(-1).date),priorDay=dateIST(last);
-    const age=parseTime(today+'T00:00:00+05:30')-parseTime(priorDay+'T00:00:00+05:30');
-    return priorDay<today&&age<=7*86400000&&timeIST(last)==='15:25';
+    return validPreviousIntradaySeed(rows,today);
   }
   _intraday_history_progress() {
     const date = dateIST(this._now()), universe = JSON.stringify(entries(this.universe).map(([token,i])=>[token,i.tradingsymbol]));
@@ -1219,6 +1234,10 @@ export class TradingEngine {
       delete this.previous_intraday[token];this._intraday_history_loaded.delete(Number(token));delete this._intraday_history_retry[token];
     }
     const managed = new Set(values(this.positions).map(p => Number(p.token))), wanted = this._priority_tokens(Object.keys(this.universe).map(Number).filter(t => !this._intraday_history_loaded.has(t)&&monotonic()>=(this._intraday_history_retry[t]||0)), managed);
+    // Managed exposure stays first; finish initial coverage before repairing
+    // already-warmed stocks. Stable sorting retains turnover order per group.
+    const warmed=this._intraday_warmup.completed;
+    wanted.sort((a,b)=>Number(!managed.has(a))-Number(!managed.has(b))||Number(warmed.has(a))-Number(warmed.has(b)));
     const broker = this.broker,generation=this._universe_generation;
     const valid=()=>this.connected&&!signal?.aborted&&!this._shutdown&&broker===this.broker&&generation===this._universe_generation&&dateIST(this._now())===today;
     let finished=false,stopped=false,rateLimited=false,passError=null,next=0;
@@ -1326,7 +1345,7 @@ export class TradingEngine {
         const verified = this.universe_summary?.status === 'verified';
         Object.assign(record, { managed: false, status: verified ? 'unsupported' : 'universe_unavailable', reason: verified ? 'Outside the verified NSE stock and ETF universe; automatic exit analysis is unavailable for this holding.' : 'NSE stock and ETF eligibility is not verified yet; this holding cannot be analysed until its instrument is available.' }); continue;
       }
-      if (instrument.entry_eligible === false || instrument.recovery_only) Object.assign(record, { scope: 'recovery_only', scope_reason: 'Existing managed exposure is monitored for exits only; new purchases and new holding adoption are disabled for this instrument.' });
+      if (instrument.entry_eligible === false || instrument.recovery_only) Object.assign(record, { scope: 'recovery_only', scope_reason: instrument.holding_eligible===true?'Outside the Nifty Total Market entry universe. Existing holding-management permissions still apply; new entries are disabled.':'Existing managed exposure is monitored for exits only; new purchases and new holding adoption are disabled for this instrument.' });
       const analysis = this._analysis_cache.get(keyFor('swing', token)), research = analysis?.holding;
       const quote = this.quotes[token] || {}, fresh = monotonic() - (quote.received_at ?? -Infinity) <= 10;
       if (bars.length >= 21 && research) {

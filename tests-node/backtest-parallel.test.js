@@ -27,7 +27,8 @@ function daily(){
 }
 
 test('parallel comparison preserves the full serial portfolio report for simultaneous long and short candidates',async()=>{
-  const data=intraday(),before=structuredClone(data),config={...options,enhanced_options:breakout,max_position_pct:.6,risk_per_trade_pct:.02};
+  // Keep narrow-range fixture entries eligible while verifying costs in both workers.
+  const data=intraday(),before=structuredClone(data),config={...options,fee_rate:.0001,slippage_rate:.00005,enhanced_options:breakout,max_position_pct:.6,risk_per_trade_pct:.02};
   const expected=compareStrategies(data,config),events=[],progress=[];
   const actual=await compareStrategiesParallel(data,{...config,parallelism:3},{onWorkerEvent:event=>events.push(event),onProgress:value=>progress.push(structuredClone(value))});
   assert.deepEqual(actual,expected);assert.deepEqual(data,before);

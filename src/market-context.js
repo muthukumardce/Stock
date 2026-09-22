@@ -179,8 +179,8 @@ export class MarketContext {
       if(type==='json'){try{return JSON.parse(body);}catch{fail('invalid_json');}}return body;
     });
   }
-  async _refreshIndexes(force){
-    for(const source of this.indexSources){
+  async _refreshIndexes(force,sources=this.indexSources){
+    for(const source of sources){
       if(this.closed)return;
       const key='index:'+source.id,item=this.cache.indexes[source.id];
       if(!this._ready(key,force)||!force&&item&&age(this.now(),item.observed_at)<DAY)continue;
@@ -308,6 +308,15 @@ export class MarketContext {
       return {id,url,status:fresh?'fresh':item?'stale':'unavailable',observed_at:item?.observed_at||null,from:item?.from||null,to:item?.to||null,event_count:item?.events.length||0,last_error:this.cache.attempts['event:'+id]?.error||null,next_attempt_at:this.cache.attempts['event:'+id]?.next_attempt_at||null};
     });
     return {status:sources.every(source=>source.status==='fresh')?'fresh':sources.some(source=>source.status==='fresh')?'partial':sources.some(source=>source.status==='stale')?'stale':'unavailable',sources};
+  }
+  async tradingConstituents(){
+    const source=this.indexSources.find(item=>item.id==='niftytotalmarket');
+    const cached=source&&this.cache.indexes[source.id],observed=parseTime(cached?.observed_at);
+    // Entry eligibility needs today's membership, even when the previous day's
+    // cache is still recent enough for research/classification. Respect retries.
+    if(source)await this._refreshIndexes(!observed||dateIST(observed)!==dateIST(this.now()),[source]);
+    const index=this.researchConstituents(),at=parseTime(index.observed_at);
+    return {...index,status:index.status==='fresh'&&(!at||dateIST(at)!==dateIST(this.now()))?'stale':index.status};
   }
   researchConstituents(){
     const source=INDEX_SOURCES.find(item=>item.id==='niftytotalmarket'),cached=this.cache.indexes[source.id];

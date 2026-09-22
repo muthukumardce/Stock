@@ -3,11 +3,13 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import dotenv from 'dotenv';
 import { hashPassword, randomSecret, Fernet } from './security.js';
+import { DEFAULT_MIN_ENTRY_REWARD_RISK } from './entry-risk.js';
 
 export const DEFAULTS = Object.freeze({
   port:3000, admin_username:'admin',
   trading_mode:'paper', live_trading_enabled:false,
   max_position_pct:0.10, risk_per_trade_pct:0.0025, daily_loss_pct:0.01, max_positions:5,
+  min_entry_reward_risk:DEFAULT_MIN_ENTRY_REWARD_RISK,
   entry_cutoff:'14:45', exit_time:'15:10', data_dir:'data', max_spread_pct:0.003,
   min_daily_turnover:10000000, analytics_workers:0, analytics_reserve_cpus:4, analytics_batch_size:32,
   min_free_disk_mib:512,min_free_memory_mib:256,max_event_loop_delay_ms:2000,
@@ -29,6 +31,7 @@ export const FIELDS = [
   ['trading_mode','Trading mode','select',['paper','live']],['live_trading_enabled','Enable real order execution','checkbox'],
   ['max_position_pct','Maximum allocation per stock (fraction)','number'],['risk_per_trade_pct','Risk per trade (fraction)','number'],
   ['daily_loss_pct','Daily loss limit (fraction)','number'],['max_positions','Maximum positions','number'],
+  ['min_entry_reward_risk','Minimum entry reward/risk after estimated costs','number'],
   ['entry_cutoff','Intraday entry cutoff (IST)','time'],['exit_time','Intraday close target (IST)','time'],
   ['max_spread_pct','Maximum spread (fraction)','number'],['min_daily_turnover','Minimum daily turnover (₹)','number'],
   ['analytics_workers','Analytics workers (0 = automatic)','number'],['analytics_reserve_cpus','CPU reserve','number'],
@@ -47,7 +50,7 @@ export const FIELDS = [
   ['min_rsi','Minimum trend RSI','number'],['max_rsi','Maximum trend RSI','number'],['max_atr_extension','Maximum distance from EMA21 in ATR units','number'],
   ['candidate_wait_ms','Opportunity collection window (milliseconds)','number'],
   ['market_regime_filter','Gate new entries on directional market breadth','checkbox'],['min_market_breadth','Minimum advancing (long) or declining (short) fraction','number'],
-  ['min_market_samples','Minimum liquid stocks for breadth','number'],['min_market_coverage','Minimum fresh quote coverage of NSE universe','number'],
+  ['min_market_samples','Minimum liquid stocks for breadth','number'],['min_market_coverage','Minimum fresh quote coverage of Nifty Total Market universe','number'],
   ['portfolio_risk_enabled','Include existing account exposure in entry risk checks','checkbox'],['max_account_stock_pct','Maximum stock fraction of reference assets','number'],
   ['max_account_gross_pct','Maximum gross exposure fraction of reference assets','number'],['max_account_risk_pct','Maximum estimated account stress loss fraction','number'],['unprotected_stress_pct','Stress move for exposure without a verified stop','number'],
   ['correlation_filter','Limit historically correlated exposure','checkbox'],['max_correlation','Daily return correlation threshold','number'],['max_correlated_exposure_pct','Maximum correlated group fraction of reference assets','number'],
@@ -89,6 +92,7 @@ export class Settings {
     new Fernet(this.token_encryption_key);
     if (!Number.isInteger(this.port) || this.port < 1 || this.port > 65535) throw new Error('Port must be between 1 and 65535');
     if (!['paper','live'].includes(this.trading_mode) || typeof this.live_trading_enabled !== 'boolean') throw new Error('Invalid trading mode');
+    if (!Number.isFinite(this.min_entry_reward_risk) || this.min_entry_reward_risk < 1 || this.min_entry_reward_risk > 10) throw new Error('min_entry_reward_risk must be between 1 and 10');
     for (const key of ['max_position_pct','risk_per_trade_pct','daily_loss_pct','max_spread_pct','min_daily_turnover']) if (!Number.isFinite(this[key])) throw new Error(`${key} must be finite`);
     if (!(0 < this.risk_per_trade_pct && this.risk_per_trade_pct <= this.max_position_pct && this.max_position_pct <= 1 && this.daily_loss_pct > 0 && this.daily_loss_pct <= 1)) throw new Error('Invalid risk fractions');
     if (!Number.isInteger(this.max_positions) || this.max_positions < 1 || this.max_positions > 50 || this.max_spread_pct <= 0 || this.max_spread_pct >= 1 || this.min_daily_turnover < 0) throw new Error('Invalid position or liquidity limits');

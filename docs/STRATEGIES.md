@@ -1,4 +1,4 @@
-# Strategy reference: version 3.0.0
+# Strategy reference: version 3.1.1
 
 StockPilot evaluates 11 named setup families and a [42-pattern candle catalogue](CANDLE_PATTERNS.md). This is a finite, documented collection of deterministic rules. It is not every strategy in trading literature, a trained model, or evidence of profitable returns. The [analytics guide](LOGIC_AND_ANALYTICS.md) explains execution, account risk, recovery and historical research.
 
@@ -17,6 +17,10 @@ target = C + 2.5R           long swing, except the mean target
 ```
 
 Every passing setup must also pass the configured minimum score. The highest score wins within a side, with setup name as a deterministic tie breaker; a tie between sides uses the side name. The live execution queue then ranks candidates across available symbols. No pattern or score bypasses ownership, price freshness, execution, calendar or account-risk checks.
+
+Version 3.1 adds an execution gate shared with historical research: planned reward/risk after estimated fees and exit slippage must reach `min_entry_reward_risk` (default 1.5). Live/paper decisions use the submitted entry limit and rounded stop; research uses the next observed opening with configured slippage. Setup levels stay unchanged when a candidate is rejected. See the [entry economics formulas](LOGIC_AND_ANALYTICS.md#ranking-and-account-wide-entry-controls) for details and limitations.
+
+Version 3.1.1 accepts valid previous-session CAS candle history for indicator warmup in execution and research. It does not substitute the last continuous-trading price for the auction close; gap setups still wait for an available closing-price reference.
 
 All new swing entries, including baseline, must pass the shared daily-management policy before buying: completed daily history must be usable, its SMA trend-exit condition must be false, and the proposed entry must be above its daily trailing level. The check runs at signal generation and again at the executable entry/opening price. Thus an apparent range-reversion setup is rejected if the current daily policy already requires liquidating it. This is a fixed consistency gate, not an optional setting; disabling enhanced technical exits does not disable daily swing management.
 

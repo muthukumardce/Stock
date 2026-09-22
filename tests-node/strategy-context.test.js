@@ -81,6 +81,15 @@ test('gap signals require the observed final candle of the prior session',()=>{
   const f=fixture('gap_continuation'),result=intraday_signal(f.bars,f.options,{...f.context,previous_bars:f.context.previous_bars.slice(0,-1)});
   assert.equal(result[0],null);assert.equal(result[2].setups[0].reason,'previous_session_close_missing');
 });
+
+test('CAS continuous candles warm indicators without inventing the subsequent auction close',()=>{
+  const f=fixture('opening_drive'),previous_bars=f.context.previous_bars.slice(0,72);
+  const view=strategy_snapshot(f.bars,'intraday',{...f.context,previous_bars},f.options);
+  assert.equal(view.data_valid,true);assert.equal(view.indicators_ready,true);assert.equal(view.seed_bars,72);
+  assert.equal(view.previous_session_close,null);assert.equal(view.opening_gap_pct,null);
+  const gap=fixture('gap_continuation'),result=intraday_signal(gap.bars,gap.options,{...gap.context,previous_bars:gap.context.previous_bars.slice(0,72)});
+  assert.equal(result[0],null);assert.equal(result[2].setups[0].reason,'previous_session_close_missing');
+});
 test('short technical exits invert momentum and ignore candles predating position entry',()=>{
   const closes=Array.from({length:40},(_,i)=>110-i*.1-i*i*.002),long=day('2026-09-17',closes,110.1,1000,.05),bars=mirror(long),as_of=new Date(+bars.at(-1).time+300000);
   const decision=technical_exit(bars,{strategy:'intraday',side:'SELL'},{enhanced_signals:true},{as_of});assert.equal(decision.reason,'technical_trend_failure');assert.equal(decision.side,'SELL');

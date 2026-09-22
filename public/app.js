@@ -471,6 +471,7 @@ function renderResearchReport(){
     const model=report[key]?.cost_model||{},options=report[key]?.options||{};
     if(numeric(model.fee_rate)!==null||numeric(model.slippage_rate)!==null)assumptions.push(`${label} execution assumptions: estimated fee ${percentage(model.fee_rate)} per fill; adverse slippage ${percentage(model.slippage_rate)} per fill.`);
     if(numeric(options.risk_per_trade_pct)!==null)assumptions.push(`${label} planned risk per trade: ${percentage(options.risk_per_trade_pct)}.`);
+    if(numeric(options.min_entry_reward_risk)!==null)assumptions.push(`${label} minimum entry reward/risk after estimated costs: ${options.min_entry_reward_risk}:1. Entries rejected by this check: ${number(report[key]?.decisions?.entry_reward_risk_too_low||0)}.`);
   }
   const notes=[...new Set(assumptions.map(item=>typeof item==='string'?item:JSON.stringify(item)).filter(Boolean))];
   $('research-assumptions').innerHTML=(notes.length?notes:['No additional assumptions were supplied in this report.']).map(item=>`<li>${escape(item)}</li>`).join('');
@@ -609,7 +610,7 @@ function render(next){
   $('metric-cash').textContent=connected||cash!==undefined?money(cash,0):'—';
   $('metric-positions').innerHTML=`${number(state.positions?.length)} <em>positions</em>`;
   $('positions-detail').textContent=`Planned stop risk ${money(state.risk_used||0,0)}`;
-  $('scanner-total').textContent=number(state.universe_count);$('scanner-subs').textContent=number(state.subscribed_count);
+  $('scanner-total').textContent=number(state.universe_classification?.entry_eligible_count??state.universe_count);$('scanner-subs').textContent=number(state.subscribed_count);
   $('scanner-warm').textContent=number(state.warmed_count);$('scanner-swing').textContent=number(state.swing_warmed_count);
   $('scanner-heartbeat').textContent=clock(state.heartbeat);$('scanner-progress').style.width=`${Math.min(100,100*(state.subscribed_count||0)/Math.max(1,state.universe_count||0))}%`;
   const resources=state.resources||{},performance=state.performance||{};
