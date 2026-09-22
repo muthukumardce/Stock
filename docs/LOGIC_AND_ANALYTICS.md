@@ -85,11 +85,13 @@ Using `margins.equity.available`, the conservative cash calculation is:
 
 ```text
 cash = available.cash
+funded_cash = available.opening_balance + available.intraday_payin
+cash_ceiling = max(cash, funded_cash) when both funding fields are present, otherwise cash
 balance = available.live_balance, falling back to margins.equity.net
-spendable_cash = max(0, min(cash, balance - collateral - adhoc_margin))
+spendable_cash = max(0, min(cash_ceiling, balance - collateral - adhoc_margin))
 ```
 
-Missing collateral/adhoc margin default to zero. Cash and balance must be finite numeric values; blanks, booleans, missing values and negative collateral/adhoc margin are invalid. Invalid data makes deployable cash zero and retains any established capital baseline rather than treating a malformed response as a withdrawal. The UI shows zero trading capital before verified funding information is available.
+Kite can report today's deposits in `intraday_payin` while leaving `cash` at the opening balance. Comparing cash with opening balance plus deposits includes that funding without adding a deposit twice when cash already includes it. The current balance cap still accounts for used margin and withdrawals, and excludes collateral and extra margin. Missing collateral/adhoc margin default to zero. Cash and balance must be finite numeric values; blanks, booleans, missing required values and negative collateral/adhoc margin are invalid. Optional funding fields must be finite numbers when supplied, and pay-in cannot be negative. Invalid data makes deployable cash zero and retains any established capital baseline rather than treating a malformed response as a withdrawal. The UI shows zero trading capital before verified funding information is available.
 
 Before paper capital has been seeded, and for live entries, zero available cash blocks new long and short entries but does not reject an otherwise valid Start request. The engine remains armed with a **Waiting for funds** indicator, automatically observes later verified balances, and continues exit management for authorized eligible existing holdings or already managed exposure. No second Start is needed when the first funds arrive. Deposits never re-arm an engine that was manually paused, halted by risk controls, or restarted. Start still verifies the current account; stale prices or unresolved orders still block decisions. The daily-loss comparison is applied only when the bot has a positive capital baseline.
 
@@ -161,7 +163,7 @@ Daily analysis is normally queued on the first fresh tick for an instrument afte
 
 An empty, stale, malformed or insufficient daily response does not mark coverage complete or become an accepted cache entry. An unusable cache left by an older run is bypassed for a fresh request. Each failed symbol backs off independently for 60, 120, 240 and then at most 300 seconds between attempts; other symbols continue loading, with managed holdings prioritized. Valid history is reused while failed symbols wait. The ordinary 30-second history loop and broker queue can make an actual retry later than its minimum delay. Restart/reconnect and a new trading date reset the transient retry timer and revalidate available cache; they cannot make unusable history eligible. Coverage is complete only after every requested symbol has usable history.
 
-Historical downloads share the serialized REST adapter with account and order calls: calls start at least 0.36 seconds apart, and quote calls at least 1.05 seconds apart. A cold full-universe download therefore takes substantial time even on a large machine. Scanner coverage grows progressively; CPU capacity does not bypass broker rate limits.
+Historical downloads share a dedicated start scheduler: at most three requests start in any rolling 1.05-second window, with at most six requests awaiting complete responses. Five-minute warmup feeds this scheduler with up to six concurrent stock downloads. Daily history, research and market context use the same historical budget, so separate callers cannot multiply the rate limit. The next group can start without waiting for the previous group's responses. Account and order calls remain serialized separately, starting at least 0.36 seconds apart, and quote calls at least 1.05 seconds apart. HTTP 429 blocks further historical starts; successful responses already in flight retain their data without clearing a newer rate-limit backoff. Closing the broker aborts active history reads and prevents queued starts. Warmup rechecks cancellation and account/universe identity both before queued requests start and before results are applied. A cold full-universe download still takes substantial time; scanner coverage grows progressively and CPU capacity does not bypass broker rate limits.
 
 Sources: `CandleBook` in [strategy.js](../src/strategy.js); `_on_ticks`, `_history`, `_intraday_history`, `_seed_intraday` in [trading.js](../src/trading.js).
 

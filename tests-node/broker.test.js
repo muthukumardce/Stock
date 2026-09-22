@@ -64,6 +64,93 @@ test('REST requests are serialized with independent quote rate limiting', async 
   assert.equal(requests[0].options.redirect, 'error');
 });
 
+const settle = () => new Promise(resolve => setImmediate(resolve));
+function overlappingHistoryFixture() {
+  let now=100;
+  const requests=[],waits=[];
+  const broker=new KiteBroker('private-key','private-token',{
+    clock:()=>now,wallClock:()=>Date.parse('2026-09-17T06:30:00Z')+(now-100)*1000,
+    sleep:(ms,signal)=>new Promise((resolve,reject)=>{
+      if(ms<=0){resolve();return;}
+      const abort=()=>reject(signal.reason);
+      signal?.addEventListener('abort',abort,{once:true});
+      waits.push({at:now+ms/1000,resolve:()=>{signal?.removeEventListener('abort',abort);resolve();}});
+      if(signal?.aborted)abort();
+    }),
+    fetch:(url,options)=>{
+      if(!url.includes('/historical/'))return Promise.resolve(success({order_id:'protected-order'}));
+      return new Promise((resolve,reject)=>{
+        const abort=()=>reject(options.signal.reason);
+        options.signal.addEventListener('abort',abort,{once:true});
+        requests.push({url:new URL(url),at:now,finish:(response=success({candles:[]}))=>{
+          options.signal.removeEventListener('abort',abort);resolve(response);
+        }});
+      });
+    },
+  });
+  return {broker,requests,advance:async seconds=>{
+    now+=seconds;
+    for(const wait of waits.splice(0))if(wait.at<=now)wait.resolve();else waits.push(wait);
+    await settle();
+  }};
+}
+
+test('historical requests start in groups of three while prior responses remain pending, capped at six',async()=>{
+  const f=overlappingHistoryFixture();
+  const pending=Array.from({length:8},(_,i)=>f.broker.call('historical_data',i+1,...historicalArgs.slice(1,3),i%2?'day':'5minute'));
+  await settle();assert.equal(f.requests.length,3);
+  await f.advance(1.051);assert.equal(f.requests.length,6,'The second group starts before any first-group response');
+  await f.advance(2);assert.equal(f.requests.length,6,'Six unfinished downloads is the shared cap');
+  await f.broker.call('cancel_order',{variety:'regular',order_id:'protect-order'});
+  const account=f.broker.call('holdings');await settle();await f.advance(.361);await account;
+  assert.equal(f.requests.length,6,'Account and order requests proceed while all history slots are occupied');
+  f.requests[4].finish();await settle();assert.equal(f.requests.length,7,'A completed response releases its slot immediately');
+  f.requests[1].finish();await settle();assert.equal(f.requests.length,8);
+  for(const request of f.requests)request.finish();
+  await Promise.all(pending);
+  for(let i=3;i<f.requests.length;i++)assert(f.requests[i].at-f.requests[i-3].at>=1.05-1e-9,'All intervals share one rolling rate budget');
+  assert.equal(f.broker._history_active.size,0);
+});
+
+test('an overlapping 429 stops queued history and late sibling successes preserve the backoff',async()=>{
+  const f=overlappingHistoryFixture();
+  const pending=Promise.allSettled(Array.from({length:8},()=>f.broker.call('historical_data',...historicalArgs)));
+  await settle();assert.equal(f.requests.length,3);
+  f.requests[0].finish(limitedResponse({retryAfter:'10'}));await settle();
+  f.requests[1].finish();f.requests[2].finish();await settle();
+  await f.advance(1.051);
+  const results=await pending;
+  assert.equal(f.requests.length,3);assert.equal(results.filter(r=>r.status==='fulfilled').length,2);
+  assert(results.filter(r=>r.status==='rejected').every(r=>r.reason.http_status===429));
+  await f.advance(10);
+  const retry=f.broker.call('historical_data',...historicalArgs);await settle();
+  f.requests[3].finish(limitedResponse());
+  await assert.rejects(retry,error=>error.retry_after_seconds===60,'A pre-429 sibling success cannot reset exponential backoff');
+});
+
+test('closing the broker aborts active history and prevents queued starts',async()=>{
+  const f=overlappingHistoryFixture();
+  const pending=Promise.allSettled(Array.from({length:8},()=>f.broker.call('historical_data',...historicalArgs)));
+  await settle();assert.equal(f.requests.length,3);
+  await f.broker.close();
+  assert((await pending).every(result=>result.status==='rejected'));
+  assert.equal(f.requests.length,3);assert.equal(f.broker._history_active.size,0);
+});
+
+test('history rechecks cancellation and scope after waiting for its next start window',async()=>{
+  for(const cancelled of [false,true]){
+    const f=overlappingHistoryFixture(),controller=new AbortController();let current=true;
+    const initial=Array.from({length:3},()=>f.broker.call('historical_data',...historicalArgs));
+    await settle();
+    const queued=f.broker.call('historical_data',...historicalArgs,{signal:controller.signal,isCurrent:()=>current});
+    const rejected=assert.rejects(queued,error=>error.name==='AbortError');
+    await settle();if(cancelled)controller.abort();else current=false;
+    await f.advance(1.051);await rejected;
+    assert.equal(f.requests.length,3);
+    for(const request of f.requests)request.finish();await Promise.all(initial);
+  }
+});
+
 const historicalArgs = [123, '2026-09-16T09:15:00+05:30', '2026-09-17T09:15:00+05:30', '5minute'];
 function rateFixture(handler) {
   let now = 100, wall = Date.parse('2026-09-17T06:30:00Z');

@@ -77,13 +77,15 @@ test('intraday telemetry describes closed-market waiting without a fake active d
 
 for (const [scope,method] of [['daily','_history_pass'],['intraday','_intraday_history_pass']]) test(`${scope} history stops a rate-limited pass without cascading requests or false symbol failures`,async t=>{
   const [engine]=ready(t);engine.universe[2]={tradingsymbol:'OTHER'};
+  if(scope==='intraday')for(let token=3;token<=10;token++)engine.universe[token]={tradingsymbol:`OTHER${token}`};
   engine.account.holdings=[{exchange:'NSE',tradingsymbol:'TEST',instrument_token:1,quantity:1},{exchange:'NSE',tradingsymbol:'OTHER',instrument_token:2,quantity:1}];
   let calls=0,limited=false;const retry=new Date(+NOW+60000).toISOString();
   engine.broker={call:async()=>{calls++;limited=true;throw new BrokerError('RateLimitException','private broker detail',{http_status:429,retry_after_seconds:60,retry_at:retry});},rate_limit_health:()=>({status:limited?'cooldown':'ready',categories:[{category:'historical',status:limited?'cooldown':'ready',retry_after_seconds:limited?60:0,retry_at:limited?retry:null}]})};
-  await engine[method]();assert.equal(calls,1);
+  const expected=scope==='daily'?1:6;
+  await engine[method]();assert.equal(calls,expected,'Only already-dispatched requests can finish after throttling');
   let job=engine.snapshot().background.tasks.find(task=>task.id===scope+'_history');
   assert.equal(job.status,'waiting');assert.match(job.message,/rate limit \(HTTP 429\)/);assert.equal(job.failed,0);assert.equal(job.next_retry_at,retry);
-  await engine[method]();assert.equal(calls,1,'cooling history category sends no additional requests');
+  await engine[method]();assert.equal(calls,expected,'cooling history category sends no additional requests');
   assert.equal(engine.snapshot().api_limits.status,'cooldown');assert.equal(engine.connected,true);assert.equal(engine.running,true);
 });
 
@@ -210,6 +212,50 @@ function priorSessionRows(){
   return Array.from({length:75},(_,i)=>({date:new Date(+new Date('2026-09-16T09:15:00+05:30')+i*300000),open:100,high:101,low:99,close:100,volume:100}));
 }
 function currentSessionRows(){return priorSessionRows().slice(0,33).map(row=>({...row,date:new Date(+row.date+86400000)}));}
+
+test('intraday warmup overlaps six downloads, refills completed slots and keeps progress accurate out of order',async t=>{
+  const [engine]=ready(t),requests=[];
+  for(let token=1;token<=8;token++){engine.universe[token]={tradingsymbol:`STOCK${token}`};engine.books[token]=new CandleBook();}
+  engine.positions.STOCK8={symbol:'STOCK8',token:8};
+  engine.broker={call:async(method,token)=>new Promise(resolve=>requests.push({token,resolve}))};
+  const task=()=>engine._activity.snapshot().find(task=>task.id==='intraday_history');
+  const pass=engine._intraday_history_pass();
+  assert.equal(requests.length,6);assert.equal(requests[0].token,8,'Managed positions keep priority');
+  assert.equal(task().completed,0);assert.match(task().current_item,/STOCK8/);
+  requests[3].resolve(currentSessionRows());await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(requests.length,7);assert.equal(task().completed,1);assert.equal(task().ready,1);
+  assert(!task().current_item.includes(`STOCK${requests[3].token}`),'Finished downloads leave the current-symbol list');
+  requests[1].resolve(currentSessionRows());await new Promise(resolve=>setImmediate(resolve));assert.equal(requests.length,8);
+  for(const request of requests)request.resolve(currentSessionRows());await pass;
+  assert.equal(task().completed,8);assert.equal(task().ready,8);assert.equal(task().failed,0);assert.equal(task().current_item,null);
+});
+
+for(const change of ['cancel','universe','broker','date'])test(`concurrent intraday downloads cannot publish or enqueue more work after ${change}`,async t=>{
+  const [engine,store]=ready(t),requests=[],controller=new AbortController();engine.settings.enhanced_signals=true;
+  for(let token=1;token<=8;token++){engine.universe[token]={tradingsymbol:`STOCK${token}`};engine.books[token]=new CandleBook();}
+  engine.broker={call:async(method,token)=>new Promise(resolve=>requests.push({token,resolve}))};
+  const pass=engine._intraday_history_pass(controller.signal);assert.equal(requests.length,6);
+  if(change==='cancel')controller.abort();
+  if(change==='universe')engine._universe_generation++;
+  if(change==='broker')engine.broker={};
+  if(change==='date')engine._now=()=>new Date(+NOW+86400000);
+  for(const request of requests)request.resolve([...priorSessionRows(),...currentSessionRows()]);await pass;
+  assert.equal(requests.length,6);assert.equal(engine._intraday_history_loaded.size,0);assert.equal(engine._analysis_pending.size,0);
+  for(let token=1;token<=8;token++){assert.equal(store.get(`intraday_seed:${token}`),null);assert.equal(engine.books[token].bars.length,0);}
+});
+
+test('an intraday pass drains in-flight work after an unexpected error before reporting failure',async t=>{
+  const [engine]=ready(t),requests=[];
+  for(let token=1;token<=8;token++){engine.universe[token]={tradingsymbol:`STOCK${token}`};engine.books[token]=new CandleBook();}
+  engine.broker={call:async()=>new Promise((resolve,reject)=>requests.push({resolve,reject}))};
+  let finished=false;
+  const pass=engine._intraday_history_pass().finally(()=>{finished=true;});
+  const rejected=assert.rejects(pass,/Unexpected fixture error/);
+  requests[0].reject(new Error('Unexpected fixture error'));await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(finished,false);assert.equal(requests.length,6);
+  for(const request of requests.slice(1))request.resolve(currentSessionRows());await rejected;
+  assert.equal(engine._activity.snapshot().find(task=>task.id==='intraday_history').status,'failed');
+});
 test('intraday warmup progress survives feed gaps, retries and repeat passes while readiness stays accurate',async t=>{
   const [engine]=ready(t);engine.books[1]=new CandleBook();
   let failed=false,calls=0;
@@ -1068,6 +1114,58 @@ test('shutdown aborts sleeping loops and queued mutex work without waiting for 3
   const broker = new RecoveryBroker(), engine = new TradingEngine(settings(temp(t)), new MemoryStore(), options({ backgroundLoops: true, brokerFactory: () => broker }));
   await engine.connect('session', 'AB1234'); const started = Date.now(); await engine.shutdown(); assert.ok(Date.now() - started < 2000); assert.equal(engine.connected, false); assert.equal(engine._tasks.length, 0);
 });
+test('same-day pay-ins count once and stay capped by current unleveraged free cash', t => {
+  const [engine] = ready(t, 'live');
+  const base = {cash:17787.1, opening_balance:17787.1, intraday_payin:50000, live_balance:64148.34406, collateral:0, adhoc_margin:0};
+  for (const [changes, expected] of [
+    [{}, 64148.34406],
+    [{live_balance:67787.1}, 67787.1],
+    [{cash:67787.1, live_balance:117787.1}, 67787.1], // Cash already includes the deposit.
+    [{live_balance:95000, collateral:30000, adhoc_margin:5000}, 60000],
+    [{live_balance:2500}, 2500], // Used margin/withdrawals still reduce availability.
+    [{cash:67787.1, opening_balance:67787.1, intraday_payin:0, live_balance:64000}, 64000],
+    [{opening_balance:'17787.1', intraday_payin:'50000'}, 64148.34406],
+    [{opening_balance:undefined}, 17787.1], // No unverified addition to possibly funded cash.
+    [{opening_balance:-10000, cash:-10000, intraday_payin:50000, live_balance:40000}, 40000],
+  ]) {
+    engine.account.margins.equity.available = {...base, ...changes};
+    assert.equal(engine._cash_balance(), expected, JSON.stringify(changes));
+  }
+  engine.account.margins.equity = {net:64148.34406, available:{...base, live_balance:undefined}};
+  assert.equal(engine._cash_balance(), 64148.34406);
+});
+
+test('malformed deposit data never enlarges available cash or overwrites capital', t => {
+  const [engine] = ready(t, 'live'), capital = engine.capital;
+  for (const changes of [{intraday_payin:-1}, {intraday_payin:NaN}, {intraday_payin:''}, {intraday_payin:null},
+    {opening_balance:Infinity}, {opening_balance:true}, {opening_balance:''}, {opening_balance:null},
+    {opening_balance:Number.MAX_VALUE, intraday_payin:Number.MAX_VALUE}]) {
+    engine.account.margins.equity.available = {cash:17787.1, opening_balance:17787.1, intraday_payin:50000, live_balance:64148.34406, ...changes};
+    engine._update_capital(true);
+    assert.equal(engine._cash_balance(), null); assert.equal(engine.snapshot().broker_available_cash, 0);
+    assert.equal(engine.capital, capital);
+  }
+});
+
+test('account refresh shows a deposit with unchanged raw cash and funds a flat live budget without resetting P&L', async t => {
+  const broker = new RecoveryBroker(), engine = new TradingEngine(settings(temp(t), 'live'), new MemoryStore(), options({brokerFactory:()=>broker}));
+  t.after(()=>engine.shutdown());
+  broker.current.margins.equity.available = {cash:17787.1, opening_balance:17787.1, intraday_payin:0, live_balance:17787.1};
+  await engine.connect('session', 'AB1234'); await engine.start();
+  engine.realised = -100;
+  broker.current.margins.equity.available = {cash:17787.1, opening_balance:17787.1, intraday_payin:50000, live_balance:67687.1};
+  await engine._refresh_account_locked();
+  assert.equal(engine.snapshot().broker_available_cash, 67687.1);
+  assert.equal(engine.capital, 67787.1); assert.equal(engine.snapshot().equity, 67687.1);
+  assert.equal(engine.realised, -100); assert.equal(engine._daily_pnl(), -100); assert.equal(engine.running, true);
+  engine.running = false;
+  broker.current.margins.equity.available.intraday_payin = 60000;
+  broker.current.margins.equity.available.live_balance = 77687.1;
+  await engine._refresh_account_locked();
+  assert.equal(engine.snapshot().broker_available_cash, 77687.1);
+  assert.equal(engine.running, false); assert.equal(engine.capital, 67787.1);
+});
+
 test('capital starts unknown and seeds paper only once from verified cash, excluding collateral', async t => {
   const store = new MemoryStore(), broker = new RecoveryBroker(), engine = new TradingEngine(settings(temp(t)), store, options({ brokerFactory: () => broker }));
   assert.equal(engine.capital, 0); assert.equal(engine.snapshot().feed_fresh, false); assert.equal(engine.snapshot().account_fresh, false);

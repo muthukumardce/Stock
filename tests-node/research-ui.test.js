@@ -67,6 +67,68 @@ function report(){
   };
 }
 
+async function riskHarness(){
+  const h=await harness();
+  const values={daily_loss_pct:.01,risk_per_trade_pct:.0025,max_account_risk_pct:.03,max_position_pct:.10,max_account_stock_pct:.25,portfolio_risk_enabled:true,max_positions:5,max_spread_pct:.003,min_daily_turnover:10000000,trading_mode:'paper',live_trading_enabled:false};
+  const form=h.elements.get('config-form');
+  for(const [key,value]of Object.entries(values)){form.elements[key].value=String(value);form.elements[key].checked=value===true;}
+  h.context.configData={values,fields:Object.keys(values).map(key=>({key,type:typeof values[key]==='boolean'?'checkbox':typeof values[key]==='number'?'number':'text'})),urls:{}};
+  h.run('renderConfig(configData)');
+  return h;
+}
+
+test('daily risk preset splits the chosen budget across slots without multiplying total planned risk',async()=>{
+  const h=await harness();
+  for(const percent of [.5,1,5,10])for(const slots of [1,5,50]){
+    const preset=h.run(`dailyRiskPreset(${percent},${slots})`);
+    assert.equal(preset.daily_loss_pct,percent/100);assert.equal(preset.max_account_risk_pct,percent/100);
+    assert(preset.risk_per_trade_pct*slots<=percent/100+1e-8);
+    assert(preset.risk_per_trade_pct<=preset.max_position_pct);assert(preset.max_position_pct*slots<=1+1e-8);
+    assert.equal(preset.max_account_stock_pct,preset.max_position_pct);assert.equal(preset.portfolio_risk_enabled,true);
+  }
+  for(const [percent,slots]of [[0,5],[11,5],[1.1,5],[10,0],[10,2.5],[10,51]])assert.throws(()=>h.run(`dailyRiskPreset(${percent},${slots})`));
+});
+
+test('10% slider previews linked budgets with the correct capital bases and sends no save request',async()=>{
+  const h=await riskHarness(),form=h.elements.get('config-form'),before=h.requests.length;
+  h.setState({...current(),capital:100000,equity:120000,broker_available_cash:90000,strategy_settings:{intraday_enabled:true,intraday_allocation_pct:.6,swing_enabled:true,swing_allocation_pct:.4},decision_controls:{portfolio:{reference_assets:200000}}});
+  h.elements.get('daily-risk-slider').value='10';h.elements.get('daily-risk-slider').events.input();
+  assert.equal(form.elements.daily_loss_pct.value,'0.1');assert.equal(form.elements.risk_per_trade_pct.value,'0.02');
+  assert.equal(form.elements.max_account_risk_pct.value,'0.1');assert.equal(form.elements.max_position_pct.value,'0.2');assert.equal(form.elements.max_account_stock_pct.value,'0.2');
+  assert.equal(form.elements.max_spread_pct.value,'0.003');assert.equal(form.elements.min_daily_turnover.value,'10000000');
+  const preview=h.elements.get('risk-preset-preview').innerHTML;
+  assert.match(preview,/10,000\.00/);assert.match(preview,/Intraday:.*1,200\.00/);assert.match(preview,/Swing:.*800\.00/);assert.match(preview,/20,000\.00/);
+  assert.equal(h.elements.get('daily-risk-value').textContent,'10%');assert.equal(h.elements.get('risk-preset-status').textContent,'Unsaved preset');
+  assert.match(h.elements.get('risk-capital-explanation').textContent,/simulated results/);assert.equal(h.requests.length,before);
+  h.setState({...current(),capital:110000,mode:'live'});
+  assert.equal(form.elements.daily_loss_pct.value,'0.1');assert.equal(h.elements.get('daily-risk-slider').value,'10');assert.match(h.elements.get('risk-capital-explanation').textContent,/cash uninvested/);
+});
+
+test('dashboard distinguishes paper equity from the eligible broker cash used for funding',async()=>{
+  const h=await harness();
+  h.setState({...current(),capital:100000,equity:105000,broker_available_cash:70000,account:{margins:{equity:{available:{cash:80000,live_balance:120000,collateral:50000}}}}});
+  assert.match(h.elements.get('metric-equity').textContent,/1,05,000/);assert.match(h.elements.get('metric-cash').textContent,/70,000/);
+  assert.match(h.elements.get('equity-detail').textContent,/simulated/);
+  h.setState({...current(),mode:'live',capital:100000,equity:105000,broker_available_cash:0,account:{margins:{equity:{available:{live_balance:120000}}}}});
+  assert.match(h.elements.get('metric-cash').textContent,/0/);assert.doesNotMatch(h.elements.get('metric-cash').textContent,/1,20,000/);
+  assert.doesNotMatch(h.elements.get('equity-detail').textContent,/simulated/);
+});
+
+test('linked slots recalculate risk while manual edits stay custom through refresh and block saves after restart is required',async()=>{
+  const h=await riskHarness(),form=h.elements.get('config-form');
+  h.elements.get('daily-risk-slider').value='10';h.elements.get('daily-risk-slider').events.input();
+  form.elements.max_positions.value='10';form.events.input({target:{name:'max_positions'}});
+  assert.equal(form.elements.risk_per_trade_pct.value,'0.01');assert.equal(form.elements.max_position_pct.value,'0.1');
+  form.elements.risk_per_trade_pct.value='0.03';form.events.input({target:{name:'risk_per_trade_pct'}});
+  assert.equal(h.elements.get('risk-preset-status').textContent,'Custom settings');
+  form.elements.max_positions.value='5';form.events.input({target:{name:'max_positions'}});assert.equal(form.elements.risk_per_trade_pct.value,'0.03');
+  form.elements.daily_loss_pct.value='0.2';form.events.input({target:{name:'daily_loss_pct'}});
+  assert.equal(h.elements.get('daily-risk-value').textContent,'20%');assert.match(h.elements.get('risk-preset-policy').textContent,/outside the slider/);
+  h.setState({...current(),restart_required:true});
+  assert.equal(h.elements.get('daily-risk-slider').disabled,true);assert.equal(h.elements.get('risk-preset-save').disabled,true);
+  h.elements.get('daily-risk-slider').value='5';h.elements.get('daily-risk-slider').events.input();assert.equal(form.elements.daily_loss_pct.value,'0.2');
+});
+
 test('research is a separate page and disconnected accounts see no fabricated performance',async()=>{
   const h=await harness();assert.equal(h.requests.some(item=>item.url==='/api/research'),false);
   h.setState({...current(),connected:false});h.run("showPage('research')");await flush();

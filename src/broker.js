@@ -1,5 +1,7 @@
-/** Kite v3 adapter. REST requests are serialized; mutations are never retried. */
+/** Kite v3 adapter. Historical reads overlap; other REST calls stay serialized.
+ * Mutations are never retried. */
 import {Worker} from 'node:worker_threads';
+import {createKiteTransport} from './kite-transport.js';
 import {Mutex, monotonic, sleep, parseTime, isoIST} from './util.js';
 
 const SECRET_FIELDS = new Set(['access_token', 'api_key', 'api_secret', 'request_token', 'password', 'enctoken']);
@@ -8,6 +10,8 @@ const REJECTION_KINDS = new Set(['InputException', 'PermissionException', 'Token
 const CLOCK_TOLERANCE_MS = 10000, CLOCK_DATE_PRECISION_MS = 1000, CLOCK_MAX_AGE_SECONDS = 60;
 const RATE_CATEGORIES = ['historical', 'quote', 'orders', 'other'];
 const RATE_RETRY_MIN_SECONDS = 1, RATE_RETRY_MAX_SECONDS = 86400, RATE_FALLBACK_MAX_SECONDS = 300;
+export const HISTORICAL_CONCURRENCY = 6;
+const HISTORICAL_WINDOW_SECONDS = 1.05; // Three starts per rolling second, with timing margin.
 const rateCategory = method => method === 'historical_data' ? 'historical' : method === 'quote' ? 'quote' :
   ['place_order', 'modify_order', 'cancel_order'].includes(method) ? 'orders' : 'other';
 
@@ -108,6 +112,10 @@ export class KiteBroker {
     this.api_key = api_key;
     this.access_token = access_token;
     this._rest_lock = new Mutex();
+    this._history_start_lock = new Mutex();
+    this._history_active = new Set();
+    this._history_starts = [];
+    this._history_abort = new AbortController();
     this._last_call = -Infinity;
     this._last_quote = -Infinity;
     this._rate_limits = Object.fromEntries(RATE_CATEGORIES.map(category => [category, {until: -Infinity, consecutive: 0, rate_limited_responses: 0, blocked_requests: 0}]));
@@ -115,7 +123,8 @@ export class KiteBroker {
     this._streamSlots = new Set(); this._retiringSockets = new Set();
     this._streamLifecycle = new Mutex();
     this._generation = 0;
-    this._fetch = options.fetch ?? globalThis.fetch;
+    this._transport = options.fetch ? null : createKiteTransport();
+    this._fetch = options.fetch ?? this._transport.fetch;
     this._clock = options.clock ?? monotonic;
     this._wallClock = options.wallClock ?? Date.now;
     this._clock_observation = null; this._clock_skew = null; this._clock_observation_status = null;
@@ -213,6 +222,7 @@ export class KiteBroker {
   async call(method, ...args) {
     const category = rateCategory(method);
     this._checkRateLimit(category);
+    if (category === 'historical') return this._historical_call(args);
     return this._rest_lock.run(async () => {
       // Calls queued before a 429 also fail promptly. Do not occupy the shared
       // REST lock for a cooldown: account checks and protection need to proceed.
@@ -223,7 +233,53 @@ export class KiteBroker {
         this._last_quote = this._clock();
       }
       this._last_call = this._clock();
-      try { const result = await this._call(method, args);this._rate_limits[category].consecutive = 0;return result; }
+      return this._invoke(method, args);
+    });
+  }
+
+  async _historical_call(args) {
+    const options = args[4] || {};
+    const check = () => {
+      this._history_abort.signal.throwIfAborted();
+      options.signal?.throwIfAborted();
+      if (options.isCurrent && !options.isCurrent()) throw new DOMException('Historical request superseded', 'AbortError');
+      this._checkRateLimit('historical');
+    };
+    const {result} = await this._history_start_lock.run(async () => {
+      check();
+      while (this._history_active.size >= HISTORICAL_CONCURRENCY) {
+        await Promise.race(this._history_active);
+        check();
+      }
+      for (;;) {
+        const now = this._clock();
+        this._history_starts = this._history_starts.filter(at => now - at < HISTORICAL_WINDOW_SECONDS);
+        if (this._history_starts.length < 3) break;
+        await this._sleep(Math.max(1, (this._history_starts[0] + HISTORICAL_WINDOW_SECONDS - now) * 1000), this._history_abort.signal);
+        check();
+      }
+      check();
+      this._history_starts.push(this._clock());
+      // Wrap errors as outcomes so a fast rejection cannot become unhandled
+      // while the start mutex releases. The mutex never waits for this response.
+      const result = this._invoke('historical_data', args).then(value => ({value}), error => ({error}))
+        .finally(() => this._history_active.delete(result));
+      this._history_active.add(result);
+      return {result};
+    });
+    const outcome = await result;
+    if (outcome.error) throw outcome.error;
+    return outcome.value;
+  }
+
+  async _invoke(method, args) {
+      const category = rateCategory(method), limitedBefore = this._rate_limits[category].rate_limited_responses;
+      try {
+        const result = await this._call(method, args);
+        // A success already in flight must not erase a sibling's newer 429 backoff.
+        if (this._rate_limits[category].rate_limited_responses === limitedBefore) this._rate_limits[category].consecutive = 0;
+        return result;
+      }
       catch (error) {
         let detail = String(error.detail || error.message || 'Broker request failed');
         for (const secret of [this.api_key, this.access_token]) if (secret) detail = detail.split(secret).join('[redacted]');
@@ -236,7 +292,6 @@ export class KiteBroker {
           rate_limit_category: error.rate_limit_category, retry_after_seconds: error.retry_after_seconds, retry_at: error.retry_at,
         } : {});
       }
-    });
   }
 
   async _call(method, args) {
@@ -346,6 +401,7 @@ export class KiteBroker {
     }
     const headers = {'X-Kite-Version': '3', Authorization: `token ${this.api_key}:${this.access_token}`};
     const request = {method: verb, headers, signal: AbortSignal.timeout(8000), redirect: 'error'};
+    if (method === 'historical_data') request.signal = AbortSignal.any([request.signal, this._history_abort.signal, ...(kwargs.signal ? [kwargs.signal] : [])]);
     if (payload) {
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
       request.body = formBody(payload).toString();
@@ -469,8 +525,13 @@ export class KiteBroker {
   }
 
   async close() {
+    this._history_abort.abort();
     this._generation++;
-    return this._streamLifecycle.run(()=>this._close_streams());
+    try {
+      await this._streamLifecycle.run(()=>this._close_streams());
+    } finally {
+      await this._transport?.close();
+    }
   }
   async _close_streams(){
     for(const slot of this._streamSlots)clearTimeout(slot.timer);this._streamSlots.clear();

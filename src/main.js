@@ -11,6 +11,7 @@ import { ResourceMonitor } from './resources.js';
 import { HistoricalResearch } from './historical-research.js';
 import { requestContext } from './http-context.js';
 import { settingsBlocker } from './settings-access.js';
+import { createKiteTransport } from './kite-transport.js';
 import { setImmediate as yieldIO } from 'node:timers/promises';
 
 const STATIC=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../public');
@@ -22,8 +23,11 @@ function cookie(req){const part=(req.headers.cookie||'').split(';').map(s=>s.tri
 function plainObject(value){return value!==null&&typeof value==='object'&&!Array.isArray(value);}
 function waitDrain(res){return new Promise(resolve=>{const done=()=>{res.off('drain',done);res.off('close',done);resolve();};res.once('drain',done);res.once('close',done);});}
 export async function exchangeToken(cfg,requestToken){
-  const response=await fetch('https://api.kite.trade/session/token',{method:'POST',headers:{'X-Kite-Version':'3','Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({api_key:cfg.kite_api_key,request_token:requestToken,checksum:sha(cfg.kite_api_key+requestToken+cfg.kite_api_secret)}),signal:AbortSignal.timeout(15000)});
-  const result=await response.json();if(!response.ok||result.status!=='success'||!result.data?.access_token)throw new Error('Broker authentication failed');return result.data;
+  const transport=createKiteTransport();
+  try{
+    const response=await transport.fetch('https://api.kite.trade/session/token',{method:'POST',headers:{'X-Kite-Version':'3','Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({api_key:cfg.kite_api_key,request_token:requestToken,checksum:sha(cfg.kite_api_key+requestToken+cfg.kite_api_secret)}),signal:AbortSignal.timeout(15000),redirect:'error'});
+    const result=await response.json();if(!response.ok||result.status!=='success'||!result.data?.access_token)throw new Error('Broker authentication failed');return result.data;
+  }finally{await transport.close();}
 }
 export async function createApp(options={}){
   const cfg=options.settings instanceof Settings?options.settings:new Settings(options.settings);

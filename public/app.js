@@ -10,6 +10,8 @@ let csrf='', state={}, events=[], eventCursor=null, equityHistory=[], liveView=n
 let eventFloor=0,clearingActivity=false;
 let configLoaded=false, configLoading=null, configDirty=false, configFields=[];
 let paperModeDirty=false, savedExecution=null, configSaving=false, configRestartRequired=false;
+let savedRiskValues={},riskPresetLinked=false,riskPresetError='';
+const riskPresetKeys=['daily_loss_pct','risk_per_trade_pct','max_account_risk_pct','max_position_pct','max_account_stock_pct','portfolio_risk_enabled'];
 let authorizationBusy=false, authorizationPending=false, authorizationWasRequired=false, authorizationLastCheck=0;
 let researchState=null,researchLoading=null,researchBusy=false,researchTimer=null,researchRequest=null,researchRetryUnverified=false;
 let selectedResearchInterval='';
@@ -598,11 +600,12 @@ function render(next){
   $('pause').disabled=busy||(!starting&&(!connected||!running));
   $('flatten').disabled=busy||!connected||!(state.positions?.length||state.pending_orders?.length||state.delivery?.positions?.length);
   $('metric-equity').textContent=money(state.equity??state.capital,0);
+  $('equity-detail').textContent=state.mode==='paper'?'Paper budget + simulated profits/losses':'Trading budget + bot profits/losses';
   const pnl=Number(state.realised_pnl||0)+Number(state.unrealised_pnl||0);
   $('metric-pnl').textContent=money(pnl);$('metric-pnl').className=positive(pnl);
   $('pnl-detail').textContent=`Realised ${money(state.realised_pnl||0)}${state.pnl_fees_estimated?' · estimated costs':''}`;
   const margins=state.account?.margins||{};const funds=margins.equity||margins;
-  const cash=funds.available?.live_balance??funds.available?.cash;
+  const cash=state.broker_available_cash??funds.available?.live_balance??funds.available?.cash;
   $('metric-cash').textContent=connected||cash!==undefined?money(cash,0):'—';
   $('metric-positions').innerHTML=`${number(state.positions?.length)} <em>positions</em>`;
   $('positions-detail').textContent=`Planned stop risk ${money(state.risk_used||0,0)}`;
@@ -699,6 +702,64 @@ $('settings-form').addEventListener('submit',async event=>{
 
 // Configuration is deliberately separate from the live account render. Polls
 // and SSE updates must never overwrite an administrator's unsaved edits.
+function dailyRiskPreset(percent,slots){
+  if(!Number.isFinite(percent)||percent<.5||percent>10||Math.abs(percent*2-Math.round(percent*2))>1e-8)throw new Error('Choose a daily risk limit from 0.5% to 10%, in steps of 0.5%.');
+  if(!Number.isInteger(slots)||slots<1||slots>50)throw new Error('Set Maximum positions to a whole number from 1 to 50 before using the risk slider.');
+  const fraction=percent/100,round=value=>Math.floor((value+Number.EPSILON)*1e8)/1e8;
+  return {daily_loss_pct:fraction,risk_per_trade_pct:round(fraction/slots),max_account_risk_pct:fraction,
+    max_position_pct:round(1/slots),max_account_stock_pct:round(1/slots),portfolio_risk_enabled:true};
+}
+function riskDraftValues(){
+  const form=$('config-form');
+  return Object.fromEntries([...riskPresetKeys,'max_positions'].map(key=>[key,key==='portfolio_risk_enabled'?form.elements[key]?.checked:numeric(form.elements[key]?.value)]));
+}
+function syncRiskSlider(){
+  const value=riskDraftValues().daily_loss_pct;
+  $('daily-risk-slider').value=String(Math.max(.5,Math.min(10,Math.round((value||.01)*200)/2)));
+}
+function applyRiskPreset(){
+  if(!configLoaded||configSaving||configRestartRequired)return;
+  try{
+    const form=$('config-form'),preset=dailyRiskPreset(Number($('daily-risk-slider').value),Number(form.elements.max_positions.value));
+    for(const [key,value]of Object.entries(preset)){const input=form.elements[key];if(typeof value==='boolean')input.checked=value;else input.value=String(value);}
+    riskPresetLinked=true;riskPresetError='';configDirty=true;
+  }catch(error){riskPresetError=error.message;}
+  renderRiskPreset();
+}
+function renderRiskPreset(){
+  const available=configLoaded&&[...riskPresetKeys,'max_positions'].every(key=>configFields.some(field=>field.key===key));
+  $('risk-preset').hidden=!available;
+  const disabled=!available||configSaving||configRestartRequired;
+  $('daily-risk-slider').disabled=disabled;$('risk-preset-save').disabled=disabled;
+  if(!available)return;
+  const draft=riskDraftValues(),capital=numeric(state.capital),assets=numeric(state.decision_controls?.portfolio?.reference_assets),strategies=state.strategy_settings||{};
+  const amount=(base,fraction)=>base>0&&fraction!==null?money(base*fraction):'Amount available after account verification';
+  const strategyAmounts=fraction=>{
+    const rows=[];
+    for(const [key,label]of [['intraday','Intraday'],['swing','Swing']])if(strategies[`${key}_enabled`]){
+      const allocation=numeric(strategies[`${key}_allocation_pct`]);
+      if(capital>0&&allocation!==null&&fraction!==null)rows.push(`${label}: ${money(capital*allocation*fraction)}`);
+    }
+    return rows.length?rows.join(' · '):'Based on each enabled strategy’s allocated capital';
+  };
+  const rows=[
+    ['daily_loss_pct','Daily loss limit',amount(capital,draft.daily_loss_pct)+' · trading capital'],
+    ['risk_per_trade_pct','Planned risk per trade',strategyAmounts(draft.risk_per_trade_pct)],
+    ['max_account_risk_pct','Estimated account stress budget',amount(assets,draft.max_account_risk_pct)+' · reference assets, including existing holdings'],
+    ['max_position_pct','Maximum allocation per position',strategyAmounts(draft.max_position_pct)],
+    ['max_account_stock_pct','Maximum total allocation per stock',amount(assets,draft.max_account_stock_pct)+' · reference assets'],
+    ['portfolio_risk_enabled','Account exposure checks','Includes existing holdings and pending orders'],
+  ];
+  $('daily-risk-value').textContent=percentage(draft.daily_loss_pct);
+  $('daily-risk-slider').setAttribute('aria-valuetext',`${decimal(Number($('daily-risk-slider').value))}% daily loss limit`);
+  $('risk-preset-preview').innerHTML=rows.map(([key,label,detail])=>`<tr><th scope="row">${escape(label)}</th><td>${key==='portfolio_risk_enabled'?(savedRiskValues[key]?'On':'Off'):percentage(savedRiskValues[key])}</td><td><strong>${key==='portfolio_risk_enabled'?(draft[key]?'On':'Off'):percentage(draft[key])}</strong><small>${escape(detail)}</small></td></tr>`).join('');
+  $('risk-preset-status').textContent=configRestartRequired?'Restart required':riskPresetLinked?(configDirty?'Unsaved preset':'Saved preset'):'Custom settings';
+  const outside=draft.daily_loss_pct!==null&&(draft.daily_loss_pct<.005||draft.daily_loss_pct>.10||Math.abs(draft.daily_loss_pct*200-Math.round(draft.daily_loss_pct*200))>1e-8);
+  $('risk-preset-policy').textContent=`The preset splits daily risk equally across ${number(draft.max_positions)} position slots and sets each allocation cap to one slot’s share. It sets the account stress budget to the same percentage and enables account exposure checks. These are allocation rules, not a prediction of returns.${outside?' Your custom daily limit is outside the slider steps; moving it replaces that value.':''}`;
+  $('risk-capital-explanation').textContent=state.mode==='paper'?'Paper trading capital starts from verified Zerodha cash once, then tracks simulated results. Real Zerodha cash can differ. A 10% daily loss limit does not mean only 10% of cash can be invested.':'Live trading capital is funded from verified Zerodha cash, excluding collateral and extra margin. Trading equity includes bot profits and losses; available cash is the balance available now. Risk and allocation limits can leave cash uninvested.';
+  const base=capital>0?`Trading capital: ${money(capital)}${state.mode==='paper'?' (simulated)':''}. `:'Verify your account to preview rupee amounts. ';
+  $('risk-preset-note').textContent=riskPresetError||base+(state.settings_blocker?.message|| (configRestartRequired?'Saved settings need a server restart.':configDirty?'Preview only. Save settings and restart to apply.':'Move the slider to change the linked settings, or edit individual values below.'));
+}
 function renderPaperTrading(){
   const paper=$('paper-trading').checked,disabledLive=!paper&&!paperModeDirty&&!savedExecution?.live_trading_enabled;
   $('paper-trading-current').textContent=state.mode?`Current mode: ${state.mode==='paper'?'Paper trading':'Live trading'}`:'Checking current mode.';
@@ -710,12 +771,15 @@ function renderPaperTrading(){
   const disabled=!configLoaded||configSaving||configRestartRequired;
   $('paper-trading').disabled=disabled;$('paper-trading-save').disabled=disabled;$('config-submit').disabled=disabled;
   for(const field of configFields){const input=$('config-form').elements[field.key];if(input)input.disabled=configSaving||configRestartRequired;}
+  renderRiskPreset();
 }
 function renderConfig(data){
   acceptResearchSettings(data.values);
   const automatic=new Set(['public_url','app_env','paper_capital','live_capital','admin_username','trading_mode','live_trading_enabled']);
   configFields=(data.fields||[]).filter(field=>!automatic.has(field.key));
   const values=data.values||{};
+  savedRiskValues={...values};riskPresetError='';
+  try{const preset=dailyRiskPreset(Number(values.daily_loss_pct)*100,Number(values.max_positions));riskPresetLinked=riskPresetKeys.every(key=>typeof preset[key]==='boolean'?values[key]===preset[key]:Math.abs(Number(values[key])-preset[key])<1e-8);}catch{riskPresetLinked=false;}
   savedExecution={trading_mode:values.trading_mode,live_trading_enabled:values.live_trading_enabled===true};
   $('paper-trading').checked=values.trading_mode==='paper';paperModeDirty=false;configRestartRequired=configRestartRequired||data.restart_required===true;
   $('config-fields').innerHTML=configFields.map(field=>{
@@ -730,6 +794,7 @@ function renderConfig(data){
   const admin=$('admin-form');
   if(!admin.dataset.dirty)admin.elements.username.value=data.admin_username||values.admin_username||'admin';
   configLoaded=true;$('paper-trading-error').textContent='';$('config-error').textContent='';
+  syncRiskSlider();
   renderPaperTrading();
 }
 function showConfigError(error){$('config-error').textContent=error.message;$('paper-trading-error').textContent=error.message;}
@@ -739,7 +804,14 @@ async function loadConfig(force=false){
   configLoading=(async()=>{const data=await api('/api/config');if(!configDirty)renderConfig(data);})();
   try{await configLoading;}finally{configLoading=null;}
 }
-$('config-form').addEventListener('input',()=>configDirty=true);
+$('daily-risk-slider').addEventListener('input',applyRiskPreset);
+$('config-form').addEventListener('input',event=>{
+  configDirty=true;
+  const key=event.target?.name;
+  if(key==='max_positions'&&riskPresetLinked){applyRiskPreset();return;}
+  if(riskPresetKeys.includes(key)){riskPresetLinked=false;riskPresetError='';syncRiskSlider();}
+  renderRiskPreset();
+});
 $('paper-trading').addEventListener('change',()=>{paperModeDirty=true;configDirty=true;$('paper-trading-error').textContent='';renderPaperTrading();});
 $('config-form').addEventListener('submit',async event=>{
   event.preventDefault();if(!configLoaded||configSaving||configRestartRequired)return;

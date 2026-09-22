@@ -5,7 +5,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { KiteBroker, BrokerError, jsonable, orderRejectionReason } from './broker.js';
+import { KiteBroker, BrokerError, jsonable, orderRejectionReason, HISTORICAL_CONCURRENCY } from './broker.js';
 import { AnalyticsPool } from './analytics.js';
 import { DeliveryManager } from './delivery.js';
 import { HoldingsAuthorization } from './holdings-authorization.js';
@@ -789,7 +789,19 @@ export class TradingEngine {
     if (!raw.every(value => (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) && Number.isFinite(Number(value)))) return null;
     const fields = raw.map(Number);
     if (fields[2] < 0 || fields[3] < 0) return null;
-    return Math.max(0, Math.min(fields[0], fields[1] - fields[2] - fields[3]));
+    let cashCeiling = fields[0];
+    const funding = [available.opening_balance, available.intraday_payin];
+    if (funding.some(value => value !== undefined && !((typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) && Number.isFinite(Number(value))))) return null;
+    if (available.intraday_payin !== undefined && Number(available.intraday_payin) < 0) return null;
+    if (funding.every(value => value !== undefined)) {
+      // Kite can leave cash at the opening balance after a same-day deposit.
+      // Compare with opening + pay-in instead of adding pay-in to cash: some
+      // responses already include it. The current free balance remains a cap.
+      const fundedCash = Number(available.opening_balance) + Number(available.intraday_payin);
+      if (!Number.isFinite(fundedCash)) return null;
+      cashCeiling = Math.max(cashCeiling, fundedCash);
+    }
+    return Math.max(0, Math.min(cashCeiling, fields[1] - fields[2] - fields[3]));
   }
   _update_capital(rebase = false) {
     const cash = this._cash_balance();
@@ -1209,20 +1221,25 @@ export class TradingEngine {
     const managed = new Set(values(this.positions).map(p => Number(p.token))), wanted = this._priority_tokens(Object.keys(this.universe).map(Number).filter(t => !this._intraday_history_loaded.has(t)&&monotonic()>=(this._intraday_history_retry[t]||0)), managed);
     const broker = this.broker,generation=this._universe_generation;
     const valid=()=>this.connected&&!signal?.aborted&&!this._shutdown&&broker===this.broker&&generation===this._universe_generation&&dateIST(this._now())===today;
-    let finished=false;
-    try {
-    for (const token of wanted) {
+    let finished=false,stopped=false,rateLimited=false,passError=null,next=0;
+    const active=new Set();
+    const reportActive=()=>{
+      if(!valid()||stopped)return;
+      const names=[...active];
+      activity({message:names.length?`Downloading five-minute candles for ${names.join(', ')}.`:'Checking five-minute candle coverage.',current_item:names.length?names.join(', '):null,failed:this._intraday_history_failed});
+    };
+    const download=async token=>{
       if(!valid()||!marketHours(this._now()))return;
       const symbol=this.universe[token]?.tradingsymbol;if(!symbol)return;
       const currentIdentity=()=>valid()&&this.universe[token]?.tradingsymbol===symbol;
       const now = this._now(), boundary = new Date(Math.floor(now.getTime() / 300000) * 300000), start = parseTime(`${dateIST(now)}T09:15:00+05:30`);
-      if (boundary <= start) break;
-      activity({message:`Downloading five-minute candles for ${symbol}.`,current_item:symbol});
+      if (boundary <= start) {stopped=true;return;}
+      active.add(symbol);reportActive();
       try {
         const cache=this.store.get(`intraday_seed:${token}`,{})||{},needsSeed=this.settings.enhanced_signals===true;
         if(!this.previous_intraday[token]?.length&&cache.date===dateIST(now)&&cache.symbol===symbol&&this._valid_intraday_seed(cache.bars,dateIST(now)))this.previous_intraday[token]=cache.bars.map(b=>new Candle(b.time??b.date,...['open','high','low','close','volume'].map(k=>b[k])));
         const from=needsSeed&&!this.previous_intraday[token]?.length?new Date(+start-7*86400000):start;
-        const rows = await broker.call('historical_data', token, from, new Date(boundary - 1000), '5minute');
+        const rows = await broker.call('historical_data', token, from, new Date(boundary - 1000), '5minute', {signal,isCurrent:()=>!stopped&&currentIdentity()&&marketHours(this._now())});
         if(!currentIdentity())return;
         if(needsSeed&&!this.previous_intraday[token]?.length){
           const earlier=rows.filter(r=>{const at=parseTime(r.date??r.time);return at&&at<start&&at>=from;});
@@ -1243,15 +1260,30 @@ export class TradingEngine {
         else this._intraday_history_retry[token]=monotonic()+60;
       } catch (exc) {
         if(!currentIdentity())return;
+        if(stopped&&exc.name==='AbortError')return;
         if (!(exc instanceof BrokerError)) throw exc;
-        if(this._history_rate_wait(activity,exc)){finished=true;return;}
+        if(this._history_rate_wait(activity,exc)){rateLimited=true;stopped=true;return;}
+        if(stopped)return;
         this._intraday_history_failed++;
         this._intraday_history_retry[token]=monotonic()+60;
-        if (exc.kind === 'TokenException') { this.connected = false; this._halt('Authentication expired loading intraday history. Reconnect Zerodha.', 'auth_expired', failureMetadata(exc, 'intraday_history', 'download')); break; }
+        if (exc.kind === 'TokenException') { this.connected = false;stopped=true; this._halt('Authentication expired loading intraday history. Reconnect Zerodha.', 'auth_expired', failureMetadata(exc, 'intraday_history', 'download')); }
+      } finally {
+        active.delete(symbol);reportActive();
       }
       activity({failed:this._intraday_history_failed});
-      await sleep(100, signal);
-    }
+    };
+    try {
+    // Keep a small pipeline full. The shared broker schedules all historical
+    // starts, including daily history and research, independently of responses.
+    await Promise.all(Array.from({length:Math.min(HISTORICAL_CONCURRENCY,wanted.length)},async()=>{
+      while(!stopped&&valid()&&marketHours(this._now())&&next<wanted.length){
+        const token=wanted[next++];
+        try{await download(token);}catch(error){stopped=true;passError??=error;}
+      }
+    }));
+    if(passError)throw passError;
+    if(rateLimited){activity({failed:this._intraday_history_failed});finished=true;return;}
+    if(this.connected&&!valid())return;
     const remaining=count(this.universe)-this._intraday_history_loaded.size,retries=values(this._intraday_history_retry).filter(Number.isFinite);
     this._history_progress_event('intraday_history',{ready:this._intraday_history_loaded.size,total:count(this.universe),failed:this._intraday_history_failed});
     activity({status:this.connected?'waiting':'failed',failed:this._intraday_history_failed,message:!this.connected?'Five-minute candle loading stopped. Reconnect Zerodha to resume.':remaining?`${remaining} symbols still need complete candles; waiting for fresh data or retry. Current candles must close before use.`:'Historical warmup is complete. Live candles continue to build from market prices.',next_retry_at:this.connected&&remaining?new Date(+this._now()+Math.max(15000,retries.length?(Math.min(...retries)-monotonic())*1000:15000)).toISOString():null});finished=true;
