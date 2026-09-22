@@ -17,6 +17,7 @@ test('only three Kite credentials are needed; other settings persist and env doe
   const manager=new ConfigManager(dir,{});let initial='';const cfg=await manager.load({onInitialPassword:value=>initial=value});
   assert.ok(initial.length>=24);assert.ok(await verifyPassword(cfg.admin_password_hash,initial));assert.equal(cfg.kite_user_id,'AB1234');assert.equal(cfg.port,3000);assert.equal(cfg.analytics_workers,0);assert.equal(cfg.trading_mode,'paper');
   assert.equal(cfg.publicValues().public_url,undefined);assert.equal(cfg.publicValues().paper_capital,undefined);assert.equal(cfg.publicValues().data_dir,'data');
+  assert.equal(cfg.market_regime_filter,false);
   manager.save({port:3100,analytics_reserve_cpus:2});
   const reload=await new ConfigManager(dir,{PORT:'9999',KITE_API_KEY:'changed-key'}).load({onInitialPassword:()=>assert.fail('Existing password must not regenerate')});
   assert.equal(reload.port,3100);assert.equal(reload.kite_api_key,'changed-key');assert.equal(reload.analytics_reserve_cpus,2);assert.equal(reload.admin_password_hash,cfg.admin_password_hash);

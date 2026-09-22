@@ -11,6 +11,7 @@ import { marketBreadth } from '../src/decision-controls.js';
 import { monotonic, dateIST, isoIST } from '../src/util.js';
 import { NiftyTradingUniverse } from '../src/nifty-trading-universe.js';
 import { entryRewardRisk } from '../src/entry-risk.js';
+import { DEFAULTS } from '../src/config.js';
 
 const NOW = new Date('2026-09-17T12:00:00+05:30');
 const clone = value => structuredClone(value);
@@ -45,6 +46,18 @@ function ready(t, mode = 'paper') {
 // whose subject is a later execution/lifecycle gate.
 const signal = (strategy = 'intraday') => new Signal(strategy, 100, 98, 104.5, 'test', 2);
 const entryDailyBars = () => Array.from({length:21},(_,i)=>new Candle(new Date(NOW-(21-i)*86400000),100,101,99,100,1000));
+
+for(const side of ['BUY','SELL'])test(`disabled default breadth permits ${side} with adverse or missing participation while reward/risk still applies`,async t=>{
+  for(const open of [side==='BUY'?110:90,undefined]){
+    const [engine]=ready(t);Object.assign(engine.settings,{market_regime_filter:DEFAULTS.market_regime_filter,
+      min_market_samples:30,min_market_coverage:1,min_market_breadth:.45,intraday_short_enabled:true});
+    engine.quotes[1].ohlc={open};
+    assert.equal(engine._decision_controls().regime.status,'disabled');
+    const weak=side==='BUY'?new Signal('intraday',100,98,101,'poor reward',2):Object.assign(shortSignal(),{target:99});
+    assert.equal(await engine._enter_locked(1,weak),'entry_reward_risk_too_low');
+    assert.equal(await engine._enter_locked(1,side==='BUY'?signal():shortSignal()),side==='BUY'?'paper_buy_filled':'paper_short_filled');
+  }
+});
 
 for(const mode of ['paper','live'])for(const side of ['BUY','SELL'])test(`${mode} ${side} rejects deteriorated entry reward before reserving cash or submitting orders`,async t=>{
   const [engine,store]=ready(t,mode),decision={};engine.settings.intraday_short_enabled=true;

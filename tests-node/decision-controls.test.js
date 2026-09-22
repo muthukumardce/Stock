@@ -4,7 +4,7 @@ import {marketBreadth,portfolioExposure,portfolioEntryGate,returnCorrelation,pen
 import {DEFAULTS} from '../src/config.js';
 
 test('breadth excludes stale and illiquid data and fails closed on insufficient coverage',()=>{
-  const settings={...DEFAULTS,min_market_samples:2,min_market_coverage:.5,min_daily_turnover:1000},universe={1:{},2:{},3:{},4:{}},quotes={
+  const settings={...DEFAULTS,market_regime_filter:true,min_market_samples:2,min_market_coverage:.5,min_daily_turnover:1000},universe={1:{},2:{},3:{},4:{}},quotes={
     1:{received_at:99,last_price:110,ohlc:{open:100},volume_traded:100},2:{received_at:99,last_price:90,ohlc:{open:100},volume_traded:100},
     3:{received_at:0,last_price:120,ohlc:{open:100},volume_traded:100},4:{received_at:99,last_price:150,ohlc:{open:100},volume_traded:0}};
   const result=marketBreadth(universe,quotes,settings,100);assert.equal(result.total,2);assert.equal(result.advancing,1);assert.equal(result.breadth,.5);assert.equal(result.status,'eligible');
@@ -13,7 +13,7 @@ test('breadth excludes stale and illiquid data and fails closed on insufficient 
 });
 
 test('exit-only recovered instruments neither contribute to equity breadth nor dilute its coverage',()=>{
-  const settings={...DEFAULTS,min_market_samples:1,min_market_coverage:1,min_daily_turnover:0};
+  const settings={...DEFAULTS,market_regime_filter:true,min_market_samples:1,min_market_coverage:1,min_daily_turnover:0};
   const universe={1:{entry_eligible:true},2:{entry_eligible:false},3:{entry_eligible:false}};
   const quotes={1:{received_at:99,last_price:90,ohlc:{open:100},volume_traded:100},2:{received_at:99,last_price:150,ohlc:{open:100},volume_traded:100}};
   const report=marketBreadth(universe,quotes,settings,100);

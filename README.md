@@ -72,7 +72,7 @@ The **Paper trading** switch is at the top of Settings. On means simulated buys 
 | Risk | Risk per trade `0.0025` (0.25%); maximum position allocation `0.10` (10%); daily loss limit `0.01` (1%); maximum five bot positions. |
 | Market filters | Maximum spread `0.003` (0.3%); minimum turnover estimate Rs 10,000,000. |
 | Enhanced rules | All 11 intraday families enabled, including protected shorts; completed higher timeframe alignment enabled. Minimum evidence score 60/100, which is not a profit probability. |
-| Market breadth | Enabled; at least 30 liquid stocks, 20% fresh quote coverage and 45% advancing shares for longs or declining shares for shorts. |
+| Market breadth | Entry filter disabled; breadth remains visible for reference. Optional thresholds apply only when explicitly enabled. |
 | Announced events | Entries blocked one calendar day before through one day after an announced corporate event. Missing/stale official calendar coverage also blocks entries. |
 | Account exposure | Maximum 25% in one stock, 90% gross exposure and 3% estimated stress loss relative to reference assets. Existing/manual holdings and unfilled manual orders count. |
 | Correlation | Enabled; absolute daily-return correlation of at least 0.85 groups exposure, capped at 35% of reference assets. Missing history blocks an entry; opposite positions do not automatically earn hedge credit. |

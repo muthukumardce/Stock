@@ -18,7 +18,7 @@ export const DEFAULTS = Object.freeze({
   intraday_short_enabled:true,higher_timeframe_filter:true,opening_range_minutes:15,min_setup_volume:1.2,min_gap_pct:0.005,max_gap_pct:0.05,relative_strength_min:0.002,squeeze_width_max:0.02,squeeze_lookback:20,
   event_risk_enabled:true,event_blackout_before_days:1,event_blackout_after_days:1,market_context_max_age_minutes:60,classification_max_age_days:7,benchmark_max_age_seconds:120,
   min_signal_score:60, min_adx:18, min_rsi:45, max_rsi:78, max_atr_extension:2.5, technical_exit_enabled:true,
-  candidate_wait_ms:1500, market_regime_filter:true, min_market_breadth:0.45, min_market_samples:30, min_market_coverage:0.20,
+  candidate_wait_ms:1500, market_regime_filter:false, min_market_breadth:0.45, min_market_samples:30, min_market_coverage:0.20,
   portfolio_risk_enabled:true, max_account_stock_pct:0.25, max_account_gross_pct:0.90, max_account_risk_pct:0.03, unprotected_stress_pct:0.05,
   correlation_filter:true, max_correlation:0.85, max_correlated_exposure_pct:0.35,
   max_trades_per_day:10, loss_streak_limit:3, loss_cooldown_minutes:30,
